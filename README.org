@@ -13,8 +13,10 @@ buffers.
 - Variable interpolation with ={{name}}= syntax
 - Built-in test assertions for status, headers, body, timing, and size
 - Preview resolved requests before sending
-- Select per-buffer environments from =.env= files with =C-c C-e=
+- Select per-buffer environments from collection =env/*.env= files with =C-c C-e=
 - Pretty-print JSON responses, with =v= to toggle raw view
+- Browse the current collection in an overview buffer with =C-c C-b=
+- Jump between requests and environments with =C-c C-o=
 
 * Requirements
 
@@ -43,6 +45,22 @@ Accept: application/json
 #+end_src
 
 Open it in Emacs. Press =C-c C-c= to send.
+
+* Collections
+
+A Courier collection is a directory marked by =courier.json=. When this file is
+present, Courier treats that directory as the collection root for request
+discovery and does not scan environment files above it.
+
+Minimal =courier.json= example:
+
+#+begin_src json
+{
+  "name": "My API",
+  "envDir": "env",
+  "defaultEnv": "local"
+}
+#+end_src
 
 * File Format
 
@@ -75,17 +93,22 @@ with =# @var= directives. Recursive expansion is supported up to 10 levels.
 
 ** Environment Files
 
-Courier can also load variables from =.env= files. It walks upward from the
-directory of the current =.http= file and looks for:
+Inside a collection, Courier reads environment files from the directory
+configured by =courier.json= via =envDir=. The default is =env/= at the
+collection root. Environment names come from filenames such as =local.env=,
+=staging.env=, and =prod.env=. You may also use =.env= for an environment
+named =default=.
 
-- =.env= for the default environment
-- =local.env=, =staging.env=, =prod.env=, and similar named environments
+If =defaultEnv= is set in =courier.json= and that environment exists, Courier
+activates it automatically for the current request buffer. Otherwise, Courier
+prompts with =completing-read= when multiple environments are available. The
+choice remains buffer-local. Variables from =# @var= directives override values
+from environment files.
 
-If multiple environment names are available, Courier prompts with
-=completing-read= and remembers the choice buffer-locally. Variables from
-=# @var= directives override values from =.env= files.
+Outside a collection, Courier falls back to the older upward scan from the
+current request directory so ad-hoc =.http= files still work.
 
-Example =local.env=:
+Example =env/local.env=:
 
 #+begin_example
 base_url=https://api.example.com
@@ -110,25 +133,56 @@ token=abc123
 | Key       | Command                        | Description            |
 |-----------+--------------------------------+------------------------|
 | =C-c C-c= | =courier-request-send=         | Send request           |
+| =C-c C-b= | =courier-overview=             | Open collection view   |
 | =C-c C-e= | =courier-request-switch-env=   | Switch environment     |
+| =C-c C-m= | =courier-request-set-method=   | Change HTTP method     |
+| =C-c C-n= | =courier-new-request=          | Create new request     |
 | =C-c C-p= | =courier-request-preview=      | Preview resolved form  |
 | =C-c C-l= | =courier-request-validate=     | Validate syntax        |
+| =C-c C-o= | =courier-open=                 | Open request or env    |
+| =C-c C-r= | =courier-rename-request=       | Rename current request |
 
 Use =M-x courier-new-request= to scaffold a new =.http= request file in the
-current directory.
+current directory. Use =C-c C-o= to open another =.http= file or switch the
+current buffer to a different environment from the same minibuffer picker.
+
+Use =C-c C-b= to open the current collection overview. The overview buffer
+lists requests, shows recent status and environment context, and supports:
+
+- =RET= to open the request at point
+- =n= to create a new request
+- =f= to create a folder
+- =r= to rename the request at point
+- =m= to move the request at point
+- =s= to send it
+- =p= to preview it
+- =e= to switch its environment
+- =/= to filter the list
+- =g= to refresh
+
+Request and folder management stay file-based. Courier renames and moves normal
+=.http= files and directories so Git continues to see plain filesystem changes.
 
 ** Response Mode
 
 | Key       | Command                            | Description               |
 |-----------+------------------------------------+---------------------------|
+| =RET=     | =courier-response-open-body=       | Open body viewer          |
 | =TAB=     | =courier-response-toggle-section=  | Fold or unfold section    |
 | =n=       | =courier-response-next-section=    | Next section heading      |
+| =o=       | =courier-response-open-body=       | Open body viewer          |
 | =p=       | =courier-response-prev-section=    | Previous section heading  |
 | =g=       | =courier-response-retry=           | Resend request            |
-| =v=       | =courier-response-toggle-pretty=   | Toggle JSON pretty-print  |
+| =v=       | =courier-response-set-view=        | Select body view          |
+| =V=       | =courier-response-toggle-pretty=   | Toggle raw/auto body view |
 | =[=       | =courier-response-history-prev=    | Show older response       |
 | =]=       | =courier-response-history-next=    | Show newer response       |
 | =C-c C-k= | =courier-response-cancel=          | Cancel request            |
+
+Body views currently include =auto=, =json=, =html=, =xml=, =javascript=,
+=raw=, =hex=, =base64=, and =image=. Use =RET= or =o= to open the current body
+in a dedicated viewer buffer; text-like views use an appropriate major mode,
+and image views display the image when Emacs can render it.
 | =q=       | quit                               | Close buffer              |
 
 * Response Buffer

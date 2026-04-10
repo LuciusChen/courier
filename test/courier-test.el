@@ -526,6 +526,31 @@
       (insert "broken-line\n"))
     (should-error (courier-parse-env-file env) :type 'user-error)))
 
+(ert-deftest courier-collection-config-uses-defaults ()
+  (courier-test--with-temp-dir (root)
+    (let ((config-file (expand-file-name "courier.json" root)))
+      (with-temp-file config-file
+        (insert "{\n  \"name\": \"Demo\"\n}\n"))
+      (should (equal (courier--collection-config root)
+                     `(:root ,(file-name-as-directory root)
+                       :path ,config-file
+                       :name "Demo"
+                       :requests-dir "requests"
+                       :env-dir "env"
+                       :default-env nil))))))
+
+(ert-deftest courier-collection-config-reads-env-settings ()
+  (courier-test--with-temp-dir (root)
+    (let ((config-file (expand-file-name "courier.json" root)))
+      (with-temp-file config-file
+        (insert "{\n"
+                "  \"envDir\": \"config/envs\",\n"
+                "  \"defaultEnv\": \"staging\"\n"
+                "}\n"))
+      (let ((config (courier--collection-config root)))
+        (should (equal (plist-get config :env-dir) "config/envs"))
+        (should (equal (plist-get config :default-env) "staging"))))))
+
 (ert-deftest courier-scan-env-files-finds-current-and-parent ()
   (courier-test--with-temp-dir (root)
     (let* ((child (expand-file-name "api/request" root))
@@ -607,6 +632,59 @@
                    :body-text "{\"foo\":1}"))))
       (should (equal body "{\"foo\":1}\n")))))
 
+(ert-deftest courier-auto-body-view-detects-image ()
+  (should (eq (courier--auto-body-view
+               '(:content-type "image/png" :body-file "/tmp/demo.png"))
+              'image)))
+
+(ert-deftest courier-format-body-base64-view ()
+  (with-temp-buffer
+    (setq-local courier--body-view 'base64)
+    (let ((body (courier--format-body
+                 '(:content-type "text/plain"
+                   :body-text "hello"))))
+      (should (string-match-p "aGVsbG8=" body)))))
+
+(ert-deftest courier-format-body-hex-view ()
+  (with-temp-buffer
+    (setq-local courier--body-view 'hex)
+    (let ((body (courier--format-body
+                 '(:content-type "application/octet-stream"
+                   :body-text "Hi"))))
+      (should (string-match-p "48 69" body)))))
+
+(ert-deftest courier-response-set-view-updates-buffer-state ()
+  (with-temp-buffer
+    (courier--render-response
+     (courier-test--make-response 200)
+     courier-test--request)
+    (courier-response-set-view 'raw)
+    (should (eq courier--body-view 'raw))
+    (should (string-match-p "raw" (format "%s" header-line-format)))))
+
+(ert-deftest courier-response-open-body-opens-viewer-buffer ()
+  (with-temp-buffer
+    (let (viewer-buffer)
+      (courier--render-response
+       '(:status-code 200
+         :reason "OK"
+         :headers (("content-type" . "application/json"))
+         :duration-ms 10
+         :size 12
+         :body-text "{\"foo\":1}"
+         :content-type "application/json"
+         :tests nil
+         :stderr ""
+         :exit-code 0)
+       courier-test--request)
+      (cl-letf (((symbol-function 'display-buffer)
+                 (lambda (buffer &rest _args)
+                   (setq viewer-buffer buffer)
+                   buffer)))
+        (courier-response-open-body))
+      (with-current-buffer viewer-buffer
+        (should (string-match-p "\"foo\"" (buffer-string)))))))
+
 (ert-deftest courier-test-response-next-section ()
   (with-temp-buffer
     (courier--render-response
@@ -664,6 +742,408 @@
       (should (= (length courier--history) 3))
       (should (= (plist-get (cdr (nth 0 courier--history)) :status-code) 204))
       (should (= (plist-get (cdr (nth 2 courier--history)) :status-code) 202)))))
+
+(ert-deftest courier-request-search-root-prefers-git-root ()
+  (courier-test--with-temp-dir (root)
+    (let* ((api-dir (expand-file-name "api/users" root))
+           (request-file (expand-file-name "get-user.http" api-dir)))
+      (make-directory (expand-file-name ".git" root))
+      (make-directory api-dir t)
+      (with-temp-file request-file
+        (insert "GET https://example.com/users/42\n"))
+      (with-temp-buffer
+        (setq-local buffer-file-name request-file)
+        (should (equal (file-name-as-directory root)
+                       (courier--request-search-root)))))))
+
+(ert-deftest courier-request-search-root-prefers-collection-root ()
+  (courier-test--with-temp-dir (root)
+    (let* ((collection-root (expand-file-name "api-collection" root))
+           (api-dir (expand-file-name "requests/users" collection-root))
+           (request-file (expand-file-name "get-user.http" api-dir)))
+      (make-directory (expand-file-name ".git" root))
+      (make-directory api-dir t)
+      (with-temp-file (expand-file-name "courier.json" collection-root)
+        (insert "{}\n"))
+      (with-temp-file request-file
+        (insert "GET https://example.com/users/42\n"))
+      (with-temp-buffer
+        (setq-local buffer-file-name request-file)
+        (should (equal (file-name-as-directory
+                        (expand-file-name "requests" collection-root))
+                       (courier--request-search-root)))))))
+
+(ert-deftest courier-request-search-root-respects-configured-requests-dir ()
+  (courier-test--with-temp-dir (root)
+    (let* ((collection-root (expand-file-name "api-collection" root))
+           (requests-root (expand-file-name "api-requests" collection-root))
+           (api-dir (expand-file-name "users" requests-root))
+           (request-file (expand-file-name "get-user.http" api-dir)))
+      (make-directory api-dir t)
+      (with-temp-file (expand-file-name "courier.json" collection-root)
+        (insert "{\n  \"requestsDir\": \"api-requests\"\n}\n"))
+      (with-temp-file request-file
+        (insert "GET https://example.com/users/42\n"))
+      (with-temp-buffer
+        (setq-local buffer-file-name request-file)
+        (should (equal (file-name-as-directory requests-root)
+                       (courier--request-search-root)))))))
+
+(ert-deftest courier-scan-env-files-stops-at-collection-root ()
+  (courier-test--with-temp-dir (root)
+    (let* ((collection-root (expand-file-name "api-collection" root))
+           (child (expand-file-name "requests/users" collection-root))
+           (outer-env (expand-file-name ".env" root))
+           (collection-env (expand-file-name ".env" collection-root))
+           (local-env (expand-file-name "local.env" child)))
+      (make-directory child t)
+      (with-temp-file outer-env
+        (insert "base_url=https://outer.example.com\n"))
+      (with-temp-file (expand-file-name "courier.json" collection-root)
+        (insert "{}\n"))
+      (with-temp-file collection-env
+        (insert "base_url=https://collection.example.com\n"))
+      (with-temp-file local-env
+        (insert "token=local\n"))
+      (let ((entries (courier-scan-env-files child collection-root)))
+        (should (member (cons "default" collection-env) entries))
+        (should (member (cons "local" local-env) entries))
+        (should-not (member (cons "default" outer-env) entries))))))
+
+(ert-deftest courier-available-env-entries-use-collection-env-dir ()
+  (courier-test--with-temp-dir (root)
+    (let* ((collection-root (expand-file-name "api-collection" root))
+           (env-dir (expand-file-name "env" collection-root))
+           (request-dir (expand-file-name "requests/users" collection-root))
+           (request-file (expand-file-name "get-user.http" request-dir))
+           (request-local-env (expand-file-name "local.env" request-dir))
+           (collection-default (expand-file-name ".env" env-dir))
+           (collection-prod (expand-file-name "prod.env" env-dir)))
+      (make-directory env-dir t)
+      (make-directory request-dir t)
+      (with-temp-file (expand-file-name "courier.json" collection-root)
+        (insert "{\n  \"defaultEnv\": \"prod\"\n}\n"))
+      (with-temp-file request-file
+        (insert "GET https://example.com/users/42\n"))
+      (with-temp-file request-local-env
+        (insert "token=from-request-dir\n"))
+      (with-temp-file collection-default
+        (insert "token=default\n"))
+      (with-temp-file collection-prod
+        (insert "token=prod\n"))
+      (with-temp-buffer
+        (setq-local buffer-file-name request-file)
+        (setq-local courier--request-path request-file)
+        (should (equal (courier--available-env-entries)
+                       `(("default" . ,collection-default)
+                         ("prod" . ,collection-prod))))))))
+
+(ert-deftest courier-available-env-entries-fall-back-without-collection ()
+  (courier-test--with-temp-dir (root)
+    (let* ((request-dir (expand-file-name "api/users" root))
+           (request-file (expand-file-name "get-user.http" request-dir))
+           (outer-env (expand-file-name ".env" root))
+           (inner-env (expand-file-name "local.env" request-dir)))
+      (make-directory request-dir t)
+      (with-temp-file request-file
+        (insert "GET https://example.com/users/42\n"))
+      (with-temp-file outer-env
+        (insert "base_url=https://outer.example.com\n"))
+      (with-temp-file inner-env
+        (insert "token=inner\n"))
+      (with-temp-buffer
+        (setq-local buffer-file-name request-file)
+        (setq-local courier--request-path request-file)
+        (should (equal (courier--available-env-entries)
+                       `(("default" . ,outer-env)
+                         ("local" . ,inner-env))))))))
+
+(ert-deftest courier-selected-env-name-prefers-collection-default ()
+  (courier-test--with-temp-dir (root)
+    (let* ((collection-root (expand-file-name "api-collection" root))
+           (request-dir (expand-file-name "requests/users" collection-root))
+           (request-file (expand-file-name "get-user.http" request-dir))
+           (env-dir (expand-file-name "env" collection-root))
+           (default-env (expand-file-name "local.env" env-dir))
+           (prod-env (expand-file-name "prod.env" env-dir)))
+      (make-directory request-dir t)
+      (make-directory env-dir t)
+      (with-temp-file (expand-file-name "courier.json" collection-root)
+        (insert "{\n  \"defaultEnv\": \"prod\"\n}\n"))
+      (with-temp-file request-file
+        (insert "GET https://example.com/users/42\n"))
+      (with-temp-file default-env
+        (insert "token=local\n"))
+      (with-temp-file prod-env
+        (insert "token=prod\n"))
+      (with-temp-buffer
+        (setq-local buffer-file-name request-file)
+        (setq-local courier--request-path request-file)
+        (should (equal (courier--selected-env-name
+                        (courier--available-env-entries))
+                       "prod"))
+        (should (equal courier--active-env "prod"))))))
+
+(ert-deftest courier-collection-without-env-dir-does-not-fall-back-upward ()
+  (courier-test--with-temp-dir (root)
+    (let* ((collection-root (expand-file-name "api-collection" root))
+           (request-dir (expand-file-name "requests/users" collection-root))
+           (request-file (expand-file-name "get-user.http" request-dir))
+           (outer-env (expand-file-name ".env" root))
+           (request-env (expand-file-name "local.env" request-dir)))
+      (make-directory request-dir t)
+      (with-temp-file (expand-file-name "courier.json" collection-root)
+        (insert "{}\n"))
+      (with-temp-file request-file
+        (insert "GET https://example.com/users/42\n"))
+      (with-temp-file outer-env
+        (insert "base_url=https://outer.example.com\n"))
+      (with-temp-file request-env
+        (insert "token=request\n"))
+      (with-temp-buffer
+        (setq-local buffer-file-name request-file)
+        (setq-local courier--request-path request-file)
+        (should-not (courier--available-env-entries))))))
+
+(ert-deftest courier-request-candidates-include-method-name-and-path ()
+  (courier-test--with-temp-dir (root)
+    (let* ((request-file (expand-file-name "users/get-user.http" root)))
+      (make-directory (file-name-directory request-file) t)
+      (with-temp-file request-file
+        (insert "# @name Get User\nGET https://example.com/users/42\n"))
+      (let ((candidate (car (courier--request-candidates root))))
+        (should (equal (plist-get (cdr candidate) :path) request-file))
+        (should (eq (plist-get (cdr candidate) :kind) 'request))
+        (should (string-match-p "^GET\\s-+Get User" (car candidate)))
+        (should (string-match-p "users/get-user\\.http$" (car candidate)))))))
+
+(ert-deftest courier-find-request-opens-selected-file ()
+  (courier-test--with-temp-dir (root)
+    (let* ((first-file (expand-file-name "users/get-user.http" root))
+           (second-file (expand-file-name "users/create-user.http" root))
+           opened-file
+           expected-file)
+      (make-directory (expand-file-name ".git" root))
+      (make-directory (file-name-directory first-file) t)
+      (with-temp-file first-file
+        (insert "# @name Get User\nGET https://example.com/users/42\n"))
+      (with-temp-file second-file
+        (insert "# @name Create User\nPOST https://example.com/users\n"))
+      (cl-letf (((symbol-function 'completing-read)
+                 (lambda (_prompt collection &rest _args)
+                   (setq expected-file (plist-get (cdar collection) :path))
+                   (caar collection)))
+                ((symbol-function 'find-file)
+                 (lambda (path)
+                   (setq opened-file path))))
+        (let ((default-directory root))
+          (courier-find-request)))
+      (should (equal opened-file expected-file)))))
+
+(ert-deftest courier-request-set-method-rewrites-request-line ()
+  (courier-test--with-request
+      (concat "# @name Demo\n"
+              "GET https://example.com/users/42\n"
+              "Accept: application/json\n")
+    (courier-request-mode)
+    (courier-request-set-method "POST")
+    (goto-char (point-min))
+    (should (search-forward "POST https://example.com/users/42" nil t))))
+
+(ert-deftest courier-request-set-method-rejects-missing-request-line ()
+  (courier-test--with-request "# @name Demo\n"
+    (courier-request-mode)
+    (should-error (courier-request-set-method "POST")
+                  :type 'user-error)))
+
+(ert-deftest courier-open-switches-environment ()
+  (courier-test--with-temp-dir (root)
+    (let* ((collection-root (expand-file-name "api-collection" root))
+           (request-dir (expand-file-name "requests/users" collection-root))
+           (env-dir (expand-file-name "env" collection-root))
+           (request-file (expand-file-name "get-user.http" request-dir))
+           selected-candidate)
+      (make-directory request-dir t)
+      (make-directory env-dir t)
+      (with-temp-file (expand-file-name "courier.json" collection-root)
+        (insert "{\n  \"defaultEnv\": \"local\"\n}\n"))
+      (with-temp-file request-file
+        (insert "GET https://example.com/users/42\n"))
+      (with-temp-file (expand-file-name "local.env" env-dir)
+        (insert "token=local\n"))
+      (with-temp-file (expand-file-name "prod.env" env-dir)
+        (insert "token=prod\n"))
+      (find-file request-file)
+      (unwind-protect
+          (progn
+            (cl-letf (((symbol-function 'completing-read)
+                       (lambda (_prompt collection &rest _args)
+                         (setq selected-candidate
+                               (car (seq-find
+                                     (lambda (candidate)
+                                       (eq (plist-get (cdr candidate) :kind) 'env))
+                                     collection)))
+                         selected-candidate)))
+              (courier-open))
+            (should (equal courier--active-env "local")))
+        (kill-buffer (current-buffer))))))
+
+(ert-deftest courier-open-candidates-group-requests-and-environments ()
+  (courier-test--with-temp-dir (root)
+    (let* ((collection-root (expand-file-name "api-collection" root))
+           (request-dir (expand-file-name "requests/users" collection-root))
+           (env-dir (expand-file-name "env" collection-root))
+           (request-file (expand-file-name "get-user.http" request-dir))
+           candidates)
+      (make-directory request-dir t)
+      (make-directory env-dir t)
+      (with-temp-file (expand-file-name "courier.json" collection-root)
+        (insert "{}\n"))
+      (with-temp-file request-file
+        (insert "# @name Get User\nGET https://example.com/users/42\n"))
+      (with-temp-file (expand-file-name "local.env" env-dir)
+        (insert "token=local\n"))
+      (with-temp-buffer
+        (setq-local buffer-file-name request-file)
+        (setq-local courier--request-path request-file)
+        (setq candidates (courier--open-candidates))
+        (should (seq-some
+                 (lambda (candidate)
+                   (string= (get-text-property 0 'courier-group (car candidate))
+                            "Requests"))
+                 candidates))
+        (should (seq-some
+                 (lambda (candidate)
+                   (string= (get-text-property 0 'courier-group (car candidate))
+                            "Environments"))
+                 candidates))))))
+
+(ert-deftest courier-overview-renders-request-list ()
+  (courier-test--with-temp-dir (root)
+    (let* ((collection-root (expand-file-name "api-collection" root))
+           (request-dir (expand-file-name "requests/users" collection-root))
+           (request-file (expand-file-name "get-user.http" request-dir))
+           overview-buffer)
+      (make-directory request-dir t)
+      (with-temp-file (expand-file-name "courier.json" collection-root)
+        (insert "{\n  \"name\": \"Demo API\"\n}\n"))
+      (with-temp-file request-file
+        (insert "# @name Get User\nGET https://example.com/users/42\n"))
+      (cl-letf (((symbol-function 'display-buffer)
+                 (lambda (buffer &rest _args)
+                   (setq overview-buffer buffer)
+                   buffer)))
+        (let ((default-directory collection-root))
+          (courier-overview)))
+      (with-current-buffer overview-buffer
+        (should (derived-mode-p 'courier-overview-mode))
+        (should (string-match-p "Collection: Demo API"
+                                (buffer-string)))
+        (should (string-match-p "Get User" (buffer-string)))
+        (should (string-match-p "users/get-user\\.http"
+                                (buffer-string)))))))
+
+(ert-deftest courier-overview-open-opens-request-at-point ()
+  (courier-test--with-temp-dir (root)
+    (let* ((collection-root (expand-file-name "api-collection" root))
+           (request-dir (expand-file-name "requests/users" collection-root))
+           (request-file (expand-file-name "get-user.http" request-dir))
+           overview-buffer
+           opened-file)
+      (make-directory request-dir t)
+      (with-temp-file (expand-file-name "courier.json" collection-root)
+        (insert "{}\n"))
+      (with-temp-file request-file
+        (insert "# @name Get User\nGET https://example.com/users/42\n"))
+      (cl-letf (((symbol-function 'display-buffer)
+                 (lambda (buffer &rest _args)
+                   (setq overview-buffer buffer)
+                   buffer)))
+        (let ((default-directory collection-root))
+          (courier-overview)))
+      (with-current-buffer overview-buffer
+        (goto-char (point-min))
+        (search-forward "Get User")
+        (beginning-of-line)
+        (cl-letf (((symbol-function 'find-file)
+                   (lambda (path)
+                     (setq opened-file path))))
+          (courier-overview-open)))
+      (should (equal opened-file request-file)))))
+
+(ert-deftest courier-new-request-uses-configured-requests-dir ()
+  (courier-test--with-temp-dir (root)
+    (let* ((collection-root (expand-file-name "api-collection" root))
+           (requests-root (expand-file-name "api-requests" collection-root))
+           created-buffer)
+      (make-directory collection-root t)
+      (with-temp-file (expand-file-name "courier.json" collection-root)
+        (insert "{\n  \"requestsDir\": \"api-requests\"\n}\n"))
+      (cl-letf (((symbol-function 'find-file)
+                 (lambda (path)
+                   (setq created-buffer (find-file-noselect path))
+                   (set-buffer created-buffer)
+                   created-buffer)))
+        (let ((default-directory collection-root))
+          (courier-new-request "Create User")))
+      (unwind-protect
+          (progn
+            (should (file-exists-p (expand-file-name "create-user.http" requests-root)))
+            (with-current-buffer created-buffer
+              (should (string-match-p "# @name Create User" (buffer-string)))))
+        (when (buffer-live-p created-buffer)
+          (kill-buffer created-buffer))))))
+
+(ert-deftest courier-new-folder-creates-under-request-root ()
+  (courier-test--with-temp-dir (root)
+    (let ((collection-root (expand-file-name "api-collection" root)))
+      (make-directory collection-root t)
+      (with-temp-file (expand-file-name "courier.json" collection-root)
+        (insert "{}\n"))
+      (let ((default-directory collection-root))
+        (courier-new-folder "admin/tools"))
+      (should (file-directory-p
+               (expand-file-name "requests/admin/tools" collection-root))))))
+
+(ert-deftest courier-rename-request-renames-file-and-directive ()
+  (courier-test--with-temp-dir (root)
+    (let* ((request-file (expand-file-name "get-user.http" root))
+           (new-file (expand-file-name "create-user.http" root))
+           buffer)
+      (with-temp-file request-file
+        (insert "# @name Get User\nGET https://example.com/users/42\n"))
+      (setq buffer (find-file-noselect request-file))
+      (unwind-protect
+          (with-current-buffer buffer
+            (courier-request-mode)
+            (courier-rename-request "Create User")
+            (should (equal (expand-file-name buffer-file-name) new-file))
+            (should (file-exists-p new-file))
+            (should-not (file-exists-p request-file))
+            (should (string-match-p "# @name Create User" (buffer-string))))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
+
+(ert-deftest courier-move-request-moves-file-and-buffer ()
+  (courier-test--with-temp-dir (root)
+    (let* ((request-dir (expand-file-name "users" root))
+           (target-dir (expand-file-name "admin/tools" root))
+           (request-file (expand-file-name "get-user.http" request-dir))
+           (new-file (expand-file-name "get-user.http" target-dir))
+           buffer)
+      (make-directory request-dir t)
+      (with-temp-file request-file
+        (insert "# @name Get User\nGET https://example.com/users/42\n"))
+      (setq buffer (find-file-noselect request-file))
+      (unwind-protect
+          (with-current-buffer buffer
+            (courier-request-mode)
+            (courier-move-request target-dir)
+            (should (equal (expand-file-name buffer-file-name) new-file))
+            (should (file-exists-p new-file))
+            (should-not (file-exists-p request-file)))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
 
 (provide 'courier-test)
 
