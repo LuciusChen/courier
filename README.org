@@ -1,0 +1,156 @@
+#+title: Courier
+#+author: Lucius Chen
+
+Courier is a lightweight HTTP client for Emacs. It sends requests defined in
+=.http= files using =curl= and displays responses in structured read-only
+buffers.
+
+* Features
+
+- Edit HTTP requests as plain text in =.http= files
+- Send requests with =C-c C-c= without blocking Emacs
+- View responses in a single buffer with collapsible sections
+- Variable interpolation with ={{name}}= syntax
+- Built-in test assertions for status, headers, body, timing, and size
+- Preview resolved requests before sending
+- Select per-buffer environments from =.env= files with =C-c C-e=
+- Pretty-print JSON responses, with =v= to toggle raw view
+
+* Requirements
+
+- Emacs 29.1 or later
+- =curl= on PATH
+
+* Installation
+
+Clone this repository and add it to your =load-path=:
+
+#+begin_src elisp
+(add-to-list 'load-path "/path/to/courier")
+(require 'courier)
+#+end_src
+
+* Quick Start
+
+Create a file =example.http=:
+
+#+begin_src http
+# @name Get User
+# @var user_id 42
+# @test status == 200
+GET https://httpbin.org/get?id={{user_id}}
+Accept: application/json
+#+end_src
+
+Open it in Emacs. Press =C-c C-c= to send.
+
+* File Format
+
+A =.http= file contains one HTTP request:
+
+#+begin_example
+DIRECTIVES
+METHOD URL
+HEADERS
+
+BODY
+#+end_example
+
+** Directives
+
+Directives are comment lines before the request line:
+
+| Directive               | Example                       | Description           |
+|-------------------------+-------------------------------+-----------------------|
+| =# @name=               | =# @name Get User=            | Human-readable name   |
+| =# @timeout=            | =# @timeout 10=               | Timeout in seconds    |
+| =# @follow-redirects=   | =# @follow-redirects true=    | Follow redirects      |
+| =# @var=                | =# @var key value=            | Define a variable     |
+| =# @test=               | =# @test status == 200=       | Test assertion        |
+
+** Variables
+
+Use ={{name}}= anywhere in the URL, headers, or body. Variables are defined
+with =# @var= directives. Recursive expansion is supported up to 10 levels.
+
+** Environment Files
+
+Courier can also load variables from =.env= files. It walks upward from the
+directory of the current =.http= file and looks for:
+
+- =.env= for the default environment
+- =local.env=, =staging.env=, =prod.env=, and similar named environments
+
+If multiple environment names are available, Courier prompts with
+=completing-read= and remembers the choice buffer-locally. Variables from
+=# @var= directives override values from =.env= files.
+
+Example =local.env=:
+
+#+begin_example
+base_url=https://api.example.com
+token=abc123
+#+end_example
+
+** Test Assertions
+
+| Expression                          | Description                    |
+|-------------------------------------+--------------------------------|
+| =status == 200=                     | Status code equals             |
+| =status != 404=                     | Status code not equals         |
+| =header content-type contains json= | Header value contains string   |
+| =body contains hello=               | Response body contains string  |
+| =time < 500=                        | Response time under N ms       |
+| =size < 102400=                     | Response size under N bytes    |
+
+* Key Bindings
+
+** Request Mode (=.http= files)
+
+| Key       | Command                        | Description            |
+|-----------+--------------------------------+------------------------|
+| =C-c C-c= | =courier-request-send=         | Send request           |
+| =C-c C-e= | =courier-request-switch-env=   | Switch environment     |
+| =C-c C-p= | =courier-request-preview=      | Preview resolved form  |
+| =C-c C-l= | =courier-request-validate=     | Validate syntax        |
+
+Use =M-x courier-new-request= to scaffold a new =.http= request file in the
+current directory.
+
+** Response Mode
+
+| Key       | Command                            | Description               |
+|-----------+------------------------------------+---------------------------|
+| =TAB=     | =courier-response-toggle-section=  | Fold or unfold section    |
+| =n=       | =courier-response-next-section=    | Next section heading      |
+| =p=       | =courier-response-prev-section=    | Previous section heading  |
+| =g=       | =courier-response-retry=           | Resend request            |
+| =v=       | =courier-response-toggle-pretty=   | Toggle JSON pretty-print  |
+| =[=       | =courier-response-history-prev=    | Show older response       |
+| =]=       | =courier-response-history-next=    | Show newer response       |
+| =C-c C-k= | =courier-response-cancel=          | Cancel request            |
+| =q=       | quit                               | Close buffer              |
+
+* Response Buffer
+
+The response buffer has five collapsible sections:
+
+- *Summary* shows status, duration, size, and content type.
+- *Headers* shows response headers.
+- *Body* shows the response body. JSON is pretty-printed by default when
+  possible, and =v= toggles back to the raw body.
+- *Tests* shows pass/fail indicators for all =# @test= directives. It expands
+  automatically when any test fails.
+- *Trace* shows the curl command, stderr, and exit code.
+
+Press =[= and =]= to browse response history. The header line shows the
+timestamp and position (for example =2/5=) when viewing a past response.
+
+* Customization
+
+| Variable                      | Default   | Description                      |
+|-------------------------------+-----------+----------------------------------|
+| =courier-curl-executable=     | ="curl"=  | Path to curl                     |
+| =courier-body-text-max-size=  | =524288=  | Max body size decoded as text    |
+| =courier-default-timeout=     | =30=      | Default timeout in seconds       |
+| =courier-history-max=         | =20=      | Max history entries per request  |

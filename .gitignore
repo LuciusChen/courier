@@ -1,0 +1,13 @@
+# Byte-compiled and native-compiled Emacs artifacts.
+*.elc
+eln-cache/
+
+# Editor-local state and temp files.
+*~
+\#*\#
+.\#*
+auto-save-list/
+.dir-locals-2.el
+
+# macOS Finder metadata.
+.DS_Store
