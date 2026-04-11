@@ -154,12 +154,12 @@ collection."
   "Fallback HTTP reason phrases keyed by status code.")
 
 (defface courier-response-tab-active-face
-  '((t :inherit header-line :weight bold :underline t))
-  "Face used for the active Courier response tab.")
+  '((t :inherit bold :underline t))
+  "Face used for the active Courier response navigation tab.")
 
 (defface courier-response-tab-inactive-face
   '((t :inherit shadow))
-  "Face used for inactive Courier response tabs.")
+  "Face used for inactive Courier response navigation tabs.")
 
 (defface courier-response-tab-count-face
   '((t :inherit shadow :height 0.95))
@@ -176,6 +176,12 @@ collection."
 (defface courier-response-timeline-heading-face
   '((t :inherit warning :weight bold))
   "Face used for Courier timeline section headings.")
+
+(defface courier-response-timeline-entry-face
+  '((((background dark)) :background "#1f2227")
+    (((background light)) :background "#eceff4")
+    (t :inherit shadow))
+  "Face used for the first summary line of Courier timeline entries.")
 
 (defface courier-response-status-success-face
   '((t :inherit success :weight bold))
@@ -198,8 +204,10 @@ collection."
   "Face used for Courier response URLs.")
 
 (defface courier-response-timeline-selected-face
-  '((t :inherit highlight))
-  "Face used for the selected Courier timeline history entry.")
+  '((((background dark)) :background "#2a313a")
+    (((background light)) :background "#dbe5f2")
+    (t :inherit highlight))
+  "Face used for the selected Courier timeline history entry summary line.")
 
 ;;;; Parsing
 
@@ -1391,6 +1399,27 @@ Each entry is a cons cell of the form `(TIMESTAMP . RESPONSE)'.")
 (defvar-local courier--history-index nil
   "Expanded history index in the current timeline, or nil when collapsed.")
 
+(defvar-local courier--response-content-start nil
+  "Marker for the start of the current response buffer content region.")
+
+(defvar-local courier--timeline-details-start nil
+  "Marker for the start of the expanded Courier timeline details block.")
+
+(defvar-local courier--timeline-details-end nil
+  "Marker for the end of the expanded Courier timeline details block.")
+
+(defun courier--response-content-start-position ()
+  "Return the current response content start position."
+  (if (markerp courier--response-content-start)
+      (marker-position courier--response-content-start)
+    (point-min)))
+
+(defun courier--response-layout-ready-p ()
+  "Return non-nil when the current response buffer has layout markers."
+  (and (markerp courier--response-content-start)
+       (markerp courier--timeline-details-start)
+       (markerp courier--timeline-details-end)))
+
 (defun courier--json-content-type-p (content-type)
   "Return non-nil when CONTENT-TYPE identifies JSON."
   (and content-type
@@ -1601,45 +1630,92 @@ Each entry is a cons cell of the form `(TIMESTAMP . RESPONSE)'.")
     (_
      nil)))
 
-(defun courier--response-tab-button (tab response)
-  "Return a clickable header-line button string for TAB using RESPONSE."
-  (let* ((label (courier--response-tab-display-name tab))
-         (count (courier--response-tab-count tab response))
-         (text (if (and count (> count 0))
-                   (concat label " "
-                           (propertize (number-to-string count)
-                                       'face 'courier-response-tab-count-face))
-                 label))
-         (map (make-sparse-keymap))
-         (face (if (eq tab courier--response-tab)
-                   'courier-response-tab-active-face
-                 'courier-response-tab-inactive-face)))
-    (define-key map [header-line mouse-1]
-      (lambda ()
-        (interactive)
-        (courier-response-set-tab tab)))
-    (define-key map [header-line down-mouse-1] #'ignore)
-    (propertize text
-                'face face
-                'mouse-face 'mode-line-highlight
-                'help-echo (format "Switch to %s"
-                                   (courier--response-tab-display-name tab))
-                'follow-link t
-                'local-map map)))
+(defun courier--label-with-count (label count)
+  "Return LABEL decorated with COUNT when COUNT is positive."
+  (if (and count (> count 0))
+      (concat label
+              (propertize "(" 'face 'default)
+              (propertize (number-to-string count)
+                          'face 'courier-response-tab-count-face)
+              (propertize ")" 'face 'default))
+    label))
 
-(defun courier--current-response-tab-button (response)
-  "Return the clickable header-line button for the current response tab."
-  (let ((tab (or courier--response-tab 'response))
-        (map (make-sparse-keymap)))
-    (define-key map [header-line mouse-1] #'courier-response-set-tab)
-    (define-key map [header-line down-mouse-1] #'ignore)
-    (propertize (substring-no-properties
-                 (courier--response-tab-button tab response))
-                'face 'courier-response-tab-active-face
-                'mouse-face 'mode-line-highlight
-                'help-echo "Switch response view"
-                'follow-link t
-                'local-map map)))
+(defun courier--response-tab-label (tab response)
+  "Return the display text for response TAB using RESPONSE."
+  (courier--label-with-count
+   (courier--response-tab-display-name tab)
+   (courier--response-tab-count tab response)))
+
+(defun courier--response-view-prefix (response)
+  "Return the header-line view prefix for RESPONSE."
+  (concat
+   (propertize (courier--response-tab-label courier--response-tab response)
+               'face 'courier-response-tab-active-face)
+   "  "
+   (propertize ">>" 'face 'courier-response-tab-inactive-face)))
+
+(defun courier--ensure-response-layout ()
+  "Ensure the current Courier response buffer has content markers."
+  (unless (markerp courier--response-content-start)
+    (setq courier--response-content-start (copy-marker (point-min))))
+  (unless (markerp courier--timeline-details-start)
+    (setq courier--timeline-details-start (copy-marker (point-min))))
+  (unless (markerp courier--timeline-details-end)
+    (setq courier--timeline-details-end (copy-marker (point-min))))
+  (set-marker courier--response-content-start (point-min)))
+
+(defun courier--replace-response-content ()
+  "Replace the response content region in the current buffer."
+  (courier--ensure-response-layout)
+  (let ((inhibit-read-only t))
+    (delete-region (marker-position courier--response-content-start) (point-max))
+    (goto-char (marker-position courier--response-content-start))
+    (set-marker courier--timeline-details-start (point-min))
+    (set-marker courier--timeline-details-end (point-min))
+    (courier--insert-response-tab courier--response courier--request)))
+
+(defun courier--capture-response-window-state ()
+  "Capture point and window offsets for the current response buffer."
+  (let ((content-start (courier--response-content-start-position))
+        (buffer (current-buffer)))
+    (list
+     :point-offset (max 0 (- (point) content-start))
+     :windows
+     (mapcar
+      (lambda (window)
+        (list window
+              (max 0 (- (window-start window) content-start))
+              (max 0 (- (window-point window) content-start))))
+      (get-buffer-window-list buffer nil t)))))
+
+(defun courier--restore-response-window-state (state)
+  "Restore response buffer point and window STATE."
+  (let* ((content-start (courier--response-content-start-position))
+         (point-offset (plist-get state :point-offset))
+         (windows (plist-get state :windows)))
+    (goto-char (min (point-max) (+ content-start point-offset)))
+    (dolist (entry windows)
+      (pcase-let ((`(,window ,start-offset ,point-offset) entry))
+        (when (window-live-p window)
+          (set-window-start window
+                            (min (point-max) (+ content-start start-offset))
+                            t)
+          (set-window-point window
+                            (min (point-max) (+ content-start point-offset))))))))
+
+(defun courier--call-preserving-response-window-state (fn)
+  "Call FN while preserving response buffer point and window state."
+  (let ((state (courier--capture-response-window-state)))
+    (funcall fn)
+    (courier--restore-response-window-state state)))
+
+(defun courier--reset-response-window-state ()
+  "Reset point and window starts to the top of the current response buffer."
+  (goto-char (point-min))
+  (dolist (window (get-buffer-window-list (current-buffer) nil t))
+    (when (window-live-p window)
+      (set-window-start window (point-min) t)
+      (set-window-point window (point-min)))))
 
 (defun courier--timeline-entry-button-action (button)
   "Toggle the timeline entry referenced by BUTTON."
@@ -1696,22 +1772,12 @@ Each entry is a cons cell of the form `(TIMESTAMP . RESPONSE)'.")
           courier--response)
     courier--response))
 
-(defun courier--clear-timeline-button ()
-  "Return a clickable header-line button that clears the timeline."
-  (let ((map (make-sparse-keymap)))
-    (define-key map [header-line mouse-1] #'courier-response-clear-timeline)
-    (define-key map [header-line down-mouse-1] #'ignore)
-    (propertize "Clear Timeline"
-                'face 'link
-                'mouse-face 'mode-line-highlight
-                'help-echo "Clear the timeline history for this response buffer"
-                'follow-link t
-                'local-map map)))
-
 (defun courier--response-header-line-format (response)
   "Return the complete header line format for RESPONSE."
   (let* ((summary-response (or (courier--header-summary-response)
                                response))
+         (view-prefix
+          (courier--response-view-prefix summary-response))
          (summary
           (if (and (eq courier--response-tab 'timeline)
                    (numberp courier--history-index))
@@ -1721,16 +1787,7 @@ Each entry is a cons cell of the form `(TIMESTAMP . RESPONSE)'.")
                  summary-response timestamp courier--history-index
                  (length courier--history)))
             (courier--response-header-line summary-response))))
-    (concat
-     " "
-     (courier--current-response-tab-button response)
-     courier--header-separator
-     summary
-     (if (and (eq courier--response-tab 'timeline)
-              (numberp courier--history-index))
-         (concat courier--header-separator
-                 (courier--clear-timeline-button))
-       ""))))
+    (concat " " view-prefix courier--header-separator summary)))
 
 (defun courier--body-viewer-buffer-name ()
   "Return the body viewer buffer name for the current response buffer."
@@ -1860,11 +1917,14 @@ Each entry is a cons cell of the form `(TIMESTAMP . RESPONSE)'.")
           (pcase view
             ('json
              (if-let* ((body-text (plist-get response :body-text)))
-                 (concat
-                  (condition-case _err
-                      (courier--pretty-json-body body-text)
-                    (error body-text))
-                  "\n")
+                 (condition-case err
+                     (concat (courier--pretty-json-body body-text) "\n")
+                   (error
+                    (concat
+                     (format "[Invalid JSON body: %s]\n"
+                             (error-message-string err))
+                     body-text
+                     "\n")))
                (format "Body saved to %s\n" (plist-get response :body-file))))
             ((or 'html 'xml 'javascript 'raw)
              (cond
@@ -1922,9 +1982,10 @@ Each entry is a cons cell of the form `(TIMESTAMP . RESPONSE)'.")
                (plist-get request :method)
                (plist-get request :url))))))
 
-(defun courier--insert-timeline-heading (title)
-  "Insert timeline section heading TITLE."
-  (insert (propertize title 'face 'courier-response-timeline-heading-face))
+(defun courier--insert-timeline-heading (title &optional count)
+  "Insert timeline section heading TITLE with optional COUNT."
+  (insert (propertize (courier--label-with-count title count)
+                      'face 'courier-response-timeline-heading-face))
   (insert "\n"))
 
 (defun courier--set-response-tab-local (tab)
@@ -1951,27 +2012,46 @@ Each entry is a cons cell of the form `(TIMESTAMP . RESPONSE)'.")
                   (plist-get courier--request :url)
                   ""))
          (status-face (courier--response-status-face response))
-         (line-face (when selectedp 'courier-response-timeline-selected-face)))
-    (concat
-     (propertize status 'face (if selectedp
-                                  `(,status-face courier-response-timeline-selected-face)
-                                status-face))
-     (propertize (format "  %s" timestamp)
-                 'face (or line-face 'shadow))
-     "\n"
-     (propertize method
-                 'face (if selectedp
-                           '(courier-response-method-face courier-response-timeline-selected-face)
-                         'courier-response-method-face))
-     " "
-     (propertize url
-                 'face (if selectedp
-                           '(courier-response-url-face courier-response-timeline-selected-face)
-                         'courier-response-url-face))
-     "\n"
-     (propertize (concat duration courier--header-separator size)
-                 'face (or line-face 'shadow))
-     "\n")))
+         (summary-face (if selectedp
+                           'courier-response-timeline-selected-face
+                         'courier-response-timeline-entry-face)))
+    (if selectedp
+        (concat
+         (propertize method
+                     'face `(courier-response-method-face ,summary-face))
+         (propertize " " 'face summary-face)
+         (propertize url
+                     'face `(courier-response-url-face ,summary-face))
+         "\n")
+      (concat
+       (propertize status 'face `(,status-face ,summary-face))
+       (propertize (format "  %s" timestamp)
+                   'face `(shadow ,summary-face))
+       "\n"
+       (propertize method
+                   'face 'courier-response-method-face)
+       " "
+       (propertize url
+                   'face 'courier-response-url-face)
+       "\n"
+       (propertize (concat duration courier--header-separator size)
+                   'face 'shadow)
+       "\n"))))
+
+(defun courier--apply-string-face-properties (string buffer-start)
+  "Copy face properties from STRING into the current buffer at BUFFER-START."
+  (let ((position 0)
+        (length (length string)))
+    (while (< position length)
+      (let* ((next (or (next-single-property-change position 'face string)
+                       length))
+             (face (get-text-property position 'face string)))
+        (when face
+          (put-text-property (+ buffer-start position)
+                             (+ buffer-start next)
+                             'face
+                             face))
+        (setq position next)))))
 
 (defun courier--insert-response-body (response)
   "Insert the active response body for RESPONSE."
@@ -1980,12 +2060,15 @@ Each entry is a cons cell of the form `(TIMESTAMP . RESPONSE)'.")
     (pcase view
       ('image
        (cond
-        ((and body-file
-              (display-images-p)
-              (ignore-errors (create-image body-file)))
-         (insert-image (create-image body-file))
-         (insert "\n\n")
-         (insert body-file "\n"))
+        ((and body-file (display-images-p))
+         (condition-case err
+             (progn
+               (insert-image (create-image body-file))
+               (insert "\n\n")
+               (insert body-file "\n"))
+           (error
+            (insert (format "Image rendering failed: %s\n" (error-message-string err)))
+            (insert (format "Image body saved to %s\n" body-file)))))
         (body-file
          (insert (format "Image body saved to %s\n" body-file)))
         (t
@@ -1998,10 +2081,11 @@ Each entry is a cons cell of the form `(TIMESTAMP . RESPONSE)'.")
   (insert (propertize (or (plist-get request :url) "(no URL)")
                       'face 'courier-response-url-face))
   (insert "\n\n")
-  (courier--insert-timeline-heading "Headers")
-  (if-let* ((headers (plist-get request :headers)))
-      (insert (courier--format-headers (list :headers headers)))
-    (insert "No Headers found\n"))
+  (let ((headers (plist-get request :headers)))
+    (courier--insert-timeline-heading "Headers" (length headers))
+    (if headers
+        (insert (courier--format-headers (list :headers headers)))
+      (insert "No Headers found\n")))
   (insert "\n")
   (courier--insert-timeline-heading "Body")
   (let ((body (plist-get request :body)))
@@ -2014,10 +2098,11 @@ Each entry is a cons cell of the form `(TIMESTAMP . RESPONSE)'.")
 
 (defun courier--insert-timeline-response-view (response)
   "Insert timeline response details for RESPONSE."
-  (courier--insert-timeline-heading "Headers")
-  (if (plist-get response :headers)
-      (insert (courier--format-headers response))
-    (insert "No Headers found\n"))
+  (let ((headers (plist-get response :headers)))
+    (courier--insert-timeline-heading "Headers" (length headers))
+    (if headers
+      (insert (courier--format-headers (list :headers headers)))
+      (insert "No Headers found\n")))
   (insert "\n")
   (courier--insert-timeline-heading "Body")
   (let ((body (courier--format-body response)))
@@ -2047,8 +2132,34 @@ Each entry is a cons cell of the form `(TIMESTAMP . RESPONSE)'.")
          (courier--insert-timeline-network-logs-view response request)))
       (insert "\n"))))
 
+(defun courier--replace-selected-timeline-details ()
+  "Replace only the expanded details block for the selected timeline entry."
+  (unless (and (eq courier--response-tab 'timeline)
+               (numberp courier--history-index)
+               (markerp courier--timeline-details-start)
+               (markerp courier--timeline-details-end))
+    (user-error "No expanded Courier timeline details are available"))
+  (let* ((history-entry (nth courier--history-index courier--history))
+         (response (cdr history-entry))
+         (request (or (plist-get response :request-snapshot)
+                      courier--request))
+         (timestamp (car history-entry)))
+    (courier--call-preserving-response-window-state
+     (lambda ()
+       (let ((inhibit-read-only t))
+         (delete-region (marker-position courier--timeline-details-start)
+                        (marker-position courier--timeline-details-end))
+         (goto-char (marker-position courier--timeline-details-start))
+         (courier--insert-expanded-timeline-details response request timestamp)
+         (insert "\n")
+         (set-marker courier--timeline-details-end (point))
+         (setq header-line-format
+               (courier--response-header-line-format courier--response)))))))
+
 (defun courier--insert-response-timeline ()
   "Insert the response timeline for the current request history."
+  (set-marker courier--timeline-details-start (point-min))
+  (set-marker courier--timeline-details-end (point-min))
   (if (null courier--history)
       (insert "No history yet.\n")
     (cl-loop for history-entry in courier--history
@@ -2058,18 +2169,26 @@ Each entry is a cons cell of the form `(TIMESTAMP . RESPONSE)'.")
                                courier--request)
              for timestamp = (car history-entry)
              do
-             (insert-text-button
-              (courier--response-timeline-entry-line
-               index timestamp response)
-              'action #'courier--timeline-entry-button-action
-              'follow-link t
-              'courier-history-index index
-              'help-echo "RET, TAB, or mouse-1 to expand or collapse this response history entry")
+             (let* ((start (point))
+                    (text (courier--response-timeline-entry-line
+                           index timestamp response)))
+               (insert text)
+               (make-text-button
+                start (point)
+                'action #'courier--timeline-entry-button-action
+                'mouse-face 'highlight
+                'follow-link t
+                'courier-history-index index
+                'help-echo "RET, TAB, or mouse-1 to expand or collapse this response history entry")
+               (put-text-property start (point) 'face 'default)
+               (courier--apply-string-face-properties text start))
              (insert "\n")
              (when (and (numberp courier--history-index)
                         (= index courier--history-index))
+               (set-marker courier--timeline-details-start (point))
                (courier--insert-expanded-timeline-details response request timestamp)
-               (insert "\n")))))
+               (insert "\n")
+               (set-marker courier--timeline-details-end (point))))))
 
 (defun courier--insert-response-tab (response _request)
   "Insert the currently selected response tab for RESPONSE."
@@ -2088,11 +2207,28 @@ Each entry is a cons cell of the form `(TIMESTAMP . RESPONSE)'.")
 (defun courier--refresh-response-display ()
   "Refresh the current Courier response buffer."
   (let ((inhibit-read-only t))
-    (erase-buffer)
     (setq header-line-format
           (courier--response-header-line-format courier--response))
-    (courier--insert-response-tab courier--response courier--request)
-    (goto-char (point-min))))
+    (courier--replace-response-content)
+    (courier--reset-response-window-state)))
+
+(defun courier--refresh-response-content-only ()
+  "Refresh only the current response content region."
+  (if (courier--response-layout-ready-p)
+      (courier--call-preserving-response-window-state
+       (lambda ()
+         (setq header-line-format
+               (courier--response-header-line-format courier--response))
+         (courier--replace-response-content)))
+    (courier--refresh-response-display)))
+
+(defun courier--refresh-for-response-body-change ()
+  "Refresh after changing the active response body presentation."
+  (if (eq courier--response-tab 'response)
+      (courier--refresh-response-content-only)
+    (progn
+      (courier--set-response-tab-local 'response)
+      (courier--refresh-response-display))))
 
 (defun courier--history-push (response)
   "Push RESPONSE onto the history for the current response buffer."
@@ -2107,7 +2243,7 @@ Each entry is a cons cell of the form `(TIMESTAMP . RESPONSE)'.")
   "Render the response at `courier--history-index'."
   (unless courier--history
     (user-error "No response history"))
-  (courier--refresh-response-display))
+  (courier--refresh-response-content-only))
 
 (defun courier--response-cleanup ()
   "Clean up process and temp files for the current response buffer."
@@ -2121,6 +2257,12 @@ Each entry is a cons cell of the form `(TIMESTAMP . RESPONSE)'.")
 (define-derived-mode courier--response-mode special-mode "Courier-Response"
   "Major mode used for Courier response buffers."
   (setq-local truncate-lines nil)
+  (unless (markerp courier--response-content-start)
+    (setq-local courier--response-content-start (copy-marker (point-min))))
+  (unless (markerp courier--timeline-details-start)
+    (setq-local courier--timeline-details-start (copy-marker (point-min))))
+  (unless (markerp courier--timeline-details-end)
+    (setq-local courier--timeline-details-end (copy-marker (point-min))))
   (add-hook 'kill-buffer-hook #'courier--response-cleanup nil t))
 
 (defun courier--response-buffer-name (request)
@@ -2224,8 +2366,7 @@ Each entry is a cons cell of the form `(TIMESTAMP . RESPONSE)'.")
   (if (eq (courier--effective-body-view courier--response) 'raw)
       (courier--set-body-view-local 'auto)
     (courier--set-body-view-local 'raw))
-  (courier--set-response-tab-local 'response)
-  (courier--refresh-response-display))
+  (courier--refresh-for-response-body-change))
 
 ;;;###autoload
 (defun courier-response-set-view (view)
@@ -2242,8 +2383,7 @@ Each entry is a cons cell of the form `(TIMESTAMP . RESPONSE)'.")
   (unless courier--response
     (user-error "No Courier response is available"))
   (courier--set-body-view-local view)
-  (courier--set-response-tab-local 'response)
-  (courier--refresh-response-display))
+  (courier--refresh-for-response-body-change))
 
 (defun courier--set-response-tab (tab)
   "Switch the current response buffer to TAB."
@@ -2264,7 +2404,9 @@ Each entry is a cons cell of the form `(TIMESTAMP . RESPONSE)'.")
    (if (courier--timeline-section-expanded-p tab)
        (delq tab (copy-sequence courier--timeline-expanded-sections))
      (append courier--timeline-expanded-sections (list tab))))
-  (courier--refresh-response-display)
+  (if (numberp courier--history-index)
+      (courier--replace-selected-timeline-details)
+    (courier--refresh-response-content-only))
   (courier--goto-timeline-section-button tab))
 
 ;;;###autoload
@@ -2420,7 +2562,7 @@ The return value is one of:
     (user-error "No response history"))
   (setq courier--history nil)
   (setq courier--history-index nil)
-  (courier--refresh-response-display))
+  (courier--refresh-response-content-only))
 
 ;;;###autoload
 (defun courier-response-activate ()
@@ -2493,8 +2635,8 @@ The return value is one of:
 (define-key courier--response-mode-map (kbd "h") #'courier-response-show-headers)
 (define-key courier--response-mode-map (kbd "l") #'courier-response-show-timeline)
 (define-key courier--response-mode-map (kbd "o") #'courier-response-open-body)
-(define-key courier--response-mode-map (kbd "n") #'courier-response-next-tab)
-(define-key courier--response-mode-map (kbd "p") #'courier-response-prev-tab)
+(define-key courier--response-mode-map (kbd "]") #'courier-response-next-tab)
+(define-key courier--response-mode-map (kbd "[") #'courier-response-prev-tab)
 (define-key courier--response-mode-map (kbd "r") #'courier-response-show-response)
 (define-key courier--response-mode-map (kbd "g") #'courier-response-retry)
 (define-key courier--response-mode-map (kbd "t") #'courier-response-show-tests)
@@ -2515,6 +2657,9 @@ The return value is one of:
 
 (defvar-local courier--method-overlay nil
   "Overlay highlighting the current Courier request method.")
+
+(defvar-local courier--params-source-buffer nil
+  "Request buffer associated with the current Courier params editor.")
 
 (defface courier-request-method-get-face
   '((t :inherit success :weight bold))
@@ -3293,6 +3438,186 @@ Entries are read from the configured env directory only."
     (beginning-of-line)
     (message "Jumped to Courier %s." label)))
 
+(defun courier--current-request-url-bounds ()
+  "Return `(START . END)' for the current request URL token, or nil."
+  (save-excursion
+    (when (courier--goto-request-line)
+      (beginning-of-line)
+      (when (looking-at "^\\([A-Z]+\\)\\(?:\\s-+\\(\\S-+\\)\\)?\\s-*$")
+        (when (match-beginning 2)
+          (cons (match-beginning 2) (match-end 2)))))))
+
+(defun courier--current-request-url ()
+  "Return the current request URL token.
+Signal `user-error' when the current request line has no URL."
+  (if-let* ((bounds (courier--current-request-url-bounds)))
+      (buffer-substring-no-properties (car bounds) (cdr bounds))
+    (user-error "Current request URL is empty")))
+
+(defun courier--replace-current-request-url (url)
+  "Replace the current request URL token with URL."
+  (unless (courier--goto-request-line)
+    (user-error "No Courier request in this buffer"))
+  (beginning-of-line)
+  (cond
+   ((looking-at "^\\([A-Z]+\\)\\(\\s-+\\)\\(\\S-+\\)\\(\\s-*\\)$")
+    (replace-match url t t nil 3))
+   ((looking-at "^\\([A-Z]+\\)\\(\\s-*\\)$")
+    (goto-char (match-end 1))
+    (insert " " url))
+   (t
+    (user-error "Cannot replace the current request URL"))))
+
+(defun courier--split-request-url (url)
+  "Split URL into `(BASE QUERY FRAGMENT)'."
+  (let* ((fragment-pos (string-match "#" url))
+         (fragment (and fragment-pos (substring url fragment-pos)))
+         (without-fragment (if fragment-pos
+                               (substring url 0 fragment-pos)
+                             url))
+         (query-pos (string-match "\\?" without-fragment))
+         (base (if query-pos
+                   (substring without-fragment 0 query-pos)
+                 without-fragment))
+         (query (and query-pos
+                     (substring without-fragment (1+ query-pos)))))
+    (list base query fragment)))
+
+(defun courier--decode-query-component (value)
+  "Decode query component VALUE."
+  (url-unhex-string (replace-regexp-in-string "\\+" "%20" value t t)))
+
+(defun courier--parse-url-query-params (url)
+  "Return decoded query params from URL as an alist."
+  (pcase-let ((`(,_base ,query ,_fragment) (courier--split-request-url url)))
+    (if (or (null query) (string-empty-p query))
+        nil
+      (mapcar
+       (lambda (part)
+         (pcase-let ((`(,raw-key ,raw-value)
+                      (if (string-match "\\`\\([^=]*\\)=\\(.*\\)\\'" part)
+                          (list (match-string 1 part) (match-string 2 part))
+                        (list part ""))))
+           (cons (courier--decode-query-component raw-key)
+                 (courier--decode-query-component raw-value))))
+       (split-string query "&" t)))))
+
+(defun courier--encode-url-query-params (params)
+  "Encode PARAMS alist into a query string."
+  (mapconcat
+   (lambda (param)
+     (format "%s=%s"
+             (url-hexify-string (car param))
+             (url-hexify-string (cdr param))))
+   params "&"))
+
+(defun courier--update-request-url-query (url params)
+  "Return URL with PARAMS replacing its query string."
+  (pcase-let ((`(,base ,_query ,fragment) (courier--split-request-url url)))
+    (concat base
+            (if params
+                (concat "?" (courier--encode-url-query-params params))
+              "")
+            (or fragment ""))))
+
+(defun courier--format-params-editor-lines (params)
+  "Return editable text for PARAMS."
+  (if params
+      (mapconcat (lambda (param)
+                   (format "%s = %s" (car param) (cdr param)))
+                 params
+                 "\n")
+    ""))
+
+(defun courier--parse-params-editor-buffer ()
+  "Parse the current Courier params editor buffer into an alist."
+  (let (params)
+    (save-excursion
+      (goto-char (point-min))
+      (while (not (eobp))
+        (let ((line (string-trim-right
+                     (buffer-substring-no-properties
+                      (line-beginning-position)
+                      (line-end-position)))))
+          (unless (or (string-empty-p line)
+                      (string-prefix-p "#" line))
+            (unless (string-match "\\`\\([^=[:space:]][^=]*\\)\\s-*=\\s-*\\(.*\\)\\'" line)
+              (user-error "Invalid params line: %s" line))
+            (let ((name (string-trim (match-string 1 line)))
+                  (value (string-trim (match-string 2 line))))
+              (when (string-empty-p name)
+                (user-error "Param name cannot be empty"))
+              (push (cons name value) params))))
+        (forward-line 1)))
+    (nreverse params)))
+
+(defun courier--params-editor-buffer-name (source-buffer)
+  "Return the params editor buffer name for SOURCE-BUFFER."
+  (format "*courier-params: %s*" (buffer-name source-buffer)))
+
+(define-derived-mode courier-request-params-mode text-mode "Courier-Params"
+  "Major mode for editing Courier URL query params."
+  (setq-local header-line-format
+              " Edit query params as key = value. C-c C-c applies. C-c C-k cancels. "))
+
+(define-key courier-request-params-mode-map (kbd "C-c C-c") #'courier-request-params-apply)
+(define-key courier-request-params-mode-map (kbd "C-c C-k") #'courier-request-params-cancel)
+
+;;;###autoload
+(defun courier-request-params-apply ()
+  "Apply the current params editor contents back to the source request URL."
+  (interactive)
+  (unless (derived-mode-p 'courier-request-params-mode)
+    (user-error "Not in a Courier params editor"))
+  (let ((params (courier--parse-params-editor-buffer))
+        (source-buffer courier--params-source-buffer)
+        (editor-buffer (current-buffer)))
+    (unless (buffer-live-p source-buffer)
+      (user-error "Source Courier request buffer is no longer live"))
+    (with-current-buffer source-buffer
+      (save-excursion
+        (courier--replace-current-request-url
+         (courier--update-request-url-query
+          (courier--current-request-url)
+          params)))
+      (set-buffer-modified-p t))
+    (when-let* ((window (get-buffer-window editor-buffer)))
+      (quit-window t window))
+    (when (buffer-live-p editor-buffer)
+      (kill-buffer editor-buffer))
+    (message "Courier params applied.")))
+
+;;;###autoload
+(defun courier-request-params-cancel ()
+  "Close the current Courier params editor without applying changes."
+  (interactive)
+  (unless (derived-mode-p 'courier-request-params-mode)
+    (user-error "Not in a Courier params editor"))
+  (when-let* ((window (get-buffer-window (current-buffer))))
+    (quit-window t window))
+  (kill-buffer (current-buffer)))
+
+;;;###autoload
+(defun courier-request-edit-params ()
+  "Edit the current request URL query params in a dedicated buffer."
+  (interactive)
+  (let* ((source-buffer (current-buffer))
+         (url (courier--current-request-url))
+         (params (courier--parse-url-query-params url))
+         (buffer (get-buffer-create
+                  (courier--params-editor-buffer-name source-buffer))))
+    (with-current-buffer buffer
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (insert (courier--format-params-editor-lines params))
+        (unless params
+          (insert "# Add one param per line: key = value\n"))
+        (goto-char (point-min))
+        (courier-request-params-mode)
+        (setq-local courier--params-source-buffer source-buffer)))
+    (display-buffer buffer)
+    buffer))
+
 ;;;###autoload
 (define-derived-mode courier-request-mode text-mode "Courier"
   "Major mode for editing Courier request files."
@@ -3718,6 +4043,7 @@ This renames the request file and updates its `# @name' directive."
     ("l" "Validate" courier-request-validate)]
    ["Edit"
     ("m" "Method" courier-request-set-method)
+    ("q" "Edit params" courier-request-edit-params)
     ("e" "Environment" courier-request-switch-env)
     ("s" "Save" courier-request-save-buffer)]
    ["Navigate"
@@ -3749,9 +4075,11 @@ This renames the request file and updates its `# @name' directive."
    ["Run"
     ("g" "Retry" courier-response-retry)
     ("k" "Cancel" courier-response-cancel)]
+   ["Timeline"
+    ("c" "Clear timeline" courier-response-clear-timeline)]
    ["Navigate"
-    ("n" "Next view" courier-response-next-tab)
-    ("p" "Prev view" courier-response-prev-tab)]])
+    ("]" "Next view" courier-response-next-tab)
+    ("[" "Prev view" courier-response-prev-tab)]])
 
 ;;;###autoload
 (transient-define-prefix courier-overview-menu ()

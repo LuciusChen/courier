@@ -48,7 +48,7 @@
 ## Version Baseline
 
 - `courier` targets **Emacs 29.1+**.
-- No external Emacs package dependencies for v0.1.
+- `transient` is an approved runtime dependency for action menus.
 - curl must be available on PATH.
 
 ## MELPA Compatibility
@@ -58,7 +58,8 @@
 - First line: `;;; file.el --- Short description -*- lexical-binding: t; -*-`
   - Description must NOT contain "for Emacs" or the package name.
   - Keep the description under 60 characters.
-- `;; Package-Requires:` must list `((emacs "29.1"))`.
+- `;; Package-Requires:` must include `((emacs "29.1"))` and any approved
+  runtime dependencies currently used by Courier, including `transient`.
 - `;; URL:`, `;; Version:`, `;; Author:` headers are required.
 - Last line: `;;; file.el ends here`
 

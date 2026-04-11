@@ -9,7 +9,7 @@ buffers.
 
 - Edit HTTP requests as plain text in =.http= files
 - Send requests with =C-c C-c= without blocking Emacs
-- View responses in a single buffer with a clickable header-line view control and an Emacs-native timeline inspector
+- View responses in a single buffer with a header-line current-view indicator and an Emacs-native timeline inspector
 - Variable interpolation with ={{name}}= syntax
 - Built-in test assertions for status, headers, body, timing, and size
 - Preview resolved requests before sending
@@ -98,6 +98,9 @@ Use ={{name}}= anywhere in the URL, headers, or body. Variables are defined
 with =# @var= directives. Recursive expansion is supported up to 10 levels.
 Use =# @param= for query parameters; path parameters should stay in the URL
 itself and use ={{var}}= placeholders when needed.
+If you prefer editing URL query params as key/value lines, use
+=M-x courier-request-edit-params= or the request action menu. Courier opens a
+small editor buffer and writes the result back into the request URL.
 
 ** Auth
 
@@ -211,7 +214,9 @@ submenu for copying =curl=, =httpie=, or =wget= commands with or without
 variable interpolation. The same menu also provides =Insert...= and
 =Inspect...= submenus for adding =# @param=, =# @auth=, and
 pre-request/post-response script blocks, or jumping to the existing directive
-in the current request buffer.
+in the current request buffer. It also exposes =Edit params=, which edits the
+current URL query string in a dedicated key/value buffer and writes it back to
+the request line on apply.
 
 Use =C-c C-b= to open the current collection overview. The overview buffer
 lists requests, shows recent status and environment context, and supports:
@@ -242,8 +247,8 @@ Request and folder management stay file-based. Courier renames and moves normal
 | =l=       | =courier-response-show-timeline=   | Show Timeline tab         |
 | =o=       | =courier-response-open-body=       | Open body viewer          |
 | =g=       | =courier-response-retry=           | Resend request            |
-| =n=       | =courier-response-next-tab=        | Next response tab         |
-| =p=       | =courier-response-prev-tab=        | Previous response tab     |
+| =]=       | =courier-response-next-tab=        | Next response tab         |
+| =[=       | =courier-response-prev-tab=        | Previous response tab     |
 | =r=       | =courier-response-show-response=   | Show Response tab         |
 | =t=       | =courier-response-show-tests=      | Show Tests tab            |
 | =v=       | =courier-response-set-view=        | Select body view          |
@@ -255,9 +260,9 @@ Body views currently include =auto=, =json=, =html=, =xml=, =javascript=,
 in a dedicated viewer buffer; text-like views use an appropriate major mode,
 and image views display the image when Emacs can render it. The main response
 buffer also applies syntax highlighting to =json=, =html=, =xml=, and
-=javascript= body views. The current top-level view lives at the front of the
-header line, switches the main buffer contents, supports the normal keyboard
-commands above, and can also be clicked with the mouse to choose another view.
+=javascript= body views. The active top-level response view is shown in the
+=header-line= as =Response >>=, =Headers >>=, =Timeline >>=, or =Tests >>=;
+use =[= and =]= to cycle views, or the direct keys =r=, =h=, =l=, and =t=.
 Use =C-c ?= in request, response, and overview buffers to open a transient menu
 for the actions that make sense in the current Courier context.
 
@@ -278,14 +283,15 @@ The response buffer has four top-level views:
   - *Network Logs* shows curl-level diagnostics such as argv, stderr, and exit
     code.
   Those section headings are buttons: use =RET= or mouse-1 on them to toggle
-  sections open and closed. Use =Clear Timeline= in the header line to clear
-  the current response buffer's timeline history, or press =RET= on the same
-  history entry again to collapse the expanded view.
+  sections open and closed. Use =M-x courier-response-clear-timeline= or the
+  response transient menu to clear the current response buffer's timeline
+  history, or press =RET= on the same history entry again to collapse the
+  expanded view.
 - *Tests* shows pass/fail indicators for all =# @test= directives.
 
-The header line shows the current view first, then status, duration, size, and
-when visiting an older timeline entry it also shows the history position (for
-example =2/5=).
+The header line shows the current response view first, then status, duration,
+and size; when visiting an older timeline entry it also shows the history
+position (for example =2/5=).
 
 * Customization
 

@@ -201,8 +201,9 @@ manager. It is a source of variable values for request resolution.
 ### 4. Send and inspect response
 
 - user sends request
-- response buffer centers on one response at a time, with a header-line view
-  control for Response, Headers, Timeline, and Tests
+- response buffer centers on one response at a time, with the active view shown
+  in the header line as `Response >>`, `Headers >>`, `Timeline >>`, or `Tests >>`
+  before the status summary
 - user changes response view as needed
 - response history remains available for the same request
 - `C-c ?` opens a context-aware action menu in request, response, and overview buffers
@@ -220,6 +221,8 @@ manager. It is a source of variable values for request resolution.
 - request actions expose transient submenus for export, snippet insertion, and
   jumping to existing request directives without adding always-visible request
   side panels
+- query params may be edited either directly in the URL or through a dedicated
+  key/value editor that writes back into the URL query string
 
 ### 6. Work from overview
 
@@ -345,7 +348,8 @@ Acceptance:
 Deliver:
 
 - cleaner header line
-- a clickable header-line current-view control for Response, Headers, Timeline, and Tests
+- a header-line current-view indicator for Response, Headers, Timeline, and Tests,
+  switched with `[` and `]`
 - a collapsed-by-default Timeline history list
 - expandable Timeline detail sections for Request, Response, and Network Logs
 - syntax highlighting through suitable major modes
