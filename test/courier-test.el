@@ -98,7 +98,9 @@
           (concat "# @name Example\n"
                   "# @timeout 12\n"
                   "# @follow-redirects true\n"
+                  "# @auth bearer {{token}}\n"
                   "# @var token abc\n"
+                  "# @param page 1\n"
                   "# @test status == 200\n"
                   "POST https://example.com\n"
                   "Accept: application/json\n"
@@ -107,6 +109,9 @@
     (should (equal (plist-get request :name) "Example"))
     (should (equal (plist-get (plist-get request :settings) :timeout) 12))
     (should (equal (plist-get (plist-get request :settings) :follow-redirects) t))
+    (should (equal (plist-get request :auth)
+                   '(:type bearer :token "{{token}}")))
+    (should (equal (plist-get request :params) '(("page" . "1"))))
     (should (equal (plist-get request :vars) '(("token" . "abc"))))
     (should (equal (plist-get request :tests) '("status == 200")))))
 
@@ -136,6 +141,20 @@
   (should-error
    (courier-test--parsed
     (concat "# @unknown nope\n"
+            "GET https://example.com\n"))
+   :type 'user-error))
+
+(ert-deftest courier-parse-rejects-invalid-param-directive ()
+  (should-error
+   (courier-test--parsed
+    (concat "# @param only-key\n"
+            "GET https://example.com\n"))
+   :type 'user-error))
+
+(ert-deftest courier-parse-rejects-invalid-auth-directive ()
+  (should-error
+   (courier-test--parsed
+    (concat "# @auth nope value\n"
             "GET https://example.com\n"))
    :type 'user-error))
 
@@ -208,6 +227,33 @@
     (should (equal (plist-get request :vars)
                    '(("one" . "1") ("two" . "2"))))))
 
+(ert-deftest courier-parse-multiple-params ()
+  (let ((request
+         (courier-test--parsed
+          (concat "# @param page 1\n"
+                  "# @param sort created at\n"
+                  "GET https://example.com\n"))))
+    (should (equal (plist-get request :params)
+                   '(("page" . "1")
+                     ("sort" . "created at"))))))
+
+(ert-deftest courier-parse-script-blocks ()
+  (let ((request
+         (courier-test--parsed
+          (concat "# @begin pre-request\n"
+                  "# (plist-put courier-script-request :url \"https://example.com/from-script\")\n"
+                  "# courier-script-request\n"
+                  "# @end\n"
+                  "# @begin post-response\n"
+                  "# (plist-put courier-script-response :reason \"Changed\")\n"
+                  "# courier-script-response\n"
+                  "# @end\n"
+                  "GET https://example.com\n"))))
+    (should (string-match-p "from-script"
+                            (plist-get request :pre-request-script)))
+    (should (string-match-p "Changed"
+                            (plist-get request :post-response-script)))))
+
 (ert-deftest courier-parse-multiple-tests ()
   (let ((request
          (courier-test--parsed
@@ -252,6 +298,7 @@
                         :url "https://example.com/{{id}}"
                         :headers '(("authorization" . "Bearer {{token}}"))
                         :body "{\"id\":\"{{id}}\"}"
+                        :params nil
                         :vars '(("id" . "42") ("token" . "abc"))
                         :tests nil
                         :settings nil))
@@ -260,6 +307,138 @@
     (should (equal (plist-get resolved :headers)
                    '(("authorization" . "Bearer abc"))))
     (should (equal (plist-get resolved :body) "{\"id\":\"42\"}"))))
+
+(ert-deftest courier-resolve-request-adds-bearer-auth-header ()
+  (let* ((request (list :path "/tmp/demo.http"
+                        :name "Demo"
+                        :method "GET"
+                        :url "https://example.com"
+                        :headers nil
+                        :body ""
+                        :params nil
+                        :vars '(("token" . "abc"))
+                        :auth '(:type bearer :token "{{token}}")
+                        :tests nil
+                        :settings nil))
+         (resolved (courier-resolve-request request)))
+    (should (equal (plist-get resolved :headers)
+                   '(("authorization" . "Bearer abc"))))))
+
+(ert-deftest courier-resolve-request-explicit-header-wins-over-auth ()
+  (let* ((request (list :path "/tmp/demo.http"
+                        :name "Demo"
+                        :method "GET"
+                        :url "https://example.com"
+                        :headers '(("authorization" . "Bearer explicit"))
+                        :body ""
+                        :params nil
+                        :vars '(("token" . "abc"))
+                        :auth '(:type bearer :token "{{token}}")
+                        :tests nil
+                        :settings nil))
+         (resolved (courier-resolve-request request)))
+    (should (equal (plist-get resolved :headers)
+                   '(("authorization" . "Bearer explicit"))))))
+
+(ert-deftest courier-resolve-request-basic-auth-encodes-credentials ()
+  (let* ((request (list :path "/tmp/demo.http"
+                        :name "Demo"
+                        :method "GET"
+                        :url "https://example.com"
+                        :headers nil
+                        :body ""
+                        :params nil
+                        :vars '(("user" . "lucy")
+                                ("password" . "secret"))
+                        :auth '(:type basic
+                                :username "{{user}}"
+                                :password "{{password}}")
+                        :tests nil
+                        :settings nil))
+         (resolved (courier-resolve-request request)))
+    (should (equal (plist-get resolved :headers)
+                   '(("authorization" . "Basic bHVjeTpzZWNyZXQ="))))))
+
+(ert-deftest courier-resolve-request-appends-query-params ()
+  (let* ((request (list :path "/tmp/demo.http"
+                        :name "Demo"
+                        :method "GET"
+                        :url "https://example.com/users"
+                        :headers nil
+                        :body ""
+                        :params '(("page" . "1")
+                                  ("sort" . "created at"))
+                        :vars nil
+                        :tests nil
+                        :settings nil))
+         (resolved (courier-resolve-request request)))
+    (should (equal (plist-get resolved :params)
+                   '(("page" . "1")
+                     ("sort" . "created at"))))
+    (should (equal (plist-get resolved :url)
+                   "https://example.com/users?page=1&sort=created%20at"))))
+
+(ert-deftest courier-resolve-request-appends-query-params-to-existing-query ()
+  (let* ((request (list :path "/tmp/demo.http"
+                        :name "Demo"
+                        :method "GET"
+                        :url "https://example.com/users?active=true"
+                        :headers nil
+                        :body ""
+                        :params '(("page" . "1"))
+                        :vars nil
+                        :tests nil
+                        :settings nil))
+         (resolved (courier-resolve-request request)))
+    (should (equal (plist-get resolved :url)
+                   "https://example.com/users?active=true&page=1"))))
+
+(ert-deftest courier-resolve-request-expands-query-param-values ()
+  (let* ((request (list :path "/tmp/demo.http"
+                        :name "Demo"
+                        :method "GET"
+                        :url "https://example.com/users"
+                        :headers nil
+                        :body ""
+                        :params '(("page" . "{{page}}")
+                                  ("q" . "{{term}}"))
+                        :vars '(("page" . "2")
+                                ("term" . "Lucy Chen"))
+                        :tests nil
+                        :settings nil))
+         (resolved (courier-resolve-request request)))
+    (should (equal (plist-get resolved :url)
+                   "https://example.com/users?page=2&q=Lucy%20Chen"))))
+
+(ert-deftest courier-run-pre-request-script-can-rewrite-request ()
+  (let* ((request (list :path "/tmp/demo.http"
+                        :method "GET"
+                        :url "https://example.com"
+                        :headers nil
+                        :body ""
+                        :params nil
+                        :vars nil
+                        :pre-request-script
+                        (concat
+                         "(setq courier-script-request\n"
+                         "      (plist-put courier-script-request :url\n"
+                         "                 \"https://example.com/from-script\"))\n"
+                         "courier-script-request")))
+         (updated (courier--run-pre-request-script request nil)))
+    (should (equal (plist-get updated :url)
+                   "https://example.com/from-script"))))
+
+(ert-deftest courier-run-post-response-script-can-rewrite-response ()
+  (let* ((request (list :path "/tmp/demo.http"
+                        :post-response-script
+                        (concat
+                         "(setq courier-script-response\n"
+                         "      (plist-put courier-script-response :reason \"Changed\"))\n"
+                         "courier-script-response")))
+         (response '(:status-code 200 :reason "OK")))
+    (should (equal (plist-get (courier--run-post-response-script request response nil)
+                              :reason)
+                   "Changed"))))
 
 (ert-deftest courier-expand-recursive-variable ()
   (should (equal (courier-expand-template "{{outer}}"
@@ -962,6 +1141,28 @@
       (should button)
       (should (= 1 (button-get button 'courier-history-index))))))
 
+(ert-deftest courier-response-clear-timeline-removes-history ()
+  (with-temp-buffer
+    (courier--render-response
+     (courier-test--make-response 200)
+     courier-test--request)
+    (courier--render-response
+     (courier-test--make-response 404)
+     courier-test--request)
+    (courier-response-show-timeline)
+    (courier-response-clear-timeline)
+    (should-not courier--history)
+    (should-not courier--history-index)
+    (should (string-match-p "No history yet\\." (buffer-string)))))
+
+(ert-deftest courier-response-clear-timeline-errors-without-history ()
+  (with-temp-buffer
+    (courier--render-response
+     (courier-test--make-response 200)
+     courier-test--request)
+    (setq courier--history nil)
+    (should-error (courier-response-clear-timeline) :type 'user-error)))
+
 (ert-deftest courier-test-history-respects-max ()
   (let ((courier-history-max 3))
     (with-temp-buffer
@@ -1197,6 +1398,156 @@
                     (overlay-end courier--method-overlay))
                    "GET"))))
 
+(ert-deftest courier-dispatch-routes-request-mode ()
+  (courier-test--with-request
+      "GET https://example.com\n"
+    (courier-request-mode)
+    (let (called)
+      (cl-letf (((symbol-function 'transient-setup)
+                 (lambda (prefix &rest _args)
+                   (setq called prefix))))
+        (courier-dispatch))
+      (should (eq called 'courier-request-menu)))))
+
+(ert-deftest courier-dispatch-routes-response-mode ()
+  (with-temp-buffer
+    (courier--render-response
+     (courier-test--make-response 200)
+     courier-test--request)
+    (let (called)
+      (cl-letf (((symbol-function 'transient-setup)
+                 (lambda (prefix &rest _args)
+                   (setq called prefix))))
+        (courier-dispatch))
+      (should (eq called 'courier-response-menu)))))
+
+(ert-deftest courier-dispatch-routes-overview-mode ()
+  (with-temp-buffer
+    (courier-overview-mode)
+    (let (called)
+      (cl-letf (((symbol-function 'transient-setup)
+                 (lambda (prefix &rest _args)
+                   (setq called prefix))))
+        (courier-dispatch))
+      (should (eq called 'courier-overview-menu)))))
+
+(ert-deftest courier-mode-maps-bind-c-c-question ()
+  (should (eq (lookup-key courier-request-mode-map (kbd "C-c ?"))
+              #'courier-dispatch))
+  (should (eq (lookup-key courier-overview-mode-map (kbd "C-c ?"))
+              #'courier-dispatch))
+  (should (eq (lookup-key courier--response-mode-map (kbd "C-c ?"))
+              #'courier-dispatch)))
+
+(ert-deftest courier-current-export-command-builds-curl ()
+  (courier-test--with-request
+      (concat "# @auth bearer {{token}}\n"
+              "# @var token abc123\n"
+              "# @param page 1\n"
+              "POST https://example.com/users\n"
+              "Accept: application/json\n"
+              "\n"
+              "{\"name\":\"Lucy\"}\n")
+    (courier-request-mode)
+    (setq-local courier--export-format 'curl
+                courier--export-interpolate t)
+    (let ((command (courier--current-export-command)))
+      (should (string-match-p (regexp-quote "curl --request POST") command))
+      (should (string-match-p
+               (regexp-quote "--url https\\://example.com/users\\?page\\=1")
+               command))
+      (should (string-match-p
+               (regexp-quote "authorization\\:\\ Bearer\\ abc123")
+               command))
+      (should (string-match-p (regexp-quote "--data-raw") command)))))
+
+(ert-deftest courier-current-export-command-builds-httpie ()
+  (courier-test--with-request
+      (concat "# @param page 1\n"
+              "GET https://example.com/users\n"
+              "Accept: application/json\n")
+    (courier-request-mode)
+    (setq-local courier--export-format 'httpie
+                courier--export-interpolate t)
+    (let ((command (courier--current-export-command)))
+      (should (string-match-p
+               (regexp-quote "http GET https\\://example.com/users\\?page\\=1")
+               command))
+      (should (string-match-p
+               (regexp-quote "accept\\:application/json")
+               command)))))
+
+(ert-deftest courier-current-export-command-preserves-source-placeholders ()
+  (courier-test--with-request
+      (concat "# @auth bearer {{token}}\n"
+              "# @param page {{page}}\n"
+              "GET https://example.com/users/{{user_id}}\n")
+    (courier-request-mode)
+    (setq-local courier--export-format 'curl
+                courier--export-interpolate nil)
+    (let ((command (courier--current-export-command)))
+      (should (string-match-p
+               (regexp-quote "users/\\{\\{user_id\\}\\}")
+               command))
+      (should (string-match-p
+               (regexp-quote "page\\=\\{\\{page\\}\\}")
+               command))
+      (should (string-match-p
+               (regexp-quote "Bearer\\ \\{\\{token\\}\\}")
+               command)))))
+
+(ert-deftest courier-request-insert-param-adds-directive-before-request-line ()
+  (courier-test--with-request
+      "GET https://example.com/users\n"
+    (courier-request-mode)
+    (courier-request-insert-param "page" "1")
+    (should (equal (buffer-string)
+                   (concat "# @param page 1\n"
+                           "GET https://example.com/users\n")))))
+
+(ert-deftest courier-request-insert-auth-adds-directive-before-request-line ()
+  (courier-test--with-request
+      "GET https://example.com/users\n"
+    (courier-request-mode)
+    (courier-request-insert-auth 'bearer "{{token}}")
+    (goto-char (point-min))
+    (should (looking-at (regexp-quote "# @auth bearer {{token}}")))))
+
+(ert-deftest courier-request-insert-pre-request-script-adds-block ()
+  (courier-test--with-request
+      "GET https://example.com/users\n"
+    (courier-request-mode)
+    (courier-request-insert-pre-request-script)
+    (should (equal (buffer-string)
+                   (concat "# @begin pre-request\n"
+                           "# \n"
+                           "# @end\n"
+                           "GET https://example.com/users\n")))
+    (should (equal (buffer-substring-no-properties
+                    (line-beginning-position)
+                    (line-end-position))
+                   "# "))))
+
+(ert-deftest courier-request-goto-auth-moves-to-auth-line ()
+  (courier-test--with-request
+      (concat "# @auth bearer {{token}}\n"
+              "GET https://example.com/users\n")
+    (courier-request-mode)
+    (goto-char (point-max))
+    (courier-request-goto-auth)
+    (should (looking-at (regexp-quote "# @auth bearer {{token}}")))))
+
+(ert-deftest courier-request-goto-post-response-script-moves-to-script ()
+  (courier-test--with-request
+      (concat "# @begin post-response\n"
+              "# courier-script-response\n"
+              "# @end\n"
+              "GET https://example.com/users\n")
+    (courier-request-mode)
+    (goto-char (point-max))
+    (courier-request-goto-post-response-script)
+    (should (looking-at (regexp-quote "# @begin post-response")))))
+
 (ert-deftest courier-request-set-method-works-on-incomplete-request-line ()
   (courier-test--with-request
       (concat "# @name Demo\n"
@@ -1419,6 +1770,38 @@
             (should (file-exists-p (expand-file-name "courier.json" collection-root)))
             (should (file-exists-p (expand-file-name "requests/untitled-1.http"
                                                      collection-root))))
+        (when (buffer-live-p draft-buffer)
+          (kill-buffer draft-buffer))))))
+
+(ert-deftest courier-request-save-buffer-prompts-from-default-collection-directory ()
+  (courier-test--with-temp-dir (root)
+    (let* ((courier-default-collection-directory
+            (expand-file-name "courier-home" root))
+           (collection-root (expand-file-name "api-collection"
+                                              courier-default-collection-directory))
+           (draft-buffer (generate-new-buffer "*courier-save-default-root*"))
+           captured-initial)
+      (unwind-protect
+          (with-current-buffer draft-buffer
+            (insert "# @name Untitled 1\nGET \nAccept: application/json\n")
+            (setq default-directory root)
+            (courier-request-mode)
+            (cl-letf (((symbol-function 'read-directory-name)
+                       (lambda (_prompt initial &rest _args)
+                         (setq captured-initial initial)
+                         collection-root))
+                      ((symbol-function 'y-or-n-p)
+                       (lambda (&rest _args)
+                         t)))
+              (courier-request-save-buffer))
+            (let ((expected
+                   (file-name-as-directory
+                    (expand-file-name courier-default-collection-directory))))
+              (should (equal (file-name-as-directory
+                              (expand-file-name captured-initial))
+                             expected)))
+            (should (file-exists-p
+                     (expand-file-name "courier.json" collection-root))))
         (when (buffer-live-p draft-buffer)
           (kill-buffer draft-buffer))))))
 

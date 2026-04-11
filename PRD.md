@@ -109,6 +109,11 @@ A request is a `.http` file with:
 Courier should continue to treat the request text itself as authoritative.
 Request method, URL, headers, and body should always round-trip through the
 file. Commands may edit the file, but no hidden request state should exist.
+Query params may be expressed with request directives and resolved into the
+final URL, but path params still belong in the URL text itself.
+Auth metadata may also be expressed with directives and resolved into headers.
+Request-side scripting is allowed, but only through explicit text blocks in the
+request file; Courier should not invent hidden UI-only state for scripts.
 
 ## Environment Model
 
@@ -200,15 +205,21 @@ manager. It is a source of variable values for request resolution.
   control for Response, Headers, Timeline, and Tests
 - user changes response view as needed
 - response history remains available for the same request
+- `C-c ?` opens a context-aware action menu in request, response, and overview buffers
 
 ### 5. Create a new request
 
 - user creates a new request draft without choosing a path first
 - Courier gives it an `Untitled N` name and opens it as an unsaved buffer
 - the draft request line uses a configurable default method, with `GET` as the default
-- on first save, Courier asks which collection should own the request
+- on first save, Courier asks which collection should own the request, defaulting
+  to a `courier/` directory under the current user's home directory unless the
+  user customizes the default collection directory
 - if the target directory is not a collection, Courier offers to create one
 - the request is then saved into that collection's `requestsDir`
+- request actions expose transient submenus for export, snippet insertion, and
+  jumping to existing request directives without adding always-visible request
+  side panels
 
 ### 6. Work from overview
 

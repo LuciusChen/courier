@@ -18,6 +18,7 @@ buffers.
 - Start unsaved request drafts and place them into a collection on first save
 - Browse the current collection in an overview buffer with =C-c C-b=
 - Jump between requests and environments with =C-c C-o=
+- Open a context-aware action menu with =C-c ?=
 
 * Requirements
 
@@ -39,9 +40,11 @@ Create a file =example.http=:
 
 #+begin_src http
 # @name Get User
+# @auth bearer {{token}}
 # @var user_id 42
+# @param expand profile
 # @test status == 200
-GET https://httpbin.org/get?id={{user_id}}
+GET https://httpbin.org/get/{{user_id}}
 Accept: application/json
 #+end_src
 
@@ -84,6 +87,8 @@ Directives are comment lines before the request line:
 | =# @name=               | =# @name Get User=            | Human-readable name   |
 | =# @timeout=            | =# @timeout 10=               | Timeout in seconds    |
 | =# @follow-redirects=   | =# @follow-redirects true=    | Follow redirects      |
+| =# @auth=               | =# @auth bearer {{token}}=    | Add auth header       |
+| =# @param=              | =# @param page 1=             | Add query parameter   |
 | =# @var=                | =# @var key value=            | Define a variable     |
 | =# @test=               | =# @test status == 200=       | Test assertion        |
 
@@ -91,6 +96,51 @@ Directives are comment lines before the request line:
 
 Use ={{name}}= anywhere in the URL, headers, or body. Variables are defined
 with =# @var= directives. Recursive expansion is supported up to 10 levels.
+Use =# @param= for query parameters; path parameters should stay in the URL
+itself and use ={{var}}= placeholders when needed.
+
+** Auth
+
+=# @auth= currently supports three forms:
+
+- =# @auth bearer {{token}}=
+- =# @auth basic {{user}} {{password}}=
+- =# @auth header X-API-Key {{token}}=
+
+Courier resolves auth values through the same variable expansion path as the
+rest of the request. If an explicit header with the same name already exists in
+the request, that explicit header wins.
+
+** Scripts
+
+Courier supports optional Elisp script blocks before the request line:
+
+#+begin_example
+# @begin pre-request
+# (setq courier-script-request
+#       (plist-put courier-script-request :url "https://example.com/from-script"))
+# courier-script-request
+# @end
+#
+# @begin post-response
+# (setq courier-script-response
+#       (plist-put courier-script-response :reason "Changed"))
+# courier-script-response
+# @end
+GET https://example.com
+#+end_example
+
+- =pre-request= runs after parsing and env loading but before validation and
+  variable resolution.
+- =post-response= runs after the response is parsed but before Courier runs
+  =# @test= assertions.
+
+Scripts run as Elisp. The main bound variables are:
+
+- =courier-script-request=
+- =courier-script-response=
+- =courier-script-env-vars=
+- =courier-script-phase=
 
 ** Environment Files
 
@@ -136,6 +186,7 @@ token=abc123
 | =C-c C-m= | =courier-request-set-method=   | Change HTTP method     |
 | =C-c C-n= | =courier-new-request=          | Create request draft   |
 | =C-c C-p= | =courier-request-preview=      | Preview resolved form  |
+| =C-c ?=   | =courier-dispatch=             | Show request actions   |
 | =C-c C-l= | =courier-request-validate=     | Validate syntax        |
 | =C-c C-o= | =courier-open=                 | Open request or env    |
 | =C-c C-r= | =courier-rename-request=       | Rename current request |
@@ -144,20 +195,29 @@ token=abc123
 Use =M-x courier-new-request= or =C-c C-n= to open an unsaved draft buffer. The
 draft starts with =# @name Untitled N= and a request line using
 =courier-default-request-method=, which defaults to =GET=. On the first
-=C-x C-s=, Courier asks which collection should own the request. If the chosen
-directory is not already a Courier collection, Courier offers to create one
-there before saving the request into that collection's =requests/= directory.
+=C-x C-s=, Courier asks which collection should own the request, starting from
+=courier-default-collection-directory=, which defaults to a =courier/=
+directory under the current user's home directory. If the chosen directory is
+not already a Courier collection, Courier offers to create one there before
+saving the request into that collection's =requests/= directory.
 The request-line method token is highlighted with a lightweight overlay so
 =GET=/=POST=/etc. remain visually obvious while editing.
 
 Use =M-x courier-create-collection= to create a collection explicitly. Use
 =C-c C-o= inside a collection to open another =.http= file or switch the
 current buffer to a different environment from the same minibuffer picker.
+Use =C-c ?= in a request buffer for request actions, including the export
+submenu for copying =curl=, =httpie=, or =wget= commands with or without
+variable interpolation. The same menu also provides =Insert...= and
+=Inspect...= submenus for adding =# @param=, =# @auth=, and
+pre-request/post-response script blocks, or jumping to the existing directive
+in the current request buffer.
 
 Use =C-c C-b= to open the current collection overview. The overview buffer
 lists requests, shows recent status and environment context, and supports:
 
 - =RET= to open the request at point
+- =C-c ?= to show overview actions
 - =n= to create a new request
 - =f= to create a folder
 - =r= to rename the request at point
@@ -177,6 +237,7 @@ Request and folder management stay file-based. Courier renames and moves normal
 |-----------+------------------------------------+---------------------------|
 | =TAB=     | =courier-response-context-tab=     | Expand entry or move to next button |
 | =RET=     | =courier-response-activate=        | Activate timeline item or open body |
+| =C-c ?=   | =courier-dispatch=                 | Show response actions      |
 | =h=       | =courier-response-show-headers=    | Show Headers tab          |
 | =l=       | =courier-response-show-timeline=   | Show Timeline tab         |
 | =o=       | =courier-response-open-body=       | Open body viewer          |
@@ -197,6 +258,8 @@ buffer also applies syntax highlighting to =json=, =html=, =xml=, and
 =javascript= body views. The current top-level view lives at the front of the
 header line, switches the main buffer contents, supports the normal keyboard
 commands above, and can also be clicked with the mouse to choose another view.
+Use =C-c ?= in request, response, and overview buffers to open a transient menu
+for the actions that make sense in the current Courier context.
 
 * Response Buffer
 
@@ -215,8 +278,9 @@ The response buffer has four top-level views:
   - *Network Logs* shows curl-level diagnostics such as argv, stderr, and exit
     code.
   Those section headings are buttons: use =RET= or mouse-1 on them to toggle
-  sections open and closed. Use =Clear Timeline= in the header line, or press
-  =RET= on the same history entry again, to collapse the expanded view.
+  sections open and closed. Use =Clear Timeline= in the header line to clear
+  the current response buffer's timeline history, or press =RET= on the same
+  history entry again to collapse the expanded view.
 - *Tests* shows pass/fail indicators for all =# @test= directives.
 
 The header line shows the current view first, then status, duration, size, and
@@ -229,6 +293,7 @@ example =2/5=).
 |-------------------------------+-----------+----------------------------------|
 | =courier-curl-executable=     | ="curl"=  | Path to curl                     |
 | =courier-body-text-max-size=  | =524288=  | Max body size decoded as text    |
+| =courier-default-collection-directory= | user home =courier/= | Default collection prompt root |
 | =courier-default-request-method= | ="GET"= | Default method for new drafts    |
 | =courier-default-timeout=     | =30=      | Default timeout in seconds       |
 | =courier-history-max=         | =20=      | Max history entries per request  |

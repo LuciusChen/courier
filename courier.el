@@ -3,7 +3,7 @@
 ;; Author: Lucius Chen <chenyh572@gmail.com>
 ;; URL: https://github.com/LuciusChen/courier
 ;; Version: 0.2.0
-;; Package-Requires: ((emacs "29.1"))
+;; Package-Requires: ((emacs "29.1") (transient "0.4.0"))
 
 ;;; Commentary:
 
@@ -23,6 +23,8 @@
 (require 'json)
 (require 'seq)
 (require 'subr-x)
+(require 'transient)
+(require 'url-util)
 
 (defconst courier--allowed-methods
   '("GET" "POST" "PUT" "PATCH" "DELETE" "HEAD" "OPTIONS")
@@ -63,6 +65,16 @@ Set to nil to disable the default timeout."
                  (const "OPTIONS"))
   :group 'courier)
 
+(defcustom courier-default-collection-directory
+  (file-name-as-directory (expand-file-name "courier" "~"))
+  "Default directory used when creating or saving Courier collections.
+
+This directory is used as the initial prompt location when saving a new
+request draft or creating a collection outside an existing Courier
+collection."
+  :type 'directory
+  :group 'courier)
+
 (defcustom courier-history-max 20
   "Maximum number of response history entries per request."
   :type 'integer
@@ -85,6 +97,10 @@ Set to nil to disable the default timeout."
 (defconst courier--body-views
   '(auto json html xml javascript raw hex base64 image)
   "Supported Courier response body views.")
+
+(defconst courier--export-formats
+  '(curl httpie wget)
+  "Supported Courier export formats.")
 
 (defconst courier--response-tabs
   '(response headers timeline tests)
@@ -191,6 +207,10 @@ Set to nil to disable the default timeout."
   "^\\(#\\)\\s-*\\(@[[:alnum:]-]+\\)\\(?:\\s-+\\(.*\\)\\)?$"
   "Regexp used to parse directive lines.")
 
+(defconst courier--script-block-end-regexp
+  "^#\\s-*\\(@end\\)\\s-*$"
+  "Regexp used to terminate Courier script blocks.")
+
 (defconst courier--request-line-regexp
   "^\\([A-Z]+\\)\\s-+\\(\\S-+\\)\\s-*$"
   "Regexp used to parse request lines.")
@@ -278,6 +298,16 @@ Signal `user-error' when KEY is present but not a string."
                   (append (plist-get request :vars)
                           (list (cons (match-string 1 value)
                                       (match-string 2 value))))))
+      ("@param"
+       (unless (string-match "\\`\\([^[:space:]]+\\)\\s-+\\(.*\\)\\'" value)
+         (courier--parse-error line-number "Invalid @param directive"))
+       (plist-put request :params
+                  (append (plist-get request :params)
+                          (list (cons (match-string 1 value)
+                                      (match-string 2 value))))))
+      ("@auth"
+       (plist-put request :auth
+                  (courier--parse-auth-directive line-number value)))
       ("@test"
        (when (string-empty-p value)
          (courier--parse-error line-number "Invalid @test directive"))
@@ -286,6 +316,69 @@ Signal `user-error' when KEY is present but not a string."
       (_
        (courier--parse-error line-number "Unknown directive: %s" key))))
   request)
+
+(defun courier--parse-auth-directive (line-number value)
+  "Parse @auth VALUE at LINE-NUMBER into a plist."
+  (cond
+   ((string-match "\\`bearer\\s-+\\(.+\\)\\'" value)
+    (list :type 'bearer
+          :token (match-string 1 value)))
+   ((string-match "\\`basic\\s-+\\([^[:space:]]+\\)\\s-+\\(.+\\)\\'" value)
+    (list :type 'basic
+          :username (match-string 1 value)
+          :password (match-string 2 value)))
+   ((string-match "\\`header\\s-+\\([^[:space:]]+\\)\\s-+\\(.+\\)\\'" value)
+    (list :type 'header
+          :name (match-string 1 value)
+          :value (match-string 2 value)))
+   (t
+    (courier--parse-error
+     line-number
+     "Invalid @auth directive; use bearer/basic/header forms"))))
+
+(defun courier--script-field-for-kind (line-number kind)
+  "Return plist field symbol for script KIND at LINE-NUMBER."
+  (pcase kind
+    ("pre-request" :pre-request-script)
+    ("post-response" :post-response-script)
+    (_
+     (courier--parse-error
+      line-number
+      "Invalid script block kind: %s"
+      kind))))
+
+(defun courier--parse-script-block (line-number kind)
+  "Parse a script block of KIND starting after LINE-NUMBER.
+
+Point must be on the `# @begin ...' line. On success, point is left on the
+line after the matching `# @end'. Return a cons cell `(FIELD . SCRIPT)'."
+  (let ((field (courier--script-field-for-kind line-number kind))
+        lines)
+    (forward-line 1)
+    (catch 'courier-script-block
+      (while (not (eobp))
+        (let ((current-line (line-number-at-pos))
+              (line (buffer-substring-no-properties
+                     (line-beginning-position)
+                     (line-end-position))))
+          (cond
+           ((string-match-p courier--script-block-end-regexp line)
+            (forward-line 1)
+            (throw 'courier-script-block
+                   (cons field (string-join (nreverse lines) "\n"))))
+           ((string-match "\\`#\\( ?.*\\)?\\'" line)
+            (let ((content (or (match-string 1 line) "")))
+              (push (if (and (not (string-empty-p content))
+                             (eq (aref content 0) ?\s))
+                        (substring content 1)
+                      content)
+                    lines))
+            (forward-line 1))
+           (t
+            (courier--parse-error
+             current-line
+             "Script block lines must start with #")))))
+      (courier--parse-error line-number "Unclosed script block: %s" kind))))
 
 (defun courier--resolve-var (name vars stack depth)
   "Resolve variable NAME from VARS with STACK and DEPTH tracking."
@@ -344,7 +437,11 @@ Signal `user-error' when KEY is present but not a string."
   (let ((request (list :path (and buffer-file-name (expand-file-name buffer-file-name))
                        :headers nil
                        :body ""
+                       :params nil
                        :vars nil
+                       :auth nil
+                       :pre-request-script nil
+                       :post-response-script nil
                        :tests nil
                        :settings nil))
         (line-number 0)
@@ -365,8 +462,16 @@ Signal `user-error' when KEY is present but not a string."
            ((string-empty-p line)
             (forward-line 1))
            ((string-prefix-p "#" line)
-            (setq request (courier--parse-directive line-number line request))
-            (forward-line 1))
+            (unless (string-match courier--directive-regexp line)
+              (courier--parse-error line-number "Malformed directive"))
+            (let ((key (match-string 2 line))
+                  (value (or (match-string 3 line) "")))
+              (if (string= key "@begin")
+                  (pcase-let ((`(,field . ,script)
+                               (courier--parse-script-block line-number value)))
+                    (plist-put request field script))
+                (setq request (courier--parse-directive line-number line request))
+                (forward-line 1))))
            ((string-match courier--request-line-regexp line)
             (let ((method (match-string 1 line))
                   (url (match-string 2 line)))
@@ -481,17 +586,138 @@ Signal `user-error' when KEY is present but not a string."
   (let* ((vars (courier-merge-vars env-vars (plist-get request :vars)))
          (resolved-vars (courier--resolve-vars vars))
          (resolved (copy-sequence request)))
+    (plist-put resolved :params
+               (mapcar (lambda (param)
+                         (cons (car param)
+                               (courier-expand-template (cdr param) resolved-vars)))
+                       (plist-get request :params)))
     (plist-put resolved :url
-               (courier-expand-template (plist-get request :url) resolved-vars))
+               (let* ((base-url
+                       (courier-expand-template (plist-get request :url) resolved-vars))
+                      (params (plist-get resolved :params)))
+                 (if params
+                     (let* ((fragment-pos (string-match "#" base-url))
+                            (fragment (and fragment-pos
+                                           (substring base-url fragment-pos)))
+                            (url-no-fragment (if fragment-pos
+                                                 (substring base-url 0 fragment-pos)
+                                               base-url))
+                            (separator (if (string-match-p "\\?" url-no-fragment)
+                                           "&"
+                                         "?"))
+                            (query
+                             (mapconcat
+                              (lambda (param)
+                                (format "%s=%s"
+                                        (url-hexify-string (car param))
+                                        (url-hexify-string (cdr param))))
+                              params "&")))
+                       (concat url-no-fragment separator query fragment))
+                   base-url)))
     (plist-put resolved :headers
                (mapcar (lambda (header)
                          (cons (car header)
                                (courier-expand-template (cdr header) resolved-vars)))
                        (plist-get request :headers)))
+    (when-let* ((auth-header
+                 (courier--resolve-auth-header (plist-get request :auth)
+                                               resolved-vars)))
+      (unless (assoc-string (car auth-header) (plist-get resolved :headers) nil)
+        (plist-put resolved :headers
+                   (append (plist-get resolved :headers)
+                           (list auth-header)))))
     (plist-put resolved :body
                (courier-expand-template (or (plist-get request :body) "") resolved-vars))
     (plist-put resolved :resolved-vars resolved-vars)
     resolved))
+
+(defun courier--resolve-auth-header (auth resolved-vars)
+  "Resolve AUTH into a header cons cell using RESOLVED-VARS."
+  (when auth
+    (pcase (plist-get auth :type)
+      ('bearer
+       (cons "authorization"
+             (format "Bearer %s"
+                     (courier-expand-template
+                      (plist-get auth :token)
+                      resolved-vars))))
+      ('basic
+       (let* ((username (courier-expand-template
+                         (plist-get auth :username)
+                         resolved-vars))
+              (password (courier-expand-template
+                         (plist-get auth :password)
+                         resolved-vars))
+              (token (base64-encode-string (format "%s:%s" username password) t)))
+         (cons "authorization" (format "Basic %s" token))))
+      ('header
+       (cons (downcase (plist-get auth :name))
+             (courier-expand-template
+              (plist-get auth :value)
+              resolved-vars))))))
+
+(defvar courier-script-request nil
+  "Request plist bound while running Courier request scripts.")
+
+(defvar courier-script-response nil
+  "Response plist bound while running Courier response scripts.")
+
+(defvar courier-script-env-vars nil
+  "Environment variable alist bound while running Courier request scripts.")
+
+(defvar courier-script-phase nil
+  "Current Courier script phase symbol.")
+
+(defvar-local courier--export-format 'curl
+  "Current export format for the active Courier request buffer.")
+
+(defvar-local courier--export-interpolate t
+  "Whether current Courier exports should interpolate variables.")
+
+(defun courier--plist-like-p (value)
+  "Return non-nil when VALUE looks like a plist."
+  (and (listp value)
+       (or (null value)
+           (keywordp (car value)))))
+
+(defun courier--eval-script-form (script phase)
+  "Evaluate SCRIPT for PHASE and return its final form result."
+  (condition-case err
+      (eval (read (format "(progn\n%s\n)" script)) t)
+    (error
+     (user-error "Courier %s script failed: %s"
+                 phase
+                 (error-message-string err)))))
+
+(defun courier--run-pre-request-script (request env-vars)
+  "Run the pre-request script from REQUEST using ENV-VARS."
+  (if-let* ((script (plist-get request :pre-request-script))
+            ((not (string-empty-p (string-trim script)))))
+      (let ((courier-script-request (copy-tree request))
+            (courier-script-env-vars (copy-tree env-vars))
+            (courier-script-response nil)
+            (courier-script-phase 'pre-request))
+        (let ((result (courier--eval-script-form script "pre-request")))
+          (cond
+           ((courier--plist-like-p result) result)
+           ((courier--plist-like-p courier-script-request) courier-script-request)
+           (t request))))
+    request))
+
+(defun courier--run-post-response-script (request response env-vars)
+  "Run the post-response script from REQUEST against RESPONSE using ENV-VARS."
+  (if-let* ((script (plist-get request :post-response-script))
+            ((not (string-empty-p (string-trim script)))))
+      (let ((courier-script-request (copy-tree request))
+            (courier-script-response (copy-tree response))
+            (courier-script-env-vars (copy-tree env-vars))
+            (courier-script-phase 'post-response))
+        (let ((result (courier--eval-script-form script "post-response")))
+          (cond
+           ((courier--plist-like-p result) result)
+           ((courier--plist-like-p courier-script-response) courier-script-response)
+           (t response))))
+    response))
 
 ;;;###autoload
 (defun courier-run-test (response expr)
@@ -749,8 +975,6 @@ Use HEADER-FILE, BODY-FILE, and META-FILE for curl output."
                           :stderr stderr
                           :exit-code exit-code
                           :command nil)))
-      (plist-put response :tests
-                 (courier-run-tests response (plist-get request :tests)))
       response)))
 
 (defun courier--apply-response-fallbacks (response &optional start-time)
@@ -804,7 +1028,7 @@ Use HEADER-FILE, BODY-FILE, and META-FILE for curl output."
             (with-temp-file meta-file
               (when (buffer-live-p stdout-buffer)
                 (insert (with-current-buffer stdout-buffer (buffer-string)))))
-           (setq response
+            (setq response
                   (condition-case err
                       (courier-parse-response
                        header-file
@@ -821,6 +1045,13 @@ Use HEADER-FILE, BODY-FILE, and META-FILE for curl output."
             (courier--apply-response-fallbacks
              response
              (process-get process 'courier-start-time))
+            (setq response
+                  (courier--run-post-response-script
+                   request
+                   response
+                   (plist-get request :env-vars)))
+            (plist-put response :tests
+                       (courier-run-tests response (plist-get request :tests)))
             (plist-put response :command command)
             (when callback
               (funcall callback response)))
@@ -1117,6 +1348,7 @@ Use HEADER-FILE, BODY-FILE, and META-FILE for curl output."
 
 (define-key courier-overview-mode-map (kbd "RET") #'courier-overview-open)
 (define-key courier-overview-mode-map (kbd "f") #'courier-new-folder)
+(define-key courier-overview-mode-map (kbd "C-c ?") #'courier-dispatch)
 (define-key courier-overview-mode-map (kbd "e") #'courier-overview-switch-env)
 (define-key courier-overview-mode-map (kbd "g") #'courier-overview-refresh)
 (define-key courier-overview-mode-map (kbd "m") #'courier-move-request)
@@ -1465,14 +1697,14 @@ Each entry is a cons cell of the form `(TIMESTAMP . RESPONSE)'.")
     courier--response))
 
 (defun courier--clear-timeline-button ()
-  "Return a clickable header-line button that collapses the timeline."
+  "Return a clickable header-line button that clears the timeline."
   (let ((map (make-sparse-keymap)))
     (define-key map [header-line mouse-1] #'courier-response-clear-timeline)
     (define-key map [header-line down-mouse-1] #'ignore)
     (propertize "Clear Timeline"
                 'face 'link
                 'mouse-face 'mode-line-highlight
-                'help-echo "Collapse the expanded timeline entry"
+                'help-echo "Clear the timeline history for this response buffer"
                 'follow-link t
                 'local-map map)))
 
@@ -1673,8 +1905,8 @@ Each entry is a cons cell of the form `(TIMESTAMP . RESPONSE)'.")
        "\n")
     "(none)\n"))
 
-(defun courier--format-trace (response request)
-  "Return a trace section string for RESPONSE and REQUEST."
+(defun courier--format-network-logs (response request)
+  "Return a network log section string for RESPONSE and REQUEST."
   (let ((command (plist-get response :command)))
     (concat
      (format "Exit code: %d\n" (or (plist-get response :exit-code) 0))
@@ -1795,10 +2027,10 @@ Each entry is a cons cell of the form `(TIMESTAMP . RESPONSE)'.")
 
 (defun courier--insert-timeline-network-logs-view (response request)
   "Insert timeline network logs for RESPONSE and REQUEST."
-  (let ((trace (string-trim-right (courier--format-trace response request))))
-    (if (string-empty-p trace)
+  (let ((logs (string-trim-right (courier--format-network-logs response request))))
+    (if (string-empty-p logs)
         (insert "No network logs found\n")
-      (insert trace "\n"))))
+      (insert logs "\n"))))
 
 (defun courier--insert-expanded-timeline-details (response request timestamp)
   "Insert expanded timeline details for RESPONSE, REQUEST, and TIMESTAMP."
@@ -2182,13 +2414,13 @@ The return value is one of:
 
 ;;;###autoload
 (defun courier-response-clear-timeline ()
-  "Collapse the expanded Courier timeline entry."
+  "Clear the Courier timeline history for the current response buffer."
   (interactive)
-  (let ((index courier--history-index))
-    (setq courier--history-index nil)
-    (courier--refresh-response-display)
-    (when (numberp index)
-      (courier--goto-timeline-history-button index))))
+  (unless courier--history
+    (user-error "No response history"))
+  (setq courier--history nil)
+  (setq courier--history-index nil)
+  (courier--refresh-response-display))
 
 ;;;###autoload
 (defun courier-response-activate ()
@@ -2257,6 +2489,7 @@ The return value is one of:
 (define-key courier--response-mode-map (kbd "<return>") #'courier-response-activate)
 (define-key courier--response-mode-map (kbd "TAB") #'courier-response-context-tab)
 (define-key courier--response-mode-map (kbd "<tab>") #'courier-response-context-tab)
+(define-key courier--response-mode-map (kbd "C-c ?") #'courier-dispatch)
 (define-key courier--response-mode-map (kbd "h") #'courier-response-show-headers)
 (define-key courier--response-mode-map (kbd "l") #'courier-response-show-timeline)
 (define-key courier--response-mode-map (kbd "o") #'courier-response-open-body)
@@ -2517,15 +2750,20 @@ directory even when it does not exist yet."
       (insert (courier--collection-template collection-root)))
     collection-root))
 
+(defun courier--save-collection-prompt-directory ()
+  "Return the initial directory used for Courier collection prompts."
+  (or courier--collection-root-hint
+      (courier--collection-root)
+      courier-default-collection-directory
+      default-directory))
+
 (defun courier--read-save-collection-root ()
   "Prompt for the collection used to save the current request buffer."
-  (let* ((initial (or courier--collection-root-hint
-                      (courier--collection-root)
-                      default-directory))
+  (let* ((initial (courier--save-collection-prompt-directory))
          (selected (file-name-as-directory
                     (expand-file-name
                      (read-directory-name "Save request to collection: "
-                                          initial nil t)))))
+                                          initial nil nil)))))
     (or (courier--collection-root selected)
         (when (y-or-n-p
                (format "No Courier collection at %s. Create one? "
@@ -2771,15 +3009,158 @@ Entries are read from the configured env directory only."
               (courier--env-vars-for-name entries env-name)
             nil))))
 
-(defun courier--resolved-current-request ()
-  "Return the validated and resolved request for the current buffer."
-  (let* ((request (courier-parse-buffer))
-         (_validated (courier-validate-request request))
+(defun courier--prepared-current-request ()
+  "Return the current request after env selection and pre-request scripts."
+  (let* ((parsed-request (courier-parse-buffer))
          (env-selection (courier--current-env-selection))
          (env-name (car env-selection))
          (env-vars (cdr env-selection))
+         (request (courier--run-pre-request-script parsed-request env-vars)))
+    (plist-put request :env-name env-name)
+    (plist-put request :env-vars env-vars)
+    request))
+
+(defun courier--resolved-current-request ()
+  "Return the validated and resolved request for the current buffer."
+  (let* ((request (courier--prepared-current-request))
+         (env-name (plist-get request :env-name))
+         (env-vars (plist-get request :env-vars))
+         (_validated (courier-validate-request request))
          (resolved (courier-resolve-request request env-vars)))
-    (plist-put resolved :env-name env-name)))
+    (plist-put resolved :env-name env-name)
+    (plist-put resolved :env-vars env-vars)))
+
+(defun courier--export-source-url (request)
+  "Return REQUEST URL with raw query params appended for export."
+  (let ((base-url (plist-get request :url))
+        (params (plist-get request :params)))
+    (if params
+        (let* ((fragment-pos (string-match "#" base-url))
+               (fragment (and fragment-pos (substring base-url fragment-pos)))
+               (url-no-fragment (if fragment-pos
+                                    (substring base-url 0 fragment-pos)
+                                  base-url))
+               (separator (if (string-match-p "\\?" url-no-fragment) "&" "?"))
+               (query (mapconcat (lambda (param)
+                                   (format "%s=%s" (car param) (cdr param)))
+                                 params "&")))
+          (concat url-no-fragment separator query fragment))
+      base-url)))
+
+(defun courier--export-source-auth-header (auth)
+  "Return a raw auth header cons cell for AUTH, or nil."
+  (when auth
+    (pcase (plist-get auth :type)
+      ('bearer
+       (cons "authorization"
+             (format "Bearer %s" (plist-get auth :token))))
+      ('basic
+       (cons "authorization"
+             (format "Basic %s:%s"
+                     (plist-get auth :username)
+                     (plist-get auth :password))))
+      ('header
+       (cons (downcase (plist-get auth :name))
+             (plist-get auth :value))))))
+
+(defun courier--request-for-export (request)
+  "Return the current REQUEST prepared for export."
+  (courier-validate-request request)
+  (if courier--export-interpolate
+      (courier-resolve-request request (plist-get request :env-vars))
+    (let ((export (copy-tree request t)))
+      (plist-put export :url (courier--export-source-url request))
+      (when-let* ((auth-header
+                   (courier--export-source-auth-header (plist-get request :auth))))
+        (unless (assoc-string (car auth-header) (plist-get export :headers) nil)
+          (plist-put export :headers
+                     (append (plist-get export :headers)
+                             (list auth-header)))))
+      export)))
+
+(defun courier--shell-quote (string)
+  "Return STRING quoted for shell output."
+  (shell-quote-argument (or string "")))
+
+(defun courier--export-curl-command (request)
+  "Return a curl command string for REQUEST."
+  (let ((lines (list (format "curl --request %s" (plist-get request :method))
+                     (format "  --url %s"
+                             (courier--shell-quote (plist-get request :url))))))
+    (dolist (header (plist-get request :headers))
+      (setq lines
+            (append lines
+                    (list (format "  --header %s"
+                                  (courier--shell-quote
+                                   (format "%s: %s" (car header) (cdr header))))))))
+    (unless (string-empty-p (or (plist-get request :body) ""))
+      (setq lines
+            (append lines
+                    (list (format "  --data-raw %s"
+                                  (courier--shell-quote
+                                   (plist-get request :body)))))))
+    (mapconcat #'identity lines " \\\n")))
+
+(defun courier--export-httpie-command (request)
+  "Return an httpie command string for REQUEST."
+  (let ((lines (list (format "http %s %s"
+                             (plist-get request :method)
+                             (courier--shell-quote (plist-get request :url))))))
+    (dolist (header (plist-get request :headers))
+      (setq lines
+            (append lines
+                    (list (format "  %s"
+                                  (courier--shell-quote
+                                   (format "%s:%s" (car header) (cdr header))))))))
+    (unless (string-empty-p (or (plist-get request :body) ""))
+      (setq lines
+            (append lines
+                    (list (format "  <<< %s"
+                                  (courier--shell-quote
+                                   (plist-get request :body)))))))
+    (mapconcat #'identity lines " \\\n")))
+
+(defun courier--export-wget-command (request)
+  "Return a wget command string for REQUEST."
+  (let ((lines (list "wget -O -"
+                     (format "  --method=%s" (plist-get request :method)))))
+    (dolist (header (plist-get request :headers))
+      (setq lines
+            (append lines
+                    (list (format "  --header=%s"
+                                  (courier--shell-quote
+                                   (format "%s: %s" (car header) (cdr header))))))))
+    (unless (string-empty-p (or (plist-get request :body) ""))
+      (setq lines
+            (append lines
+                    (list (format "  --body-data=%s"
+                                  (courier--shell-quote
+                                   (plist-get request :body)))))))
+    (setq lines
+          (append lines
+                  (list (courier--shell-quote (plist-get request :url)))))
+    (mapconcat #'identity lines " \\\n")))
+
+(defun courier--export-command-string (request)
+  "Return an export command string for REQUEST using current export settings."
+  (pcase courier--export-format
+    ('curl (courier--export-curl-command request))
+    ('httpie (courier--export-httpie-command request))
+    ('wget (courier--export-wget-command request))
+    (_ (user-error "Unsupported export format: %s" courier--export-format))))
+
+(defun courier--current-export-command ()
+  "Return the current request export command string."
+  (courier--export-command-string
+   (courier--request-for-export (courier--prepared-current-request))))
+
+(defun courier--export-state-label ()
+  "Return a short label for current export settings."
+  (format "%s • %s"
+          (upcase (symbol-name courier--export-format))
+          (if courier--export-interpolate
+              "interpolate"
+            "source")))
 
 (defun courier--response-buffer-for-path (path)
   "Return the Courier response buffer currently associated with PATH."
@@ -2889,6 +3270,29 @@ Entries are read from the configured env directory only."
         (overlay-put overlay 'help-echo (format "Courier method: %s" method)))
     (courier--delete-method-overlay)))
 
+(defun courier--directive-insertion-point ()
+  "Return the buffer position where Courier directives should be inserted."
+  (save-excursion
+    (if (courier--goto-request-line)
+        (line-beginning-position)
+      (point-max))))
+
+(defun courier--insert-directive-text (text)
+  "Insert Courier directive TEXT before the request line."
+  (goto-char (courier--directive-insertion-point))
+  (insert text))
+
+(defun courier--goto-directive (regexp label)
+  "Move point to the first directive matching REGEXP, described by LABEL."
+  (let ((origin (point)))
+    (goto-char (point-min))
+    (unless (re-search-forward regexp nil t)
+      (goto-char origin)
+      (user-error "No Courier %s in this request" label))
+    (push-mark origin t)
+    (beginning-of-line)
+    (message "Jumped to Courier %s." label)))
+
 ;;;###autoload
 (define-derived-mode courier-request-mode text-mode "Courier"
   "Major mode for editing Courier request files."
@@ -2962,6 +3366,137 @@ Entries are read from the configured env directory only."
       (insert method " "))))
   (courier--refresh-overview-buffers)
   (message "Courier method set to %s." method))
+
+;;;###autoload
+(defun courier-request-export-set-format (format)
+  "Set the current request export FORMAT."
+  (interactive
+   (list
+    (intern
+     (completing-read "Export format: "
+                      (mapcar #'symbol-name courier--export-formats)
+                      nil t nil nil
+                      (symbol-name courier--export-format)))))
+  (unless (memq format courier--export-formats)
+    (user-error "Unsupported export format: %s" format))
+  (setq courier--export-format format)
+  (message "Courier export format: %s" (symbol-name format)))
+
+;;;###autoload
+(defun courier-request-export-toggle-interpolation ()
+  "Toggle variable interpolation for Courier export."
+  (interactive)
+  (setq courier--export-interpolate (not courier--export-interpolate))
+  (message "Courier export interpolation %s"
+           (if courier--export-interpolate
+               "enabled"
+             "disabled")))
+
+;;;###autoload
+(defun courier-request-export-copy ()
+  "Copy the current request export command to the kill ring."
+  (interactive)
+  (let ((command (courier--current-export-command)))
+    (kill-new command)
+    (message "Copied Courier export: %s" (courier--export-state-label))))
+
+;;;###autoload
+(defun courier-request-insert-param (name value)
+  "Insert a Courier query parameter directive with NAME and VALUE."
+  (interactive
+   (list (read-string "Param name: ")
+         (read-string "Param value: ")))
+  (when (string-empty-p name)
+    (user-error "Courier param name cannot be empty"))
+  (courier--insert-directive-text
+   (format "# @param %s %s\n" name value)))
+
+;;;###autoload
+(defun courier-request-insert-auth (kind &optional first second)
+  "Insert a Courier auth directive of KIND using FIRST and SECOND values.
+
+For `bearer', FIRST is the token.
+For `basic', FIRST is the username and SECOND is the password.
+For `header', FIRST is the header name and SECOND is the header value."
+  (interactive
+   (let ((kind
+          (intern
+           (completing-read "Auth kind: "
+                            '("bearer" "basic" "header")
+                            nil t))))
+     (pcase kind
+       ('bearer
+        (list kind (read-string "Bearer token: " "{{token}}")))
+       ('basic
+        (list kind
+              (read-string "Basic username: " "{{user}}")
+              (read-string "Basic password: " "{{password}}")))
+       ('header
+        (list kind
+              (read-string "Header name: " "X-API-Key")
+              (read-string "Header value: " "{{token}}"))))))
+  (let ((directive
+         (pcase kind
+           ('bearer
+            (format "# @auth bearer %s\n" (or first "{{token}}")))
+           ('basic
+            (format "# @auth basic %s %s\n"
+                    (or first "{{user}}")
+                    (or second "{{password}}")))
+           ('header
+            (format "# @auth header %s %s\n"
+                    (or first "X-API-Key")
+                    (or second "{{token}}")))
+           (_
+            (user-error "Unsupported auth kind: %s" kind)))))
+    (courier--insert-directive-text directive)))
+
+(defun courier--insert-script-block (kind)
+  "Insert a Courier script block of KIND before the request line."
+  (let ((start (courier--directive-insertion-point)))
+    (goto-char start)
+    (insert (format "# @begin %s\n# \n# @end\n" kind))
+    (goto-char start)
+    (forward-line 1)
+    (end-of-line)))
+
+;;;###autoload
+(defun courier-request-insert-pre-request-script ()
+  "Insert a Courier pre-request script block."
+  (interactive)
+  (courier--insert-script-block "pre-request"))
+
+;;;###autoload
+(defun courier-request-insert-post-response-script ()
+  "Insert a Courier post-response script block."
+  (interactive)
+  (courier--insert-script-block "post-response"))
+
+;;;###autoload
+(defun courier-request-goto-auth ()
+  "Jump to the first Courier auth directive in the current request."
+  (interactive)
+  (courier--goto-directive "^#\\s-*@auth\\b" "auth directive"))
+
+;;;###autoload
+(defun courier-request-goto-param ()
+  "Jump to the first Courier query parameter directive in the current request."
+  (interactive)
+  (courier--goto-directive "^#\\s-*@param\\b" "param directive"))
+
+;;;###autoload
+(defun courier-request-goto-pre-request-script ()
+  "Jump to the first Courier pre-request script block."
+  (interactive)
+  (courier--goto-directive "^#\\s-*@begin\\s-+pre-request\\b"
+                           "pre-request script"))
+
+;;;###autoload
+(defun courier-request-goto-post-response-script ()
+  "Jump to the first Courier post-response script block."
+  (interactive)
+  (courier--goto-directive "^#\\s-*@begin\\s-+post-response\\b"
+                           "post-response script"))
 
 ;;;###autoload
 (defun courier-request-save-buffer ()
@@ -3054,7 +3589,8 @@ Unsaved request buffers choose a collection on first save."
   "Create a Courier collection rooted at DIRECTORY."
   (interactive
    (list (read-directory-name "Create Courier collection in: "
-                              default-directory nil t)))
+                              (courier--save-collection-prompt-directory)
+                              nil nil)))
   (let ((root (courier--create-collection directory)))
     (message "Courier collection created at %s" root)
     root))
@@ -3145,8 +3681,113 @@ This renames the request file and updates its `# @name' directive."
       (courier--refresh-overview-buffers)
       (message "Courier request moved to %s" new-path))))
 
+;;;###autoload
+(transient-define-prefix courier-request-export-menu ()
+  "Show export actions for the current Courier request buffer."
+  [["State"
+    ("f" "Set format" courier-request-export-set-format)
+    ("i" "Toggle interpolate" courier-request-export-toggle-interpolation)]
+   ["Action"
+    ("y" "Copy command" courier-request-export-copy)]])
+
+;;;###autoload
+(transient-define-prefix courier-request-insert-menu ()
+  "Show insert actions for the current Courier request buffer."
+  [["Directive"
+    ("p" "Param" courier-request-insert-param)
+    ("a" "Auth" courier-request-insert-auth)]
+   ["Script"
+    ("r" "Pre-request" courier-request-insert-pre-request-script)
+    ("R" "Post-response" courier-request-insert-post-response-script)]])
+
+;;;###autoload
+(transient-define-prefix courier-request-inspect-menu ()
+  "Show inspect actions for the current Courier request buffer."
+  [["Jump"
+    ("p" "Params" courier-request-goto-param)
+    ("a" "Auth" courier-request-goto-auth)
+    ("r" "Pre-request" courier-request-goto-pre-request-script)
+    ("R" "Post-response" courier-request-goto-post-response-script)]])
+
+;;;###autoload
+(transient-define-prefix courier-request-menu ()
+  "Show request actions for the current Courier buffer."
+  [["Run"
+    ("c" "Send" courier-request-send)
+    ("p" "Preview" courier-request-preview)
+    ("l" "Validate" courier-request-validate)]
+   ["Edit"
+    ("m" "Method" courier-request-set-method)
+    ("e" "Environment" courier-request-switch-env)
+    ("s" "Save" courier-request-save-buffer)]
+   ["Navigate"
+    ("o" "Open" courier-open)
+    ("b" "Overview" courier-overview)]
+   ["Structure"
+    ("I" "Insert..." courier-request-insert-menu)
+    ("S" "Inspect..." courier-request-inspect-menu)]
+   ["Manage"
+    ("n" "New request" courier-new-request)
+    ("r" "Rename" courier-rename-request)
+    ("F" "New folder" courier-new-folder)
+    ("C" "New collection" courier-create-collection)]
+   ["Share"
+    ("x" "Export..." courier-request-export-menu)]])
+
+;;;###autoload
+(transient-define-prefix courier-response-menu ()
+  "Show response actions for the current Courier buffer."
+  [["View"
+    ("r" "Response" courier-response-show-response)
+    ("h" "Headers" courier-response-show-headers)
+    ("t" "Timeline" courier-response-show-timeline)
+    ("T" "Tests" courier-response-show-tests)]
+   ["Body"
+    ("v" "Body view" courier-response-set-view)
+    ("V" "Raw/auto" courier-response-toggle-pretty)
+    ("o" "Open body" courier-response-open-body)]
+   ["Run"
+    ("g" "Retry" courier-response-retry)
+    ("k" "Cancel" courier-response-cancel)]
+   ["Navigate"
+    ("n" "Next view" courier-response-next-tab)
+    ("p" "Prev view" courier-response-prev-tab)]])
+
+;;;###autoload
+(transient-define-prefix courier-overview-menu ()
+  "Show overview actions for the current Courier buffer."
+  [["Request"
+    ("o" "Open" courier-overview-open)
+    ("s" "Send" courier-overview-send)
+    ("p" "Preview" courier-overview-preview)
+    ("e" "Environment" courier-overview-switch-env)]
+   ["List"
+    ("/" "Filter" courier-overview-set-filter)
+    ("g" "Refresh" courier-overview-refresh)
+    ("j" "Jump/Open" courier-open)]
+   ["Manage"
+    ("n" "New request" courier-new-request)
+    ("F" "New folder" courier-new-folder)
+    ("r" "Rename" courier-rename-request)
+    ("m" "Move" courier-move-request)]])
+
+;;;###autoload
+(defun courier-dispatch ()
+  "Show the Courier action menu for the current buffer."
+  (interactive)
+  (cond
+   ((derived-mode-p 'courier-request-mode)
+    (transient-setup 'courier-request-menu))
+   ((derived-mode-p 'courier--response-mode)
+    (transient-setup 'courier-response-menu))
+   ((derived-mode-p 'courier-overview-mode)
+    (transient-setup 'courier-overview-menu))
+   (t
+    (user-error "No Courier action menu is available in this buffer"))))
+
 (define-key courier-request-mode-map (kbd "C-c C-c") #'courier-request-send)
 (define-key courier-request-mode-map (kbd "C-c C-b") #'courier-overview)
+(define-key courier-request-mode-map (kbd "C-c ?") #'courier-dispatch)
 (define-key courier-request-mode-map (kbd "C-c C-e") #'courier-request-switch-env)
 (define-key courier-request-mode-map (kbd "C-c C-l") #'courier-request-validate)
 (define-key courier-request-mode-map (kbd "C-c C-m") #'courier-request-set-method)
