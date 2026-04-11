@@ -218,9 +218,10 @@ manager. It is a source of variable values for request resolution.
   user customizes the default collection directory
 - if the target directory is not a collection, Courier offers to create one
 - the request is then saved into that collection's `requestsDir`
-- request actions expose transient submenus for export, snippet insertion, and
-  jumping to existing request directives without adding always-visible request
-  side panels
+- request editing stays text-first; the buffer shows `URL  Headers  Body  >>`
+  as a navigation layer, while `C-c C-j` jumps to any request section
+- transient remains for actions such as send, preview, save, env switching, and
+  export, not for primary content editing
 - query params may be edited either directly in the URL or through a dedicated
   key/value editor that writes back into the URL query string
 

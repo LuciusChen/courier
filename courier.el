@@ -2661,6 +2661,14 @@ The return value is one of:
 (defvar-local courier--params-source-buffer nil
   "Request buffer associated with the current Courier params editor.")
 
+(defconst courier--request-primary-sections
+  '(url headers body)
+  "Primary navigation sections shown in Courier request buffers.")
+
+(defconst courier--request-secondary-sections
+  '(params auth vars tests pre-request post-response)
+  "Secondary navigation sections hidden behind `>>' in request buffers.")
+
 (defface courier-request-method-get-face
   '((t :inherit success :weight bold))
   "Face used for GET request methods in Courier.")
@@ -2676,6 +2684,18 @@ The return value is one of:
 (defface courier-request-method-default-face
   '((t :inherit font-lock-keyword-face :weight bold :underline t))
   "Fallback face used for Courier request method overlays.")
+
+(defface courier-request-nav-active-face
+  '((t :inherit bold :underline t))
+  "Face used for the active Courier request navigation section.")
+
+(defface courier-request-nav-inactive-face
+  '((t :inherit shadow))
+  "Face used for inactive Courier request navigation sections.")
+
+(defface courier-request-nav-more-face
+  '((t :inherit shadow :weight bold))
+  "Face used for the `>>' marker in Courier request navigation.")
 
 (defconst courier-request-font-lock-keywords
   '(("^\\(#\\)\\s-*\\(@[[:alnum:]-]+\\)\\(?:\\s-+\\(.*\\)\\)?$"
@@ -2697,6 +2717,136 @@ The return value is one of:
   (if courier--active-env
       (format "Courier[%s]" courier--active-env)
     "Courier"))
+
+(defun courier--request-section-label (section)
+  "Return the display label for request SECTION."
+  (pcase section
+    ('url "URL")
+    ('headers "Headers")
+    ('body "Body")
+    ('params "Params")
+    ('auth "Auth")
+    ('vars "Vars")
+    ('tests "Tests")
+    ('pre-request "Pre-request")
+    ('post-response "Post-response")
+    (_ (capitalize (symbol-name section)))))
+
+(defun courier--request-nav-item (section active)
+  "Return a propertized request navigation label for SECTION.
+ACTIVE controls whether the active navigation face is used."
+  (propertize (courier--request-section-label section)
+              'face (if active
+                        'courier-request-nav-active-face
+                      'courier-request-nav-inactive-face)))
+
+(defun courier--request-script-kind-at-point ()
+  "Return the current request script kind at point, or nil."
+  (save-excursion
+    (let ((limit (point))
+          current)
+      (goto-char (point-min))
+      (while (< (point) limit)
+        (let ((line (buffer-substring-no-properties
+                     (line-beginning-position)
+                     (line-end-position))))
+          (cond
+           ((string-match "^#\\s-*@begin\\s-+\\(pre-request\\|post-response\\)\\b" line)
+            (setq current (intern (match-string-no-properties 1 line))))
+           ((string-match-p courier--script-block-end-regexp line)
+            (setq current nil))))
+        (forward-line 1))
+      current)))
+
+(defun courier--request-body-start-position ()
+  "Return the buffer position where the current request body begins."
+  (save-excursion
+    (unless (courier--goto-request-line)
+      (user-error "No Courier request in this buffer"))
+    (forward-line 1)
+    (while (and (not (eobp))
+                (not (string-empty-p
+                      (buffer-substring-no-properties
+                       (line-beginning-position)
+                       (line-end-position)))))
+      (forward-line 1))
+    (if (eobp)
+        (point-max)
+      (forward-line 1)
+      (point))))
+
+(defun courier--request-line-position ()
+  "Return the beginning position of the current request line."
+  (save-excursion
+    (when (courier--goto-request-line)
+      (line-beginning-position))))
+
+(defun courier--maybe-recenter-current-window ()
+  "Recenter the selected window when it shows the current buffer."
+  (when (eq (window-buffer (selected-window)) (current-buffer))
+    (recenter)))
+
+(defun courier--request-headers-start-position ()
+  "Return the beginning position of the request headers section."
+  (save-excursion
+    (unless (courier--goto-request-line)
+      (user-error "No Courier request in this buffer"))
+    (forward-line 1)
+    (point)))
+
+(defun courier--request-current-section ()
+  "Return the logical request section at point."
+  (save-excursion
+    (beginning-of-line)
+    (let* ((line-start (line-beginning-position))
+           (line (buffer-substring-no-properties
+                  line-start
+                  (line-end-position)))
+           (script-kind (courier--request-script-kind-at-point))
+           (request-line (courier--request-line-position))
+           (headers-start (and request-line
+                               (courier--request-headers-start-position)))
+           (body-start (and request-line
+                            (courier--request-body-start-position))))
+      (cond
+       (script-kind
+        script-kind)
+       ((string-match-p "^#\\s-*@auth\\b" line)
+        'auth)
+       ((string-match-p "^#\\s-*@param\\b" line)
+        'params)
+       ((string-match-p "^#\\s-*@var\\b" line)
+        'vars)
+       ((string-match-p "^#\\s-*@test\\b" line)
+        'tests)
+       ((and request-line
+             (= line-start request-line))
+        'url)
+       ((and headers-start body-start
+             (<= headers-start line-start)
+             (< line-start body-start))
+        'headers)
+       ((and body-start
+             (>= line-start body-start))
+        'body)
+       (t
+        'url)))))
+
+(defun courier--request-header-line-format ()
+  "Return the request navigation header line for the current buffer."
+  (let* ((current (courier--request-current-section))
+         (primary (mapconcat
+                   (lambda (section)
+                     (courier--request-nav-item section (eq current section)))
+                   courier--request-primary-sections
+                   "  "))
+         (secondary
+          (unless (memq current courier--request-primary-sections)
+            (concat " "
+                    (courier--request-nav-item current t)))))
+    (concat " " primary "  "
+            (propertize ">>" 'face 'courier-request-nav-more-face)
+            (or secondary ""))))
 
 (defun courier--preview-buffer ()
   "Return the Courier preview buffer."
@@ -3623,6 +3773,7 @@ Signal `user-error' when the current request line has no URL."
   "Major mode for editing Courier request files."
   (setq-local mode-name '(:eval (courier--mode-line-lighter)))
   (setq-local font-lock-defaults '(courier-request-font-lock-keywords))
+  (setq-local header-line-format '(:eval (courier--request-header-line-format)))
   (setq-local outline-regexp "^# @\\|^[A-Z]+ ")
   (setq-local courier--request-path (and buffer-file-name (expand-file-name buffer-file-name)))
   (setq-local courier--collection-root-hint
@@ -3823,6 +3974,88 @@ For `header', FIRST is the header name and SECOND is the header value."
   (courier--goto-directive "^#\\s-*@begin\\s-+post-response\\b"
                            "post-response script"))
 
+(defun courier-request-goto-url ()
+  "Jump to the current request URL."
+  (interactive)
+  (unless (courier--goto-request-line)
+    (user-error "No Courier request in this buffer"))
+  (if-let* ((bounds (courier--current-request-url-bounds)))
+      (goto-char (car bounds))
+    (end-of-line))
+  (courier--maybe-recenter-current-window))
+
+(defun courier-request-goto-headers ()
+  "Jump to the request headers section."
+  (interactive)
+  (goto-char (courier--request-headers-start-position))
+  (back-to-indentation)
+  (courier--maybe-recenter-current-window))
+
+(defun courier-request-goto-body ()
+  "Jump to the request body section."
+  (interactive)
+  (goto-char (courier--request-body-start-position))
+  (back-to-indentation)
+  (courier--maybe-recenter-current-window))
+
+(defun courier-request-goto-vars ()
+  "Jump to the first Courier variable directive in the current request."
+  (interactive)
+  (courier--goto-directive "^#\\s-*@var\\b" "variable directive"))
+
+(defun courier-request-goto-tests ()
+  "Jump to the first Courier test directive in the current request."
+  (interactive)
+  (courier--goto-directive "^#\\s-*@test\\b" "test directive"))
+
+(defun courier--request-jump-section (section)
+  "Jump to request SECTION in the current Courier buffer."
+  (pcase section
+    ('url (courier-request-goto-url))
+    ('headers (courier-request-goto-headers))
+    ('body (courier-request-goto-body))
+    ('params (courier-request-edit-params))
+    ('auth (courier-request-goto-auth))
+    ('vars (courier-request-goto-vars))
+    ('tests (courier-request-goto-tests))
+    ('pre-request (courier-request-goto-pre-request-script))
+    ('post-response (courier-request-goto-post-response-script))
+    (_ (user-error "Unknown Courier section: %s" section))))
+
+;;;###autoload
+(defun courier-request-jump-section (section)
+  "Jump to request SECTION in the current Courier buffer."
+  (interactive
+   (let* ((choices (mapcar (lambda (item)
+                             (cons (courier--request-section-label item) item))
+                           (append courier--request-primary-sections
+                                   courier--request-secondary-sections)))
+          (selection (completing-read "Jump to section: " choices nil t)))
+     (list (cdr (assoc selection choices)))))
+  (courier--request-jump-section section))
+
+;;;###autoload
+(defun courier-request-next-section ()
+  "Jump to the next primary request section."
+  (interactive)
+  (let* ((current (courier--request-current-section))
+         (sections courier--request-primary-sections)
+         (index (or (cl-position current sections)
+                    -1)))
+    (courier--request-jump-section
+     (nth (mod (1+ index) (length sections)) sections))))
+
+;;;###autoload
+(defun courier-request-prev-section ()
+  "Jump to the previous primary request section."
+  (interactive)
+  (let* ((current (courier--request-current-section))
+         (sections courier--request-primary-sections)
+         (index (or (cl-position current sections)
+                    1)))
+    (courier--request-jump-section
+     (nth (mod (1- index) (length sections)) sections))))
+
 ;;;###autoload
 (defun courier-request-save-buffer ()
   "Save the current Courier request buffer.
@@ -4016,25 +4249,6 @@ This renames the request file and updates its `# @name' directive."
     ("y" "Copy command" courier-request-export-copy)]])
 
 ;;;###autoload
-(transient-define-prefix courier-request-insert-menu ()
-  "Show insert actions for the current Courier request buffer."
-  [["Directive"
-    ("p" "Param" courier-request-insert-param)
-    ("a" "Auth" courier-request-insert-auth)]
-   ["Script"
-    ("r" "Pre-request" courier-request-insert-pre-request-script)
-    ("R" "Post-response" courier-request-insert-post-response-script)]])
-
-;;;###autoload
-(transient-define-prefix courier-request-inspect-menu ()
-  "Show inspect actions for the current Courier request buffer."
-  [["Jump"
-    ("p" "Params" courier-request-goto-param)
-    ("a" "Auth" courier-request-goto-auth)
-    ("r" "Pre-request" courier-request-goto-pre-request-script)
-    ("R" "Post-response" courier-request-goto-post-response-script)]])
-
-;;;###autoload
 (transient-define-prefix courier-request-menu ()
   "Show request actions for the current Courier buffer."
   [["Run"
@@ -4043,15 +4257,12 @@ This renames the request file and updates its `# @name' directive."
     ("l" "Validate" courier-request-validate)]
    ["Edit"
     ("m" "Method" courier-request-set-method)
-    ("q" "Edit params" courier-request-edit-params)
+    ("j" "Jump section" courier-request-jump-section)
     ("e" "Environment" courier-request-switch-env)
     ("s" "Save" courier-request-save-buffer)]
    ["Navigate"
     ("o" "Open" courier-open)
     ("b" "Overview" courier-overview)]
-   ["Structure"
-    ("I" "Insert..." courier-request-insert-menu)
-    ("S" "Inspect..." courier-request-inspect-menu)]
    ["Manage"
     ("n" "New request" courier-new-request)
     ("r" "Rename" courier-rename-request)
@@ -4117,12 +4328,15 @@ This renames the request file and updates its `# @name' directive."
 (define-key courier-request-mode-map (kbd "C-c C-b") #'courier-overview)
 (define-key courier-request-mode-map (kbd "C-c ?") #'courier-dispatch)
 (define-key courier-request-mode-map (kbd "C-c C-e") #'courier-request-switch-env)
+(define-key courier-request-mode-map (kbd "C-c C-j") #'courier-request-jump-section)
 (define-key courier-request-mode-map (kbd "C-c C-l") #'courier-request-validate)
 (define-key courier-request-mode-map (kbd "C-c C-m") #'courier-request-set-method)
 (define-key courier-request-mode-map (kbd "C-c C-n") #'courier-new-request)
 (define-key courier-request-mode-map (kbd "C-c C-o") #'courier-open)
 (define-key courier-request-mode-map (kbd "C-c C-p") #'courier-request-preview)
 (define-key courier-request-mode-map (kbd "C-c C-r") #'courier-rename-request)
+(define-key courier-request-mode-map (kbd "C-c [") #'courier-request-prev-section)
+(define-key courier-request-mode-map (kbd "C-c ]") #'courier-request-next-section)
 (define-key courier-request-mode-map [remap save-buffer] #'courier-request-save-buffer)
 
 ;;;###autoload

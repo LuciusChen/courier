@@ -1521,6 +1521,31 @@
                     (overlay-end courier--method-overlay))
                    "GET"))))
 
+(ert-deftest courier-request-header-line-shows-primary-navigation ()
+  (courier-test--with-request
+      (concat "# @name Demo\n"
+              "GET https://example.com/users/42\n"
+              "Accept: application/json\n"
+              "\n"
+              "{\"name\":\"Lucy\"}\n")
+    (courier-request-mode)
+    (let ((line (substring-no-properties
+                 (courier--request-header-line-format))))
+      (should (string-match-p "URL" line))
+      (should (string-match-p "Headers" line))
+      (should (string-match-p "Body" line))
+      (should (string-match-p ">>" line)))))
+
+(ert-deftest courier-request-header-line-shows-current-secondary-section ()
+  (courier-test--with-request
+      (concat "# @auth bearer {{token}}\n"
+              "GET https://example.com/users/42\n")
+    (courier-request-mode)
+    (goto-char (point-min))
+    (let ((line (substring-no-properties
+                 (courier--request-header-line-format))))
+      (should (string-match-p "Auth" line)))))
+
 (ert-deftest courier-dispatch-routes-request-mode ()
   (courier-test--with-request
       "GET https://example.com\n"
@@ -1561,6 +1586,14 @@
               #'courier-dispatch))
   (should (eq (lookup-key courier--response-mode-map (kbd "C-c ?"))
               #'courier-dispatch)))
+
+(ert-deftest courier-request-mode-binds-section-navigation ()
+  (should (eq (lookup-key courier-request-mode-map (kbd "C-c C-j"))
+              #'courier-request-jump-section))
+  (should (eq (lookup-key courier-request-mode-map (kbd "C-c ["))
+              #'courier-request-prev-section))
+  (should (eq (lookup-key courier-request-mode-map (kbd "C-c ]"))
+              #'courier-request-next-section)))
 
 (ert-deftest courier-response-mode-uses-bracket-view-navigation ()
   (should (eq (lookup-key courier--response-mode-map (kbd "]"))
@@ -1676,6 +1709,26 @@
     (goto-char (point-max))
     (courier-request-goto-post-response-script)
     (should (looking-at (regexp-quote "# @begin post-response")))))
+
+(ert-deftest courier-request-next-section-jumps-to-headers ()
+  (courier-test--with-request
+      (concat "GET https://example.com/users\n"
+              "Accept: application/json\n"
+              "\n"
+              "{\"name\":\"Lucy\"}\n")
+    (courier-request-mode)
+    (goto-char (point-min))
+    (courier-request-next-section)
+    (should (looking-at "Accept: application/json"))))
+
+(ert-deftest courier-request-jump-section-opens-params-editor ()
+  (courier-test--with-request
+      "GET https://example.com/users?page=1\n"
+    (courier-request-mode)
+    (let ((buffer (courier-request-jump-section 'params)))
+      (should (buffer-live-p buffer))
+      (with-current-buffer buffer
+        (should (derived-mode-p 'courier-request-params-mode))))))
 
 (ert-deftest courier-request-edit-params-loads-query-into-editor ()
   (courier-test--with-request

@@ -186,6 +186,9 @@ token=abc123
 | =C-c C-c= | =courier-request-send=         | Send request           |
 | =C-c C-b= | =courier-overview=             | Open collection view   |
 | =C-c C-e= | =courier-request-switch-env=   | Switch environment     |
+| =C-c C-j= | =courier-request-jump-section= | Jump to request section |
+| =C-c [=   | =courier-request-prev-section= | Previous main section  |
+| =C-c ]=   | =courier-request-next-section= | Next main section      |
 | =C-c C-m= | =courier-request-set-method=   | Change HTTP method     |
 | =C-c C-n= | =courier-new-request=          | Create request draft   |
 | =C-c C-p= | =courier-request-preview=      | Preview resolved form  |
@@ -205,18 +208,26 @@ not already a Courier collection, Courier offers to create one there before
 saving the request into that collection's =requests/= directory.
 The request-line method token is highlighted with a lightweight overlay so
 =GET=/=POST=/etc. remain visually obvious while editing.
+The request buffer also shows a navigation header line:
+
+#+begin_example
+URL  Headers  Body  >>
+#+end_example
+
+That line is informational, not a second editor. Use =C-c [= and =C-c ]= to
+move between the main sections, or =C-c C-j= to jump to any section, including
+=Params=, =Auth=, =Vars=, =Tests=, =Pre-request=, and =Post-response=. Query
+params stay URL-backed: choosing =Params= opens the dedicated key/value editor
+and writes changes back into the request URL.
 
 Use =M-x courier-create-collection= to create a collection explicitly. Use
 =C-c C-o= inside a collection to open another =.http= file or switch the
 current buffer to a different environment from the same minibuffer picker.
 Use =C-c ?= in a request buffer for request actions, including the export
 submenu for copying =curl=, =httpie=, or =wget= commands with or without
-variable interpolation. The same menu also provides =Insert...= and
-=Inspect...= submenus for adding =# @param=, =# @auth=, and
-pre-request/post-response script blocks, or jumping to the existing directive
-in the current request buffer. It also exposes =Edit params=, which edits the
-current URL query string in a dedicated key/value buffer and writes it back to
-the request line on apply.
+variable interpolation. Request content itself stays plain text: Courier does
+not use transient submenus as the primary way to add params, auth, or script
+blocks.
 
 Use =C-c C-b= to open the current collection overview. The overview buffer
 lists requests, shows recent status and environment context, and supports:
