@@ -65,6 +65,18 @@ Set to nil to disable the default timeout."
                  (const "OPTIONS"))
   :group 'courier)
 
+(defcustom courier-default-body-type 'json
+  "Default body type used for new Courier requests.
+
+This affects request-side editing and send-time behavior when a request does
+not declare an explicit `[body].type` in its front matter."
+  :type '(choice (const none)
+                 (const json)
+                 (const xml)
+                 (const text)
+                 (const form-urlencoded))
+  :group 'courier)
+
 (defcustom courier-default-collection-directory
   (file-name-as-directory (expand-file-name "courier" "~"))
   "Default directory used when creating or saving Courier collections.
@@ -101,6 +113,14 @@ collection."
 (defconst courier--export-formats
   '(curl httpie wget)
   "Supported Courier export formats.")
+
+(defconst courier--allowed-body-types
+  '(none json xml text form-urlencoded)
+  "Supported Courier request body types.")
+
+(defconst courier--allowed-auth-types
+  '(none bearer basic header)
+  "Supported Courier request auth types.")
 
 (defconst courier--response-tabs
   '(response headers timeline tests)
@@ -211,14 +231,6 @@ collection."
 
 ;;;; Parsing
 
-(defconst courier--directive-regexp
-  "^\\(#\\)\\s-*\\(@[[:alnum:]-]+\\)\\(?:\\s-+\\(.*\\)\\)?$"
-  "Regexp used to parse directive lines.")
-
-(defconst courier--script-block-end-regexp
-  "^#\\s-*\\(@end\\)\\s-*$"
-  "Regexp used to terminate Courier script blocks.")
-
 (defconst courier--request-line-regexp
   "^\\([A-Z]+\\)\\s-+\\(\\S-+\\)\\s-*$"
   "Regexp used to parse request lines.")
@@ -226,6 +238,14 @@ collection."
 (defconst courier--header-line-regexp
   "^\\([^: \t][^:]*\\):\\s-*\\(.*\\)$"
   "Regexp used to parse header lines.")
+
+(defconst courier--toml-table-regexp
+  "^\\[\\([A-Za-z_][A-Za-z0-9_]*\\)\\]\\s-*$"
+  "Regexp used to parse supported Courier TOML tables.")
+
+(defconst courier--toml-assignment-regexp
+  "^\\([A-Za-z_][A-Za-z0-9_]*\\)\\s-*=\\s-*\\(.*\\)$"
+  "Regexp used to parse supported Courier TOML assignments.")
 
 (defconst courier--env-line-regexp
   "\\`\\([^[:space:]#=][^[:space:]=]*\\)=\\(.*\\)\\'"
@@ -277,116 +297,372 @@ Signal `user-error' when KEY is present but not a string."
       (and (string-suffix-p ".env" file-name)
            (not (string-prefix-p "." file-name)))))
 
-(defun courier--parse-directive (line-number line request)
-  "Parse directive LINE on LINE-NUMBER into REQUEST plist."
-  (unless (string-match courier--directive-regexp line)
-    (courier--parse-error line-number "Malformed directive"))
-  (let ((key (match-string 2 line))
-        (value (or (match-string 3 line) "")))
-    (pcase key
-      ("@name"
-       (plist-put request :name value))
-      ("@timeout"
-       (unless (and (string-match-p "\\`[0-9]+\\'" value)
-                    (> (string-to-number value) 0))
-         (courier--parse-error line-number "Invalid @timeout value: %s" value))
-       (let ((settings (plist-get request :settings)))
-         (plist-put request :settings
-                    (plist-put settings :timeout (string-to-number value)))))
-      ("@follow-redirects"
-       (unless (member value '("true" "false"))
-         (courier--parse-error line-number "Invalid @follow-redirects value: %s" value))
-       (let ((settings (plist-get request :settings)))
-         (plist-put request :settings
-                    (plist-put settings :follow-redirects (string= value "true")))))
-      ("@var"
-       (unless (string-match "\\`\\([^[:space:]]+\\)\\s-+\\(.*\\)\\'" value)
-         (courier--parse-error line-number "Invalid @var directive"))
-       (plist-put request :vars
-                  (append (plist-get request :vars)
-                          (list (cons (match-string 1 value)
-                                      (match-string 2 value))))))
-      ("@param"
-       (unless (string-match "\\`\\([^[:space:]]+\\)\\s-+\\(.*\\)\\'" value)
-         (courier--parse-error line-number "Invalid @param directive"))
-       (plist-put request :params
-                  (append (plist-get request :params)
-                          (list (cons (match-string 1 value)
-                                      (match-string 2 value))))))
-      ("@auth"
-       (plist-put request :auth
-                  (courier--parse-auth-directive line-number value)))
-      ("@test"
-       (when (string-empty-p value)
-         (courier--parse-error line-number "Invalid @test directive"))
-       (plist-put request :tests
-                  (append (plist-get request :tests) (list value))))
-      (_
-       (courier--parse-error line-number "Unknown directive: %s" key))))
-  request)
+(defun courier--empty-request (&optional path)
+  "Return a fresh Courier request plist for PATH."
+  (list :path path
+        :headers nil
+        :body ""
+        :body-type courier-default-body-type
+        :params nil
+        :vars nil
+        :auth nil
+        :pre-request-script nil
+        :post-response-script nil
+        :tests nil
+        :settings nil))
 
-(defun courier--parse-auth-directive (line-number value)
-  "Parse @auth VALUE at LINE-NUMBER into a plist."
-  (cond
-   ((string-match "\\`bearer\\s-+\\(.+\\)\\'" value)
-    (list :type 'bearer
-          :token (match-string 1 value)))
-   ((string-match "\\`basic\\s-+\\([^[:space:]]+\\)\\s-+\\(.+\\)\\'" value)
-    (list :type 'basic
-          :username (match-string 1 value)
-          :password (match-string 2 value)))
-   ((string-match "\\`header\\s-+\\([^[:space:]]+\\)\\s-+\\(.+\\)\\'" value)
-    (list :type 'header
-          :name (match-string 1 value)
-          :value (match-string 2 value)))
-   (t
-    (courier--parse-error
-     line-number
-     "Invalid @auth directive; use bearer/basic/header forms"))))
-
-(defun courier--script-field-for-kind (line-number kind)
-  "Return plist field symbol for script KIND at LINE-NUMBER."
-  (pcase kind
-    ("pre-request" :pre-request-script)
-    ("post-response" :post-response-script)
-    (_
+(defun courier--read-toml-basic-string (raw line-number)
+  "Parse RAW as a TOML basic string for LINE-NUMBER."
+  (condition-case err
+      (pcase-let ((`(,value . ,end) (read-from-string raw)))
+        (unless (stringp value)
+          (courier--parse-error line-number "Expected TOML string"))
+        (unless (string-empty-p (string-trim (substring raw end)))
+          (courier--parse-error line-number "Trailing characters after TOML string"))
+        value)
+    (error
      (courier--parse-error
       line-number
-      "Invalid script block kind: %s"
-      kind))))
+      "Invalid TOML string: %s"
+      (error-message-string err)))))
 
-(defun courier--parse-script-block (line-number kind)
-  "Parse a script block of KIND starting after LINE-NUMBER.
+(defun courier--parse-toml-string-array-content (content line-number)
+  "Parse TOML string array CONTENT starting at LINE-NUMBER."
+  (let ((index 0)
+        (length (length content))
+        values)
+    (while (< index length)
+      (while (and (< index length)
+                  (memq (aref content index) '(?\s ?\t ?\n ?, ?\r)))
+        (setq index (1+ index)))
+      (when (< index length)
+        (unless (eq (aref content index) ?\")
+          (courier--parse-error line-number "tests must contain only strings"))
+        (pcase-let* ((`(,value . ,end)
+                      (condition-case err
+                          (read-from-string (substring content index))
+                        (error
+                         (courier--parse-error
+                          line-number
+                          "Invalid TOML string in tests: %s"
+                          (error-message-string err))))))
+          (unless (stringp value)
+            (courier--parse-error line-number "tests must contain only strings"))
+          (push value values)
+          (setq index (+ index end)))))
+    (nreverse values)))
 
-Point must be on the `# @begin ...' line. On success, point is left on the
-line after the matching `# @end'. Return a cons cell `(FIELD . SCRIPT)'."
-  (let ((field (courier--script-field-for-kind line-number kind))
-        lines)
-    (forward-line 1)
-    (catch 'courier-script-block
-      (while (not (eobp))
-        (let ((current-line (line-number-at-pos))
-              (line (buffer-substring-no-properties
+(defun courier--parse-toml-array (raw lines index line-number)
+  "Parse TOML string array RAW from LINES at INDEX and LINE-NUMBER.
+Return `(VALUES . NEXT-INDEX)'."
+  (let ((trimmed (string-trim raw)))
+    (cond
+     ((string-match "\\`\\[\\(.*\\)\\]\\s-*\\'" trimmed)
+      (cons (courier--parse-toml-string-array-content
+             (match-string 1 trimmed)
+             line-number)
+            (1+ index)))
+     ((string-match-p "\\`\\[\\s-*\\'" trimmed)
+      (let ((content-lines nil)
+            (cursor (1+ index))
+            (done nil))
+        (while (and (< cursor (length lines))
+                    (not done))
+          (let ((line (nth cursor lines)))
+            (if (string-match "^\\s-*]\\s-*$" line)
+                (setq done t)
+              (push line content-lines)
+              (setq cursor (1+ cursor)))))
+        (unless done
+          (courier--parse-error line-number "Unclosed TOML array"))
+        (cons (courier--parse-toml-string-array-content
+               (string-join (nreverse content-lines) "\n")
+               line-number)
+              (1+ cursor))))
+     (t
+      (courier--parse-error line-number "Invalid TOML array")))))
+
+(defun courier--parse-toml-multiline-string (raw lines index line-number)
+  "Parse TOML multiline string RAW from LINES at INDEX and LINE-NUMBER.
+Return `(STRING . NEXT-INDEX)'."
+  (let* ((trimmed (string-trim-left raw))
+         (after-open (substring trimmed 3))
+         (close-pos (string-match "\"\"\"" after-open)))
+    (if close-pos
+        (let ((value (substring after-open 0 close-pos))
+              (rest (substring after-open (+ close-pos 3))))
+          (unless (string-empty-p (string-trim rest))
+            (courier--parse-error line-number "Trailing characters after multiline string"))
+          (cons value (1+ index)))
+      (let ((pieces nil)
+            (cursor (1+ index))
+            done)
+        (unless (string-empty-p after-open)
+          (push after-open pieces))
+        (while (and (< cursor (length lines))
+                    (not done))
+          (let* ((line (nth cursor lines))
+                 (end-pos (string-match "\"\"\"" line)))
+            (if end-pos
+                (let ((prefix (substring line 0 end-pos))
+                      (rest (substring line (+ end-pos 3))))
+                  (unless (string-empty-p prefix)
+                    (push prefix pieces))
+                  (unless (string-empty-p (string-trim rest))
+                    (courier--parse-error
+                     (+ line-number (- cursor index))
+                     "Trailing characters after multiline string"))
+                  (setq done t))
+              (push line pieces)
+              (setq cursor (1+ cursor)))))
+        (unless done
+          (courier--parse-error line-number "Unclosed TOML multiline string"))
+        (cons (string-join (nreverse pieces) "\n")
+              (1+ cursor))))))
+
+(defun courier--parse-toml-value (raw lines index line-number)
+  "Parse TOML RAW value from LINES at INDEX and LINE-NUMBER.
+Return `(VALUE . NEXT-INDEX)'."
+  (let ((trimmed (string-trim raw)))
+    (cond
+     ((string-prefix-p "\"\"\"" trimmed)
+      (courier--parse-toml-multiline-string trimmed lines index line-number))
+     ((string-prefix-p "\"" trimmed)
+      (cons (courier--read-toml-basic-string trimmed line-number) (1+ index)))
+     ((string-prefix-p "[" trimmed)
+      (courier--parse-toml-array trimmed lines index line-number))
+     ((string-match-p "\\`[0-9]+\\'" trimmed)
+      (cons (string-to-number trimmed) (1+ index)))
+     ((member trimmed '("true" "false"))
+      (cons (string= trimmed "true") (1+ index)))
+     (t
+      (courier--parse-error line-number "Unsupported TOML value: %s" trimmed)))))
+
+(defun courier--parse-front-matter (text start-line request)
+  "Parse TOML front matter TEXT starting at START-LINE into REQUEST."
+  (let ((lines (split-string text "\n"))
+        (index 0)
+        (current-table nil)
+        (seen-tables nil)
+        (settings (plist-get request :settings))
+        (body-type (plist-get request :body-type))
+        (auth nil)
+        (vars nil)
+        (tests nil)
+        (pre-request nil)
+        (post-response nil))
+    (while (< index (length lines))
+      (let* ((line (nth index lines))
+             (line-number (+ start-line index))
+             (trimmed (string-trim line)))
+        (cond
+         ((or (string-empty-p trimmed)
+              (string-prefix-p "#" trimmed))
+          (setq index (1+ index)))
+         ((string-match courier--toml-table-regexp trimmed)
+          (setq current-table (match-string 1 trimmed))
+          (when (member current-table seen-tables)
+            (courier--parse-error line-number "Duplicate TOML table: [%s]" current-table))
+          (unless (member current-table '("auth" "vars" "scripts" "body"))
+            (courier--parse-error line-number "Unsupported TOML table: [%s]" current-table))
+          (push current-table seen-tables)
+          (setq index (1+ index)))
+         ((string-match courier--toml-assignment-regexp line)
+          (let* ((key (match-string 1 line))
+                 (raw-value (match-string 2 line))
+                 (parsed (courier--parse-toml-value raw-value lines index line-number))
+                 (value (car parsed)))
+            (setq index (cdr parsed))
+            (pcase current-table
+              ((pred null)
+               (pcase key
+                 ("name"
+                  (unless (stringp value)
+                    (courier--parse-error line-number "name must be a string"))
+                  (setq request (plist-put request :name value)))
+                 ("timeout"
+                  (unless (and (integerp value) (> value 0))
+                    (courier--parse-error line-number "timeout must be a positive integer"))
+                  (setq settings (plist-put settings :timeout value)))
+                 ("follow_redirects"
+                  (unless (memq value '(t nil))
+                    (courier--parse-error line-number "follow_redirects must be a boolean"))
+                  (setq settings (plist-put settings :follow-redirects value)))
+                 ("tests"
+                  (unless (cl-every #'stringp value)
+                    (courier--parse-error line-number "tests must be an array of strings"))
+                  (setq tests value))
+                 (_
+                  (courier--parse-error line-number "Unsupported TOML key: %s" key))))
+              ("auth"
+               (pcase key
+                 ("type" (setq auth (plist-put auth :type (intern value))))
+                 ("token" (setq auth (plist-put auth :token value)))
+                 ("username" (setq auth (plist-put auth :username value)))
+                 ("password" (setq auth (plist-put auth :password value)))
+                 ("header" (setq auth (plist-put auth :header value)))
+                 ("value" (setq auth (plist-put auth :value value)))
+                 (_
+                  (courier--parse-error line-number "Unsupported [auth] key: %s" key))))
+              ("vars"
+               (unless (stringp value)
+                 (courier--parse-error line-number "[vars] values must be strings"))
+               (setq vars (append vars (list (cons key value)))))
+              ("body"
+               (pcase key
+                 ("type"
+                  (setq body-type (intern value)))
+                 (_
+                  (courier--parse-error line-number "Unsupported [body] key: %s" key))))
+              ("scripts"
+               (pcase key
+                 ("pre_request"
+                  (unless (stringp value)
+                    (courier--parse-error line-number "pre_request must be a string"))
+                  (setq pre-request value))
+                 ("post_response"
+                  (unless (stringp value)
+                    (courier--parse-error line-number "post_response must be a string"))
+                  (setq post-response value))
+                 (_
+                  (courier--parse-error line-number "Unsupported [scripts] key: %s" key)))))))
+         (t
+          (courier--parse-error line-number "Malformed TOML line: %s" line)))))
+    (when body-type
+      (unless (memq body-type courier--allowed-body-types)
+        (courier--parse-error start-line "Invalid [body].type: %s" body-type)))
+    (when auth
+      (let ((type (plist-get auth :type)))
+        (unless (memq type '(bearer basic header))
+          (courier--parse-error start-line "Invalid [auth].type: %s" type))
+        (pcase type
+          ('bearer
+           (unless (stringp (plist-get auth :token))
+             (courier--parse-error start-line "[auth] bearer auth requires token")))
+          ('basic
+           (unless (stringp (plist-get auth :username))
+             (courier--parse-error start-line "[auth] basic auth requires username"))
+           (unless (stringp (plist-get auth :password))
+             (courier--parse-error start-line "[auth] basic auth requires password")))
+          ('header
+           (unless (stringp (plist-get auth :header))
+             (courier--parse-error start-line "[auth] header auth requires header"))
+           (unless (stringp (plist-get auth :value))
+             (courier--parse-error start-line "[auth] header auth requires value"))))))
+    (setq request (plist-put request :settings settings))
+    (setq request (plist-put request :body-type body-type))
+    (setq request (plist-put request :auth auth))
+    (setq request (plist-put request :vars vars))
+    (setq request (plist-put request :tests tests))
+    (setq request (plist-put request :pre-request-script pre-request))
+    (setq request (plist-put request :post-response-script post-response))
+    request))
+
+(defun courier--buffer-components ()
+  "Return the current buffer split into Courier front matter and HTTP block.
+
+The result is a plist with `:front-matter', `:front-matter-line', `:http', and
+`:http-line'."
+  (save-excursion
+    (goto-char (point-min))
+    (if (looking-at-p "\\+\\+\\+$")
+        (let ((front-start-line 2))
+          (forward-line 1)
+          (let ((front-start (point))
+                close-pos)
+            (while (and (not (eobp))
+                        (not close-pos))
+              (let ((line (buffer-substring-no-properties
+                           (line-beginning-position)
+                           (line-end-position))))
+                (if (string= line "+++")
+                    (setq close-pos (line-beginning-position))
+                  (forward-line 1))))
+            (unless close-pos
+              (courier--parse-error 1 "Unclosed TOML front matter"))
+            (goto-char close-pos)
+            (let ((front-matter
+                   (buffer-substring-no-properties front-start close-pos)))
+              (forward-line 1)
+              (list :front-matter front-matter
+                    :front-matter-line front-start-line
+                    :http (buffer-substring-no-properties (point) (point-max))
+                    :http-line (line-number-at-pos)))))
+      (list :front-matter nil
+            :front-matter-line 1
+            :http (buffer-substring-no-properties (point-min) (point-max))
+            :http-line 1))))
+
+(defun courier--parse-http-block (http http-line request &optional relaxed)
+  "Parse raw HTTP block HTTP starting at HTTP-LINE into REQUEST.
+When RELAXED is non-nil, allow incomplete draft request lines."
+  (with-temp-buffer
+    (insert http)
+    (goto-char (point-min))
+    (while (and (not (eobp))
+                (looking-at-p "[ \t]*$"))
+      (forward-line 1))
+    (let ((line-number http-line)
+          request-line-seen
+          body-start)
+      (if (eobp)
+          (unless relaxed
+            (courier--parse-error http-line "Missing request line"))
+        (let ((line (buffer-substring-no-properties
                      (line-beginning-position)
                      (line-end-position))))
           (cond
-           ((string-match-p courier--script-block-end-regexp line)
-            (forward-line 1)
-            (throw 'courier-script-block
-                   (cons field (string-join (nreverse lines) "\n"))))
-           ((string-match "\\`#\\( ?.*\\)?\\'" line)
-            (let ((content (or (match-string 1 line) "")))
-              (push (if (and (not (string-empty-p content))
-                             (eq (aref content 0) ?\s))
-                        (substring content 1)
-                      content)
-                    lines))
-            (forward-line 1))
+           ((string-match courier--request-line-regexp line)
+            (let* ((method (match-string 1 line))
+                   (url (match-string 2 line))
+                   (parts (courier--split-request-url url))
+                   (base (nth 0 parts))
+                   (fragment (nth 2 parts)))
+              (unless (member method courier--allowed-methods)
+                (courier--parse-error line-number "Invalid HTTP method: %s" method))
+              (setq request-line-seen t)
+              (plist-put request :method method)
+              (plist-put request :url (concat base (or fragment "")))
+              (plist-put request :params (courier--parse-url-query-params url))
+              (forward-line 1)))
+           (relaxed
+            (if (string-match "^\\([A-Za-z]+\\)\\(?:\\s-+\\(.*\\)\\)?$" line)
+                (let* ((method (upcase (match-string 1 line)))
+                       (url (string-trim-right (or (match-string 2 line) ""))))
+                  (plist-put request :method method)
+                  (pcase-let ((`(,base ,_query ,fragment) (courier--split-request-url url)))
+                    (plist-put request :url (concat base (or fragment ""))))
+                  (plist-put request :params (courier--parse-url-query-params url))
+                  (setq request-line-seen t)
+                  (forward-line 1))))
            (t
-            (courier--parse-error
-             current-line
-             "Script block lines must start with #")))))
-      (courier--parse-error line-number "Unclosed script block: %s" kind))))
+            (courier--parse-error line-number "Missing or malformed request line")))))
+      (while (and (not (eobp))
+                  (not body-start))
+        (setq line-number (+ http-line (1- (line-number-at-pos))))
+        (let ((line (buffer-substring-no-properties
+                     (line-beginning-position)
+                     (line-end-position))))
+          (cond
+           ((string-empty-p line)
+            (forward-line 1)
+            (setq body-start (point)))
+           ((string-match courier--header-line-regexp line)
+            (plist-put request :headers
+                       (append (plist-get request :headers)
+                               (list (cons (downcase (match-string 1 line))
+                                           (match-string 2 line)))))
+            (forward-line 1))
+           (relaxed
+            (setq body-start (point)))
+           (t
+            (courier--parse-error line-number "Malformed header: %s" line)))))
+      (unless (or request-line-seen relaxed)
+        (courier--parse-error http-line "Missing request line"))
+      (when body-start
+        (plist-put request :body
+                   (buffer-substring-no-properties body-start (point-max)))))
+    request))
 
 (defun courier--resolve-var (name vars stack depth)
   "Resolve variable NAME from VARS with STACK and DEPTH tracking."
@@ -408,24 +684,25 @@ line after the matching `# @end'. Return a cons cell `(FIELD . SCRIPT)'."
         (length (length string))
         parts)
     (while (< index length)
-      (if (and (< (1+ index) length)
-               (eq (aref string index) ?{)
-               (eq (aref string (1+ index)) ?{))
-          (progn
-            (when (and (< (+ index 2) length)
-                       (eq (aref string (+ index 2)) ?{))
-              (user-error "Malformed variable placeholder in %s" string))
-            (let ((end (string-match "}}" string (+ index 2))))
-              (unless end
-                (user-error "Unclosed variable placeholder in %s" string))
-              (let ((name (substring string (+ index 2) end)))
-                (when (or (string-empty-p name)
-                          (string-match-p "[{}[:space:]]" name))
-                  (user-error "Malformed variable placeholder: {{%s}}" name))
-                (push (funcall resolver name) parts)
-                (setq index (+ end 2)))))
+      (cond
+       ((and (< (1+ index) length)
+             (eq (aref string index) ?{)
+             (eq (aref string (1+ index)) ?{))
+        (when (and (< (+ index 2) length)
+                   (eq (aref string (+ index 2)) ?{))
+          (user-error "Malformed variable placeholder in %s" string))
+        (let ((end (string-match "}}" string (+ index 2))))
+          (unless end
+            (user-error "Unclosed variable placeholder in %s" string))
+          (let ((name (substring string (+ index 2) end)))
+            (when (or (string-empty-p name)
+                      (string-match-p "[{}[:space:]]" name))
+              (user-error "Malformed variable placeholder: {{%s}}" name))
+            (push (funcall resolver name) parts)
+            (setq index (+ end 2)))))
+       (t
         (push (string (aref string index)) parts)
-        (setq index (1+ index))))
+        (setq index (1+ index)))))
     (apply #'concat (nreverse parts))))
 
 (defun courier--resolve-vars (vars)
@@ -439,82 +716,48 @@ line after the matching `# @end'. Return a cons cell `(FIELD . SCRIPT)'."
   "Return header NAME from RESPONSE."
   (cdr (assoc-string (downcase name) (plist-get response :headers) nil)))
 
+(defun courier--parse-buffer-for-editor ()
+  "Parse the current buffer into a relaxed request model for editing."
+  (let* ((path (and buffer-file-name (expand-file-name buffer-file-name)))
+         (request (courier--empty-request path))
+         (parts (courier--buffer-components)))
+    (plist-put request :method courier-default-request-method)
+    (plist-put request :url "")
+    (when-let* ((front-matter (plist-get parts :front-matter)))
+      (setq request
+            (courier--parse-front-matter
+             front-matter
+             (plist-get parts :front-matter-line)
+             request)))
+    (courier--parse-http-block
+     (plist-get parts :http)
+     (plist-get parts :http-line)
+     request
+     t)))
+
+(defun courier--parse-file-for-editor (path)
+  "Parse PATH into a relaxed request model for editing."
+  (with-temp-buffer
+    (insert-file-contents path)
+    (setq-local buffer-file-name path)
+    (courier--parse-buffer-for-editor)))
+
 ;;;###autoload
 (defun courier-parse-buffer ()
   "Parse the current buffer into a request plist."
-  (let ((request (list :path (and buffer-file-name (expand-file-name buffer-file-name))
-                       :headers nil
-                       :body ""
-                       :params nil
-                       :vars nil
-                       :auth nil
-                       :pre-request-script nil
-                       :post-response-script nil
-                       :tests nil
-                       :settings nil))
-        (line-number 0)
-        request-line-seen
-        body-start)
-    (save-excursion
-      (goto-char (point-min))
-      (while (and (not (eobp))
-                  (looking-at-p "[ \t]*$"))
-        (forward-line 1))
-      (while (and (not (eobp))
-                  (not request-line-seen))
-        (setq line-number (line-number-at-pos))
-        (let ((line (buffer-substring-no-properties
-                     (line-beginning-position)
-                     (line-end-position))))
-          (cond
-           ((string-empty-p line)
-            (forward-line 1))
-           ((string-prefix-p "#" line)
-            (unless (string-match courier--directive-regexp line)
-              (courier--parse-error line-number "Malformed directive"))
-            (let ((key (match-string 2 line))
-                  (value (or (match-string 3 line) "")))
-              (if (string= key "@begin")
-                  (pcase-let ((`(,field . ,script)
-                               (courier--parse-script-block line-number value)))
-                    (plist-put request field script))
-                (setq request (courier--parse-directive line-number line request))
-                (forward-line 1))))
-           ((string-match courier--request-line-regexp line)
-            (let ((method (match-string 1 line))
-                  (url (match-string 2 line)))
-              (unless (member method courier--allowed-methods)
-                (courier--parse-error line-number "Invalid HTTP method: %s" method))
-              (setq request-line-seen t)
-              (plist-put request :method method)
-              (plist-put request :url url)
-              (forward-line 1)))
-           (t
-            (courier--parse-error line-number "Missing or malformed request line")))))
-      (unless request-line-seen
-        (courier--parse-error 1 "Missing request line"))
-      (while (and (not (eobp))
-                  (not body-start))
-        (setq line-number (line-number-at-pos))
-        (let ((line (buffer-substring-no-properties
-                     (line-beginning-position)
-                     (line-end-position))))
-          (cond
-           ((string-empty-p line)
-            (forward-line 1)
-            (setq body-start (point)))
-           ((string-match courier--header-line-regexp line)
-            (plist-put request :headers
-                       (append (plist-get request :headers)
-                               (list (cons (downcase (match-string 1 line))
-                                           (match-string 2 line)))))
-            (forward-line 1))
-           (t
-            (courier--parse-error line-number "Malformed header: %s" line)))))
-      (when body-start
-        (plist-put request :body
-                   (buffer-substring-no-properties body-start (point-max)))))
-    request))
+  (let* ((path (and buffer-file-name (expand-file-name buffer-file-name)))
+         (request (courier--empty-request path))
+         (parts (courier--buffer-components)))
+    (when-let* ((front-matter (plist-get parts :front-matter)))
+      (setq request
+            (courier--parse-front-matter
+             front-matter
+             (plist-get parts :front-matter-line)
+             request)))
+    (courier--parse-http-block
+     (plist-get parts :http)
+     (plist-get parts :http-line)
+     request)))
 
 ;;;###autoload
 (defun courier-parse-file (path)
@@ -565,11 +808,19 @@ line after the matching `# @end'. Return a cons cell `(FIELD . SCRIPT)'."
   "Validate REQUEST and return REQUEST."
   (let ((method (plist-get request :method))
         (url (plist-get request :url))
-        (settings (plist-get request :settings)))
+        (settings (plist-get request :settings))
+        (body-type (or (plist-get request :body-type)
+                       courier-default-body-type))
+        (body (or (plist-get request :body) "")))
     (unless (and (stringp method) (member method courier--allowed-methods))
       (user-error "Invalid HTTP method: %s" method))
     (unless (and (stringp url) (not (string-empty-p url)))
       (user-error "Request URL must be present"))
+    (unless (memq body-type courier--allowed-body-types)
+      (user-error "Invalid body type: %s" body-type))
+    (when (and (eq body-type 'none)
+               (not (string-empty-p (string-trim body))))
+      (user-error "Body type `none` cannot have a body"))
     (when-let* ((timeout (plist-get settings :timeout)))
       (unless (and (integerp timeout) (> timeout 0))
         (user-error "Timeout must be a positive integer")))
@@ -588,12 +839,98 @@ line after the matching `# @end'. Return a cons cell `(FIELD . SCRIPT)'."
        (or (cdr (assoc-string name resolved-vars nil))
            (user-error "Unresolved variable: %s" name))))))
 
+(defun courier--request-body-type (request)
+  "Return the effective body type for REQUEST."
+  (or (plist-get request :body-type)
+      courier-default-body-type))
+
+(defun courier--body-type-label (body-type)
+  "Return a display label for BODY-TYPE."
+  (pcase body-type
+    ('none "None")
+    ('json "JSON")
+    ('xml "XML")
+    ('text "Text")
+    ('form-urlencoded "Form")
+    (_ (capitalize (symbol-name body-type)))))
+
+(defun courier--request-auth-type (request)
+  "Return the effective auth type for REQUEST."
+  (if-let* ((auth (plist-get request :auth)))
+      (or (plist-get auth :type) 'none)
+    'none))
+
+(defun courier--auth-type-label (auth-type)
+  "Return a display label for AUTH-TYPE."
+  (pcase auth-type
+    ('none "None")
+    ('basic "Basic")
+    ('bearer "Bearer")
+    ('header "Header")
+    (_ (capitalize (symbol-name auth-type)))))
+
+(defun courier--default-content-type-for-body-type (body-type)
+  "Return the default Content-Type header value for BODY-TYPE, or nil."
+  (pcase body-type
+    ('json "application/json")
+    ('xml "application/xml")
+    ('text "text/plain; charset=utf-8")
+    ('form-urlencoded "application/x-www-form-urlencoded")
+    (_ nil)))
+
+(defun courier--form-body-pairs-from-string (body)
+  "Parse BODY as a form-urlencoded-like raw string into an alist."
+  (let ((body (or body "")))
+    (if (string-empty-p body)
+        nil
+      (mapcar
+       (lambda (part)
+         (pcase-let* ((`(,name ,value)
+                       (if (string-match "\\`\\([^=]*\\)=\\(.*\\)\\'" part)
+                           (list (match-string 1 part) (match-string 2 part))
+                         (list part ""))))
+           (cons (url-unhex-string name)
+                 (url-unhex-string value))))
+       (split-string body "&" t)))))
+
+(defun courier--form-body-string-from-pairs (pairs)
+  "Return a raw unencoded form body string from PAIRS."
+  (mapconcat (lambda (pair)
+               (format "%s=%s" (car pair) (cdr pair)))
+             pairs "&"))
+
+(defun courier--resolve-form-body (body resolved-vars)
+  "Return BODY resolved and URL-encoded as form data using RESOLVED-VARS."
+  (let ((pairs (courier--form-body-pairs-from-string body)))
+    (mapconcat
+     (lambda (pair)
+       (format "%s=%s"
+               (url-hexify-string
+                (courier-expand-template (car pair) resolved-vars))
+               (url-hexify-string
+                (courier-expand-template (cdr pair) resolved-vars))))
+     pairs "&")))
+
+(defun courier--maybe-add-default-body-header (request)
+  "Add a default Content-Type header to REQUEST when body semantics require it."
+  (let* ((body-type (courier--request-body-type request))
+         (body (or (plist-get request :body) ""))
+         (headers (plist-get request :headers)))
+    (when (and (not (string-empty-p body))
+               (not (assoc-string "content-type" headers nil)))
+      (when-let* ((content-type (courier--default-content-type-for-body-type body-type)))
+        (plist-put request :headers
+                   (append headers (list (cons "content-type" content-type))))))
+    request))
+
 ;;;###autoload
 (defun courier-resolve-request (request &optional env-vars)
   "Resolve variables in REQUEST with optional ENV-VARS and return a new plist."
   (let* ((vars (courier-merge-vars env-vars (plist-get request :vars)))
          (resolved-vars (courier--resolve-vars vars))
-         (resolved (copy-sequence request)))
+         (resolved (copy-sequence request))
+         (body-type (courier--request-body-type request)))
+    (plist-put resolved :body-type body-type)
     (plist-put resolved :params
                (mapcar (lambda (param)
                          (cons (car param)
@@ -635,8 +972,14 @@ line after the matching `# @end'. Return a cons cell `(FIELD . SCRIPT)'."
                    (append (plist-get resolved :headers)
                            (list auth-header)))))
     (plist-put resolved :body
-               (courier-expand-template (or (plist-get request :body) "") resolved-vars))
+               (pcase body-type
+                 ('none "")
+                 ('form-urlencoded
+                  (courier--resolve-form-body (or (plist-get request :body) "") resolved-vars))
+                 (_
+                  (courier-expand-template (or (plist-get request :body) "") resolved-vars))))
     (plist-put resolved :resolved-vars resolved-vars)
+    (courier--maybe-add-default-body-header resolved)
     resolved))
 
 (defun courier--resolve-auth-header (auth resolved-vars)
@@ -656,10 +999,10 @@ line after the matching `# @end'. Return a cons cell `(FIELD . SCRIPT)'."
               (password (courier-expand-template
                          (plist-get auth :password)
                          resolved-vars))
-              (token (base64-encode-string (format "%s:%s" username password) t)))
+             (token (base64-encode-string (format "%s:%s" username password) t)))
          (cons "authorization" (format "Basic %s" token))))
       ('header
-       (cons (downcase (plist-get auth :name))
+       (cons (downcase (plist-get auth :header))
              (courier-expand-template
               (plist-get auth :value)
               resolved-vars))))))
@@ -2612,12 +2955,21 @@ The return value is one of:
         (pcase view
           ('image
            (special-mode)
-           (when (and body-file
-                      (display-images-p)
-                      (ignore-errors (create-image body-file)))
-             (insert-image (create-image body-file)))
-           (when body-file
-             (insert (format "\n\n%s\n" body-file))))
+           (cond
+            ((null body-file)
+             (insert "(empty)\n"))
+            ((not (display-images-p))
+             (insert "[Image display is unavailable in this Emacs session]\n\n")
+             (insert (format "%s\n" body-file)))
+            (t
+             (condition-case err
+                 (let ((image (create-image body-file)))
+                   (insert-image image)
+                   (insert (format "\n\n%s\n" body-file)))
+               (error
+                (insert (format "[Failed to render image: %s]\n\n%s\n"
+                                (error-message-string err)
+                                body-file)))))))
           (_
            (setq-local courier--response response)
            (setq-local courier--request request)
@@ -2661,12 +3013,27 @@ The return value is one of:
 (defvar-local courier--params-source-buffer nil
   "Request buffer associated with the current Courier params editor.")
 
+(defvar-local courier--request-model nil
+  "Parsed request model backing the current Courier request buffer.")
+
+(defvar-local courier--request-tab 'body
+  "Current Courier request section shown in the active request buffer.")
+
+(defvar-local courier--request-rendering-p nil
+  "Non-nil while the current Courier request buffer is being re-rendered.")
+
+(put 'courier--request-path 'permanent-local t)
+(put 'courier--active-env 'permanent-local t)
+(put 'courier--collection-root-hint 'permanent-local t)
+(put 'courier--request-model 'permanent-local t)
+(put 'courier--request-tab 'permanent-local t)
+
 (defconst courier--request-primary-sections
-  '(url headers body)
+  '(params body headers)
   "Primary navigation sections shown in Courier request buffers.")
 
 (defconst courier--request-secondary-sections
-  '(params auth vars tests pre-request post-response)
+  '(auth vars tests pre-request post-response)
   "Secondary navigation sections hidden behind `>>' in request buffers.")
 
 (defface courier-request-method-get-face
@@ -2697,15 +3064,18 @@ The return value is one of:
   '((t :inherit shadow :weight bold))
   "Face used for the `>>' marker in Courier request navigation.")
 
+(defface courier-request-divider-face
+  '((t :inherit shadow))
+  "Face used for the subtle divider between request header and editor area.")
+
 (defconst courier-request-font-lock-keywords
-  '(("^\\(#\\)\\s-*\\(@[[:alnum:]-]+\\)\\(?:\\s-+\\(.*\\)\\)?$"
-     (1 font-lock-comment-delimiter-face)
-     (2 font-lock-keyword-face)
-     (3 font-lock-string-face nil t))
-    ("^\\([A-Z]+\\)\\s-+\\(\\S-+.*\\)$"
+  '(("^\\([A-Z]+\\)\\s-+\\(\\S-+.*\\)$"
      (1 font-lock-keyword-face)
      (2 font-lock-string-face))
     ("^\\([^:# \t][^:]*\\):\\s-*\\(.*\\)$"
+     (1 font-lock-variable-name-face)
+     (2 font-lock-string-face))
+    ("^\\([A-Za-z_][A-Za-z0-9_]*\\)\\s-*=\\s-*\\(.*\\)$"
      (1 font-lock-variable-name-face)
      (2 font-lock-string-face))
     ("{{[^{}[:space:]]+}}"
@@ -2723,9 +3093,13 @@ The return value is one of:
   (pcase section
     ('url "URL")
     ('headers "Headers")
-    ('body "Body")
+    ('body (format "Body(%s)"
+                   (courier--body-type-label
+                    (courier--request-body-type courier--request-model))))
     ('params "Params")
-    ('auth "Auth")
+    ('auth (format "Auth(%s)"
+                   (courier--auth-type-label
+                    (courier--request-auth-type courier--request-model))))
     ('vars "Vars")
     ('tests "Tests")
     ('pre-request "Pre-request")
@@ -2740,97 +3114,21 @@ ACTIVE controls whether the active navigation face is used."
                         'courier-request-nav-active-face
                       'courier-request-nav-inactive-face)))
 
-(defun courier--request-script-kind-at-point ()
-  "Return the current request script kind at point, or nil."
-  (save-excursion
-    (let ((limit (point))
-          current)
-      (goto-char (point-min))
-      (while (< (point) limit)
-        (let ((line (buffer-substring-no-properties
-                     (line-beginning-position)
-                     (line-end-position))))
-          (cond
-           ((string-match "^#\\s-*@begin\\s-+\\(pre-request\\|post-response\\)\\b" line)
-            (setq current (intern (match-string-no-properties 1 line))))
-           ((string-match-p courier--script-block-end-regexp line)
-            (setq current nil))))
-        (forward-line 1))
-      current)))
+(defun courier--request-jump-choices ()
+  "Return an alist of request section jump choices."
+  (mapcar (lambda (item)
+            (cons (courier--request-section-label item) item))
+          (append courier--request-primary-sections
+                  courier--request-secondary-sections)))
 
-(defun courier--request-body-start-position ()
-  "Return the buffer position where the current request body begins."
-  (save-excursion
-    (unless (courier--goto-request-line)
-      (user-error "No Courier request in this buffer"))
-    (forward-line 1)
-    (while (and (not (eobp))
-                (not (string-empty-p
-                      (buffer-substring-no-properties
-                       (line-beginning-position)
-                       (line-end-position)))))
-      (forward-line 1))
-    (if (eobp)
-        (point-max)
-      (forward-line 1)
-      (point))))
-
-(defun courier--request-line-position ()
-  "Return the beginning position of the current request line."
-  (save-excursion
-    (when (courier--goto-request-line)
-      (line-beginning-position))))
-
-(defun courier--maybe-recenter-current-window ()
-  "Recenter the selected window when it shows the current buffer."
-  (when (eq (window-buffer (selected-window)) (current-buffer))
-    (recenter)))
-
-(defun courier--request-headers-start-position ()
-  "Return the beginning position of the request headers section."
-  (save-excursion
-    (unless (courier--goto-request-line)
-      (user-error "No Courier request in this buffer"))
-    (forward-line 1)
-    (point)))
+(defun courier--request-all-sections ()
+  "Return all request sections in display order."
+  (append courier--request-primary-sections
+          courier--request-secondary-sections))
 
 (defun courier--request-current-section ()
   "Return the logical request section at point."
-  (save-excursion
-    (beginning-of-line)
-    (let* ((line-start (line-beginning-position))
-           (line (buffer-substring-no-properties
-                  line-start
-                  (line-end-position)))
-           (script-kind (courier--request-script-kind-at-point))
-           (request-line (courier--request-line-position))
-           (headers-start (and request-line
-                               (courier--request-headers-start-position)))
-           (body-start (and request-line
-                            (courier--request-body-start-position))))
-      (cond
-       (script-kind
-        script-kind)
-       ((string-match-p "^#\\s-*@auth\\b" line)
-        'auth)
-       ((string-match-p "^#\\s-*@param\\b" line)
-        'params)
-       ((string-match-p "^#\\s-*@var\\b" line)
-        'vars)
-       ((string-match-p "^#\\s-*@test\\b" line)
-        'tests)
-       ((and request-line
-             (= line-start request-line))
-        'url)
-       ((and headers-start body-start
-             (<= headers-start line-start)
-             (< line-start body-start))
-        'headers)
-       ((and body-start
-             (>= line-start body-start))
-        'body)
-       (t
-        'url)))))
+  (or courier--request-tab 'body))
 
 (defun courier--request-header-line-format ()
   "Return the request navigation header line for the current buffer."
@@ -2841,12 +3139,408 @@ ACTIVE controls whether the active navigation face is used."
                    courier--request-primary-sections
                    "  "))
          (secondary
-          (unless (memq current courier--request-primary-sections)
+          (when (memq current courier--request-secondary-sections)
             (concat " "
                     (courier--request-nav-item current t)))))
     (concat " " primary "  "
             (propertize ">>" 'face 'courier-request-nav-more-face)
             (or secondary ""))))
+
+(defun courier--request-display-name (path)
+  "Return the display name for request PATH."
+  (let ((request (if-let* ((buffer (courier--request-buffer-for-path path)))
+                     (with-current-buffer buffer
+                       (courier--sync-request-model)
+                       (copy-tree courier--request-model t))
+                   (courier-parse-file path))))
+    (or (plist-get request :name)
+        (file-name-base path))))
+
+(defun courier--request-view-request-line (request)
+  "Return the request line string for REQUEST."
+  (format "%s %s"
+          (or (plist-get request :method) courier-default-request-method)
+          (or (plist-get request :url) "")))
+
+(defun courier--request-divider-line ()
+  "Return the subtle divider line between request header and section view."
+  (propertize "----------------------------------------"
+              'face 'courier-request-divider-face))
+
+(defun courier--request-section-placeholder (section)
+  "Return placeholder text for empty request SECTION."
+  (pcase section
+    ('params "# No params.\n")
+    ('headers "# No headers.\n")
+    ('body
+     (if (eq (courier--request-body-type courier--request-model) 'none)
+         "# No body.\n"
+       ""))
+    ('auth
+     (concat "# Auth section\n"
+             "# Supported types: none, bearer, basic, header\n"))
+    ('vars "# No variables.\n")
+    ('tests "# No tests.\n")
+    ('pre-request "# Empty pre-request script.\n")
+    ('post-response "# Empty post-response script.\n")
+    (_ "")))
+
+(defun courier--format-request-kv-lines (pairs)
+  "Return PAIRS formatted as `key = value' lines."
+  (if pairs
+      (mapconcat (lambda (pair)
+                   (format "%s = %s" (car pair) (cdr pair)))
+                 pairs
+                 "\n")
+    ""))
+
+(defun courier--request-effective-params (request)
+  "Return the effective params for REQUEST.
+
+Explicit Courier params win. When no explicit params exist, fall back to the
+request URL query string."
+  (or (plist-get request :params)
+      (courier--parse-url-query-params (or (plist-get request :url) ""))))
+
+(defun courier--request-auth-lines (auth)
+  "Return editable text for AUTH."
+  (pcase (plist-get auth :type)
+    ('none
+     "type = none")
+    ('bearer
+     (format "type = bearer\ntoken = %s" (or (plist-get auth :token) "")))
+    ('basic
+     (format "type = basic\nusername = %s\npassword = %s"
+             (or (plist-get auth :username) "")
+             (or (plist-get auth :password) "")))
+    ('header
+     (format "type = header\nheader = %s\nvalue = %s"
+             (or (plist-get auth :header) "")
+             (or (plist-get auth :value) "")))
+    (_
+     "")))
+
+(defun courier--request-section-text (request section)
+  "Return editable text for REQUEST SECTION."
+  (let ((text
+         (pcase section
+           ('params
+            (courier--format-request-kv-lines
+             (courier--request-effective-params request)))
+           ('headers
+            (if-let* ((headers (plist-get request :headers)))
+                (mapconcat (lambda (header)
+                             (format "%s: %s" (car header) (cdr header)))
+                           headers
+                           "\n")
+              ""))
+           ('body
+            (pcase (courier--request-body-type request)
+              ('form-urlencoded
+               (courier--format-request-kv-lines
+                (courier--form-body-pairs-from-string (plist-get request :body))))
+              ('none "")
+              (_
+               (or (plist-get request :body) ""))))
+           ('auth
+            (courier--request-auth-lines (plist-get request :auth)))
+           ('vars
+            (courier--format-request-kv-lines (plist-get request :vars)))
+           ('tests
+            (string-join (plist-get request :tests) "\n"))
+           ('pre-request
+            (or (plist-get request :pre-request-script) ""))
+           ('post-response
+            (or (plist-get request :post-response-script) ""))
+           (_
+            ""))))
+    (if (string-empty-p text)
+        (courier--request-section-placeholder section)
+      text)))
+
+(defun courier--request-content-start-position ()
+  "Return the editable content start position in the current request buffer."
+  (save-excursion
+    (goto-char (point-min))
+    (forward-line 3)
+    (point)))
+
+(defun courier--parse-request-view-request-line (line)
+  "Parse request LINE from the current rendered view."
+  (let ((trimmed (string-trim-right line)))
+    (cond
+     ((string-match "^\\([A-Z]+\\)\\(?:\\s-+\\(.*\\)\\)?$" trimmed)
+      (list (match-string 1 trimmed)
+            (or (match-string 2 trimmed) "")))
+     ((string-empty-p trimmed)
+      (list courier-default-request-method ""))
+     (t
+      (user-error "Malformed request line: %s" line)))))
+
+(defun courier--trim-trailing-empty-lines (string)
+  "Return STRING without trailing empty lines."
+  (replace-regexp-in-string "\n*\\'" "" (or string "")))
+
+(defun courier--comment-only-section-p (text)
+  "Return non-nil when TEXT only contains comments or blank lines."
+  (cl-every
+   (lambda (line)
+     (let ((trimmed (string-trim line)))
+       (or (string-empty-p trimmed)
+           (string-prefix-p "#" trimmed))))
+   (split-string (or text "") "\n")))
+
+(defun courier--parse-request-kv-lines (text label)
+  "Parse `key = value' TEXT for LABEL into an alist."
+  (let (pairs)
+    (dolist (line (split-string (or text "") "\n"))
+      (let ((trimmed (string-trim-right line)))
+        (unless (or (string-empty-p trimmed)
+                    (string-prefix-p "#" (string-trim-left trimmed)))
+          (unless (string-match "\\`\\([^=[:space:]][^=]*\\)\\s-*=\\s-*\\(.*\\)\\'" trimmed)
+            (user-error "Invalid %s line: %s" label trimmed))
+          (push (cons (string-trim (match-string 1 trimmed))
+                      (string-trim (match-string 2 trimmed)))
+                pairs))))
+    (nreverse pairs)))
+
+(defun courier--parse-request-header-lines (text)
+  "Parse header TEXT into a Courier header alist."
+  (let (headers)
+    (dolist (line (split-string (or text "") "\n"))
+      (let ((trimmed (string-trim-right line)))
+        (unless (or (string-empty-p trimmed)
+                    (string-prefix-p "#" (string-trim-left trimmed)))
+          (unless (string-match courier--header-line-regexp trimmed)
+            (user-error "Malformed header: %s" trimmed))
+          (push (cons (downcase (match-string 1 trimmed))
+                      (match-string 2 trimmed))
+                headers))))
+    (nreverse headers)))
+
+(defun courier--parse-request-auth-lines (text)
+  "Parse auth section TEXT into a Courier auth plist or nil."
+  (let* ((pairs (courier--parse-request-kv-lines text "auth"))
+         (type (cdr (assoc-string "type" pairs nil))))
+    (cond
+     ((null pairs) nil)
+     ((string-empty-p (or type ""))
+      (user-error "Auth section requires `type = ...'"))
+     ((string= type "none")
+      nil)
+     ((string= type "bearer")
+      (list :type 'bearer
+            :token (or (cdr (assoc-string "token" pairs nil)) "")))
+     ((string= type "basic")
+      (list :type 'basic
+            :username (or (cdr (assoc-string "username" pairs nil)) "")
+            :password (or (cdr (assoc-string "password" pairs nil)) "")))
+     ((string= type "header")
+      (list :type 'header
+            :header (or (cdr (assoc-string "header" pairs nil)) "")
+            :value (or (cdr (assoc-string "value" pairs nil)) "")))
+     (t
+      (user-error "Unsupported auth type: %s" type)))))
+
+(defun courier--toml-quote-string (string)
+  "Return STRING serialized as a TOML basic string."
+  (prin1-to-string (or string "")))
+
+(defun courier--serialize-front-matter (request)
+  "Return TOML front matter for REQUEST, or nil when not needed."
+  (let* ((settings (plist-get request :settings))
+         (name (and (plist-get request :name)
+                    (string-trim (plist-get request :name))))
+         (timeout (plist-get settings :timeout))
+         (follow-redirects-present (plist-member settings :follow-redirects))
+         (follow-redirects (plist-get settings :follow-redirects))
+         (body-type (courier--request-body-type request))
+         (auth (plist-get request :auth))
+         (vars (plist-get request :vars))
+         (tests (plist-get request :tests))
+         (pre-request (plist-get request :pre-request-script))
+         (post-response (plist-get request :post-response-script))
+         root-entries
+         table-sections)
+    (when (and name (not (string-empty-p name)))
+      (push (format "name = %s" (courier--toml-quote-string name)) root-entries))
+    (when timeout
+      (push (format "timeout = %d" timeout) root-entries))
+    (when follow-redirects-present
+      (push (format "follow_redirects = %s" (if follow-redirects "true" "false")) root-entries))
+    (when tests
+      (let ((lines (list "tests = [")))
+        (dolist (test tests)
+          (push (format "  %s," (courier--toml-quote-string test)) lines))
+        (push "]" lines)
+        (push (string-join (nreverse lines) "\n") root-entries)))
+    (when body-type
+      (push (format "[body]\ntype = %s"
+                    (courier--toml-quote-string (symbol-name body-type)))
+            table-sections))
+    (when auth
+      (let ((lines (list "[auth]")))
+        (push (format "type = %s"
+                      (courier--toml-quote-string
+                       (symbol-name (plist-get auth :type))))
+              lines)
+        (pcase (plist-get auth :type)
+          ('bearer
+           (push (format "token = %s"
+                         (courier--toml-quote-string
+                          (or (plist-get auth :token) "")))
+                 lines))
+          ('basic
+           (push (format "username = %s"
+                         (courier--toml-quote-string
+                          (or (plist-get auth :username) "")))
+                 lines)
+           (push (format "password = %s"
+                         (courier--toml-quote-string
+                          (or (plist-get auth :password) "")))
+                 lines))
+          ('header
+           (push (format "header = %s"
+                         (courier--toml-quote-string
+                          (or (plist-get auth :header) "")))
+                 lines)
+           (push (format "value = %s"
+                         (courier--toml-quote-string
+                          (or (plist-get auth :value) "")))
+                 lines))
+          (_
+           (user-error "Unsupported auth type: %s" (plist-get auth :type))))
+        (push (string-join (nreverse lines) "\n") table-sections)))
+    (when vars
+      (let ((lines (list "[vars]")))
+        (dolist (pair vars)
+          (push (format "%s = %s"
+                        (car pair)
+                        (courier--toml-quote-string (cdr pair)))
+                lines))
+        (push (string-join (nreverse lines) "\n") table-sections)))
+    (when (or (and pre-request (not (string-empty-p (string-trim pre-request))))
+              (and post-response (not (string-empty-p (string-trim post-response)))))
+      (let ((lines (list "[scripts]")))
+        (when (and pre-request
+                   (not (string-empty-p (string-trim pre-request))))
+          (when (string-match-p "\"\"\"" pre-request)
+            (user-error "pre_request script contains unsupported triple quotes"))
+          (push (format "pre_request = \"\"\"\n%s\n\"\"\"" pre-request) lines))
+        (when (and post-response
+                   (not (string-empty-p (string-trim post-response))))
+          (when (string-match-p "\"\"\"" post-response)
+            (user-error "post_response script contains unsupported triple quotes"))
+          (push (format "post_response = \"\"\"\n%s\n\"\"\"" post-response) lines))
+        (push (string-join (nreverse lines) "\n") table-sections)))
+    (let ((sections (append (nreverse root-entries)
+                            (nreverse table-sections))))
+      (when sections
+      (concat "+++\n"
+              (string-join sections "\n\n")
+              "\n+++\n\n")))))
+
+(defun courier--serialize-request (request)
+  "Return REQUEST serialized to Courier v1 syntax."
+  (let* ((front-matter (courier--serialize-front-matter request))
+         (request-url (courier--update-request-url-query
+                       (or (plist-get request :url) "")
+                       (plist-get request :params)))
+         (request-line (format "%s %s"
+                               (or (plist-get request :method) courier-default-request-method)
+                               request-url))
+         (headers (mapcar (lambda (header)
+                            (format "%s: %s" (car header) (cdr header)))
+                          (plist-get request :headers)))
+         (body (or (plist-get request :body) "")))
+    (concat
+     (or front-matter "")
+     request-line "\n"
+     (if headers
+         (concat (string-join headers "\n") "\n")
+       "")
+     "\n"
+     body)))
+
+(defun courier--sync-request-model ()
+  "Persist the currently visible request view back into `courier--request-model'."
+  (when (and (derived-mode-p 'courier-request-mode)
+             courier--request-model
+             (not courier--request-rendering-p))
+    (save-excursion
+      (goto-char (point-min))
+      (let* ((request-line (buffer-substring-no-properties
+                            (line-beginning-position)
+                            (line-end-position)))
+             (content-start (courier--request-content-start-position))
+             (section-text (courier--trim-trailing-empty-lines
+                            (buffer-substring-no-properties content-start (point-max)))))
+        (pcase-let ((`(,method ,url) (courier--parse-request-view-request-line request-line)))
+          (plist-put courier--request-model :method method)
+          (plist-put courier--request-model :url url))
+        (pcase courier--request-tab
+          ('params
+           (let ((params (courier--parse-request-kv-lines section-text "param")))
+             (plist-put courier--request-model :params params)
+             (plist-put courier--request-model :url
+                        (car (courier--split-request-url
+                              (or (plist-get courier--request-model :url) ""))))))
+          ('headers
+           (plist-put courier--request-model :headers
+                      (courier--parse-request-header-lines section-text)))
+         ('body
+           (let ((body-type (courier--request-body-type courier--request-model)))
+             (plist-put courier--request-model :body
+                        (pcase body-type
+                          ('none "")
+                          ('form-urlencoded
+                           (courier--form-body-string-from-pairs
+                            (courier--parse-request-kv-lines section-text "form body")))
+                          (_
+                           section-text)))))
+          ('auth
+           (plist-put courier--request-model :auth
+                      (courier--parse-request-auth-lines section-text)))
+          ('vars
+           (plist-put courier--request-model :vars
+                      (courier--parse-request-kv-lines section-text "variable")))
+          ('tests
+           (plist-put courier--request-model :tests
+                      (cl-loop for line in (split-string section-text "\n")
+                               for trimmed = (string-trim-right line)
+                               unless (or (string-empty-p trimmed)
+                                          (string-prefix-p "#" (string-trim-left trimmed)))
+                               collect trimmed)))
+          ('pre-request
+           (plist-put courier--request-model :pre-request-script
+                      (if (courier--comment-only-section-p section-text)
+                          ""
+                        section-text)))
+          ('post-response
+           (plist-put courier--request-model :post-response-script
+                      (if (courier--comment-only-section-p section-text)
+                          ""
+                        section-text))))))))
+
+(defun courier--render-request-buffer ()
+  "Render the current Courier request buffer from `courier--request-model'."
+  (unless courier--request-model
+    (user-error "No Courier request model loaded"))
+  (let ((inhibit-read-only t)
+        (modified (buffer-modified-p))
+        (request courier--request-model))
+    (setq courier--request-rendering-p t)
+    (unwind-protect
+        (progn
+          (erase-buffer)
+          (insert (courier--request-view-request-line request) "\n")
+          (insert (courier--request-divider-line) "\n")
+          (insert "\n")
+          (insert (courier--request-section-text request courier--request-tab))
+          (goto-char (courier--request-content-start-position))
+          (courier--refresh-method-overlay))
+      (setq courier--request-rendering-p nil)
+      (set-buffer-modified-p modified))))
 
 (defun courier--preview-buffer ()
   "Return the Courier preview buffer."
@@ -2974,11 +3668,9 @@ directory even when it does not exist yet."
 
 (defun courier--buffer-request-name ()
   "Return the current buffer request name, or a default untitled name."
-  (save-excursion
-    (goto-char (point-min))
-    (if (re-search-forward "^# @name\\s-+\\(.+\\)\\s-*$" nil t)
-        (string-trim (match-string-no-properties 1))
-      "Untitled")))
+  (if courier--request-model
+      (or (plist-get courier--request-model :name) "Untitled")
+    "Untitled"))
 
 (defun courier--next-untitled-request-name ()
   "Return the next untitled request display name."
@@ -2992,7 +3684,13 @@ directory even when it does not exist yet."
 
 (defun courier--request-skeleton (name)
   "Return initial draft text for request NAME."
-  (concat "# @name " name "\n"
+  (concat "+++\n"
+          "name = " (courier--toml-quote-string name) "\n"
+          "\n"
+          "[body]\n"
+          "type = " (courier--toml-quote-string
+                     (symbol-name courier-default-body-type)) "\n"
+          "+++\n\n"
           courier-default-request-method " \n"
           "Accept: application/json\n"))
 
@@ -3066,15 +3764,6 @@ directory even when it does not exist yet."
           (courier--create-collection selected))
         (user-error "No Courier collection selected"))))
 
-(defun courier--request-display-name (path)
-  "Return the display name for request PATH."
-  (let ((request (if-let* ((buffer (courier--request-buffer-for-path path)))
-                     (with-current-buffer buffer
-                       (courier-parse-buffer))
-                   (courier-parse-file path))))
-    (or (plist-get request :name)
-        (file-name-base path))))
-
 (defun courier--ensure-directory-under-root (directory root)
   "Validate DIRECTORY against ROOT and create it when missing."
   (let ((expanded-directory (file-name-as-directory (expand-file-name directory)))
@@ -3087,14 +3776,14 @@ directory even when it does not exist yet."
     expanded-directory))
 
 (defun courier--write-request-name (buffer name)
-  "Ensure BUFFER contains a `# @name' directive set to NAME."
+  "Ensure BUFFER contains Courier request NAME in its active model."
   (with-current-buffer buffer
-    (save-excursion
-      (goto-char (point-min))
-      (if (re-search-forward "^# @name\\(?:\\s-+.*\\)?$" nil t)
-          (replace-match (format "# @name %s" name) t t)
-        (goto-char (point-min))
-        (insert (format "# @name %s\n" name))))))
+    (if courier--request-model
+        (progn
+          (courier--sync-request-model)
+          (plist-put courier--request-model :name name)
+          (courier--render-request-buffer))
+      (user-error "Courier request model is not initialized"))))
 
 (defun courier--migrate-request-artifacts (old-path new-path &optional new-name)
   "Move Courier state from OLD-PATH to NEW-PATH.
@@ -3306,7 +3995,10 @@ Entries are read from the configured env directory only."
 
 (defun courier--prepared-current-request ()
   "Return the current request after env selection and pre-request scripts."
-  (let* ((parsed-request (courier-parse-buffer))
+  (courier--sync-request-model)
+  (let* ((parsed-request (if courier--request-model
+                             (copy-tree courier--request-model t)
+                           (courier-parse-buffer)))
          (env-selection (courier--current-env-selection))
          (env-name (car env-selection))
          (env-vars (cdr env-selection))
@@ -3355,7 +4047,7 @@ Entries are read from the configured env directory only."
                      (plist-get auth :username)
                      (plist-get auth :password))))
       ('header
-       (cons (downcase (plist-get auth :name))
+       (cons (downcase (plist-get auth :header))
              (plist-get auth :value))))))
 
 (defun courier--request-for-export (request)
@@ -3364,6 +4056,7 @@ Entries are read from the configured env directory only."
   (if courier--export-interpolate
       (courier-resolve-request request (plist-get request :env-vars))
     (let ((export (copy-tree request t)))
+      (plist-put export :body-type (courier--request-body-type request))
       (plist-put export :url (courier--export-source-url request))
       (when-let* ((auth-header
                    (courier--export-source-auth-header (plist-get request :auth))))
@@ -3371,6 +4064,9 @@ Entries are read from the configured env directory only."
           (plist-put export :headers
                      (append (plist-get export :headers)
                              (list auth-header)))))
+      (when (eq (courier--request-body-type export) 'none)
+        (plist-put export :body ""))
+      (courier--maybe-add-default-body-header export)
       export)))
 
 (defun courier--shell-quote (string)
@@ -3520,10 +4216,12 @@ Entries are read from the configured env directory only."
 
 (defun courier--current-method ()
   "Return the current request method from the buffer, or nil."
-  (save-excursion
-    (when (courier--goto-request-line)
-      (when (looking-at "^\\([A-Z]+\\)\\(?:\\s-+.*\\)?$")
-        (match-string-no-properties 1)))))
+  (if courier--request-model
+      (plist-get courier--request-model :method)
+    (save-excursion
+      (when (courier--goto-request-line)
+        (when (looking-at "^\\([A-Z]+\\)\\(?:\\s-+.*\\)?$")
+          (match-string-no-properties 1))))))
 
 (defun courier--method-overlay-face (method)
   "Return the overlay face used for request METHOD."
@@ -3535,10 +4233,16 @@ Entries are read from the configured env directory only."
 
 (defun courier--current-method-bounds ()
   "Return `(START . END)' for the current request method token, or nil."
-  (save-excursion
-    (when (courier--goto-request-line)
-      (when (looking-at "^\\([A-Z]+\\)\\(?:\\s-+.*\\)?$")
-        (cons (match-beginning 1) (match-end 1))))))
+  (if courier--request-model
+      (save-excursion
+        (goto-char (point-min))
+        (beginning-of-line)
+        (when (looking-at "^\\([A-Z]+\\)\\(?:\\s-+.*\\)?$")
+          (cons (match-beginning 1) (match-end 1))))
+    (save-excursion
+      (when (courier--goto-request-line)
+        (when (looking-at "^\\([A-Z]+\\)\\(?:\\s-+.*\\)?$")
+          (cons (match-beginning 1) (match-end 1)))))))
 
 (defun courier--after-change-refresh-method-overlay (&rest _args)
   "Refresh the Courier request method overlay after buffer changes."
@@ -3565,37 +4269,21 @@ Entries are read from the configured env directory only."
         (overlay-put overlay 'help-echo (format "Courier method: %s" method)))
     (courier--delete-method-overlay)))
 
-(defun courier--directive-insertion-point ()
-  "Return the buffer position where Courier directives should be inserted."
-  (save-excursion
-    (if (courier--goto-request-line)
-        (line-beginning-position)
-      (point-max))))
-
-(defun courier--insert-directive-text (text)
-  "Insert Courier directive TEXT before the request line."
-  (goto-char (courier--directive-insertion-point))
-  (insert text))
-
-(defun courier--goto-directive (regexp label)
-  "Move point to the first directive matching REGEXP, described by LABEL."
-  (let ((origin (point)))
-    (goto-char (point-min))
-    (unless (re-search-forward regexp nil t)
-      (goto-char origin)
-      (user-error "No Courier %s in this request" label))
-    (push-mark origin t)
-    (beginning-of-line)
-    (message "Jumped to Courier %s." label)))
-
 (defun courier--current-request-url-bounds ()
   "Return `(START . END)' for the current request URL token, or nil."
-  (save-excursion
-    (when (courier--goto-request-line)
-      (beginning-of-line)
-      (when (looking-at "^\\([A-Z]+\\)\\(?:\\s-+\\(\\S-+\\)\\)?\\s-*$")
-        (when (match-beginning 2)
-          (cons (match-beginning 2) (match-end 2)))))))
+  (if courier--request-model
+      (save-excursion
+        (goto-char (point-min))
+        (beginning-of-line)
+        (when (looking-at "^\\([A-Z]+\\)\\(?:\\s-+\\(\\S-+\\)\\)?\\s-*$")
+          (when (match-beginning 2)
+            (cons (match-beginning 2) (match-end 2)))))
+    (save-excursion
+      (when (courier--goto-request-line)
+        (beginning-of-line)
+        (when (looking-at "^\\([A-Z]+\\)\\(?:\\s-+\\(\\S-+\\)\\)?\\s-*$")
+          (when (match-beginning 2)
+            (cons (match-beginning 2) (match-end 2))))))))
 
 (defun courier--current-request-url ()
   "Return the current request URL token.
@@ -3606,17 +4294,22 @@ Signal `user-error' when the current request line has no URL."
 
 (defun courier--replace-current-request-url (url)
   "Replace the current request URL token with URL."
-  (unless (courier--goto-request-line)
-    (user-error "No Courier request in this buffer"))
-  (beginning-of-line)
-  (cond
-   ((looking-at "^\\([A-Z]+\\)\\(\\s-+\\)\\(\\S-+\\)\\(\\s-*\\)$")
-    (replace-match url t t nil 3))
-   ((looking-at "^\\([A-Z]+\\)\\(\\s-*\\)$")
-    (goto-char (match-end 1))
-    (insert " " url))
-   (t
-    (user-error "Cannot replace the current request URL"))))
+  (if courier--request-model
+      (progn
+        (courier--sync-request-model)
+        (plist-put courier--request-model :url url)
+        (courier--render-request-buffer))
+    (unless (courier--goto-request-line)
+      (user-error "No Courier request in this buffer"))
+    (beginning-of-line)
+    (cond
+     ((looking-at "^\\([A-Z]+\\)\\(\\s-+\\)\\(\\S-+\\)\\(\\s-*\\)$")
+      (replace-match url t t nil 3))
+     ((looking-at "^\\([A-Z]+\\)\\(\\s-*\\)$")
+      (goto-char (match-end 1))
+      (insert " " url))
+     (t
+      (user-error "Cannot replace the current request URL")))))
 
 (defun courier--split-request-url (url)
   "Split URL into `(BASE QUERY FRAGMENT)'."
@@ -3725,11 +4418,19 @@ Signal `user-error' when the current request line has no URL."
     (unless (buffer-live-p source-buffer)
       (user-error "Source Courier request buffer is no longer live"))
     (with-current-buffer source-buffer
-      (save-excursion
-        (courier--replace-current-request-url
-         (courier--update-request-url-query
-          (courier--current-request-url)
-          params)))
+      (courier--sync-request-model)
+      (if courier--request-model
+          (progn
+            (plist-put courier--request-model :params params)
+            (plist-put courier--request-model :url
+                       (car (courier--split-request-url
+                             (or (plist-get courier--request-model :url) ""))))
+            (courier--render-request-buffer))
+        (save-excursion
+          (courier--replace-current-request-url
+           (courier--update-request-url-query
+            (courier--current-request-url)
+            params))))
       (set-buffer-modified-p t))
     (when-let* ((window (get-buffer-window editor-buffer)))
       (quit-window t window))
@@ -3752,8 +4453,9 @@ Signal `user-error' when the current request line has no URL."
   "Edit the current request URL query params in a dedicated buffer."
   (interactive)
   (let* ((source-buffer (current-buffer))
-         (url (courier--current-request-url))
-         (params (courier--parse-url-query-params url))
+         (params (if courier--request-model
+                     (copy-tree (courier--request-effective-params courier--request-model) t)
+                   (courier--parse-url-query-params (courier--current-request-url))))
          (buffer (get-buffer-create
                   (courier--params-editor-buffer-name source-buffer))))
     (with-current-buffer buffer
@@ -3774,7 +4476,8 @@ Signal `user-error' when the current request line has no URL."
   (setq-local mode-name '(:eval (courier--mode-line-lighter)))
   (setq-local font-lock-defaults '(courier-request-font-lock-keywords))
   (setq-local header-line-format '(:eval (courier--request-header-line-format)))
-  (setq-local outline-regexp "^# @\\|^[A-Z]+ ")
+  (setq-local outline-regexp "^[A-Z]+ ")
+  (setq-local revert-buffer-function #'courier-request-revert-buffer)
   (setq-local courier--request-path (and buffer-file-name (expand-file-name buffer-file-name)))
   (setq-local courier--collection-root-hint
               (or courier--collection-root-hint
@@ -3786,13 +4489,29 @@ Signal `user-error' when the current request line has no URL."
   (unless courier--active-env
     (when-let* ((preferred-env (courier--preferred-env-name
                                 (courier--available-env-entries))))
-      (setq-local courier--active-env preferred-env))))
+      (setq-local courier--active-env preferred-env)))
+  (unless courier--request-model
+    (setq-local courier--request-model (courier--parse-buffer-for-editor)))
+  (setq-local courier--request-tab (or courier--request-tab 'body))
+  (courier--render-request-buffer))
+
+;;;###autoload
+(defun courier-request-revert-buffer (&optional _ignore-auto _noconfirm)
+  "Revert the current Courier request buffer from disk."
+  (interactive)
+  (unless buffer-file-name
+    (user-error "Current Courier request has no file to revert"))
+  (setq-local courier--request-model (courier--parse-file-for-editor buffer-file-name))
+  (courier--render-request-buffer)
+  (set-buffer-modified-p nil)
+  (message "Courier request reverted."))
 
 ;;;###autoload
 (defun courier-request-validate ()
   "Parse and validate the current Courier request buffer."
   (interactive)
-  (let ((request (courier-parse-buffer)))
+  (courier--sync-request-model)
+  (let ((request (copy-tree courier--request-model t)))
     (courier-validate-request request)
     (message "Courier request is valid.")))
 
@@ -3831,17 +4550,72 @@ Signal `user-error' when the current request line has no URL."
                      courier--allowed-methods
                      nil t nil nil
                      (courier--current-method))))
-  (save-excursion
-    (unless (courier--goto-request-line)
-      (user-error "No Courier request in this buffer"))
-    (beginning-of-line)
-    (cond
-     ((looking-at "^\\([A-Z]+\\)\\(?:\\s-+.*\\)?$")
-      (replace-match method t t nil 1))
-     (t
-      (insert method " "))))
+  (courier--sync-request-model)
+  (plist-put courier--request-model :method method)
+  (courier--render-request-buffer)
   (courier--refresh-overview-buffers)
   (message "Courier method set to %s." method))
+
+;;;###autoload
+(defun courier-request-set-body-type (body-type)
+  "Set the current request body type to BODY-TYPE."
+  (interactive
+   (list
+    (intern
+     (completing-read "Body type: "
+                      (mapcar #'symbol-name courier--allowed-body-types)
+                      nil t nil nil
+                      (symbol-name
+                       (courier--request-body-type
+                        (or courier--request-model
+                            (courier--parse-buffer-for-editor))))))))
+  (unless (memq body-type courier--allowed-body-types)
+    (user-error "Unsupported body type: %s" body-type))
+  (courier--sync-request-model)
+  (plist-put courier--request-model :body-type body-type)
+  (when (eq body-type 'none)
+    (plist-put courier--request-model :body ""))
+  (setq courier--request-tab 'body)
+  (courier--render-request-buffer)
+  (set-buffer-modified-p t)
+  (message "Courier body type set to %s." (courier--body-type-label body-type)))
+
+;;;###autoload
+(defun courier-request-set-auth-type (auth-type)
+  "Set the current request auth type to AUTH-TYPE."
+  (interactive
+   (list
+    (intern
+     (completing-read "Auth type: "
+                      (mapcar #'symbol-name courier--allowed-auth-types)
+                      nil t nil nil
+                      (symbol-name
+                       (courier--request-auth-type
+                        (or courier--request-model
+                            (courier--parse-buffer-for-editor))))))))
+  (unless (memq auth-type courier--allowed-auth-types)
+    (user-error "Unsupported auth type: %s" auth-type))
+  (courier--sync-request-model)
+  (plist-put courier--request-model :auth
+             (pcase auth-type
+               ('none nil)
+               ('bearer
+                (list :type 'bearer
+                      :token "{{token}}"))
+               ('basic
+                (list :type 'basic
+                      :username "{{user}}"
+                      :password "{{password}}"))
+               ('header
+                (list :type 'header
+                      :header "X-API-Key"
+                      :value "{{token}}"))
+               (_
+                (user-error "Unsupported auth type: %s" auth-type))))
+  (setq courier--request-tab 'auth)
+  (courier--render-request-buffer)
+  (set-buffer-modified-p t)
+  (message "Courier auth type set to %s." (courier--auth-type-label auth-type)))
 
 ;;;###autoload
 (defun courier-request-export-set-format (format)
@@ -3876,161 +4650,25 @@ Signal `user-error' when the current request line has no URL."
     (kill-new command)
     (message "Copied Courier export: %s" (courier--export-state-label))))
 
-;;;###autoload
-(defun courier-request-insert-param (name value)
-  "Insert a Courier query parameter directive with NAME and VALUE."
-  (interactive
-   (list (read-string "Param name: ")
-         (read-string "Param value: ")))
-  (when (string-empty-p name)
-    (user-error "Courier param name cannot be empty"))
-  (courier--insert-directive-text
-   (format "# @param %s %s\n" name value)))
-
-;;;###autoload
-(defun courier-request-insert-auth (kind &optional first second)
-  "Insert a Courier auth directive of KIND using FIRST and SECOND values.
-
-For `bearer', FIRST is the token.
-For `basic', FIRST is the username and SECOND is the password.
-For `header', FIRST is the header name and SECOND is the header value."
-  (interactive
-   (let ((kind
-          (intern
-           (completing-read "Auth kind: "
-                            '("bearer" "basic" "header")
-                            nil t))))
-     (pcase kind
-       ('bearer
-        (list kind (read-string "Bearer token: " "{{token}}")))
-       ('basic
-        (list kind
-              (read-string "Basic username: " "{{user}}")
-              (read-string "Basic password: " "{{password}}")))
-       ('header
-        (list kind
-              (read-string "Header name: " "X-API-Key")
-              (read-string "Header value: " "{{token}}"))))))
-  (let ((directive
-         (pcase kind
-           ('bearer
-            (format "# @auth bearer %s\n" (or first "{{token}}")))
-           ('basic
-            (format "# @auth basic %s %s\n"
-                    (or first "{{user}}")
-                    (or second "{{password}}")))
-           ('header
-            (format "# @auth header %s %s\n"
-                    (or first "X-API-Key")
-                    (or second "{{token}}")))
-           (_
-            (user-error "Unsupported auth kind: %s" kind)))))
-    (courier--insert-directive-text directive)))
-
-(defun courier--insert-script-block (kind)
-  "Insert a Courier script block of KIND before the request line."
-  (let ((start (courier--directive-insertion-point)))
-    (goto-char start)
-    (insert (format "# @begin %s\n# \n# @end\n" kind))
-    (goto-char start)
-    (forward-line 1)
-    (end-of-line)))
-
-;;;###autoload
-(defun courier-request-insert-pre-request-script ()
-  "Insert a Courier pre-request script block."
-  (interactive)
-  (courier--insert-script-block "pre-request"))
-
-;;;###autoload
-(defun courier-request-insert-post-response-script ()
-  "Insert a Courier post-response script block."
-  (interactive)
-  (courier--insert-script-block "post-response"))
-
-;;;###autoload
-(defun courier-request-goto-auth ()
-  "Jump to the first Courier auth directive in the current request."
-  (interactive)
-  (courier--goto-directive "^#\\s-*@auth\\b" "auth directive"))
-
-;;;###autoload
-(defun courier-request-goto-param ()
-  "Jump to the first Courier query parameter directive in the current request."
-  (interactive)
-  (courier--goto-directive "^#\\s-*@param\\b" "param directive"))
-
-;;;###autoload
-(defun courier-request-goto-pre-request-script ()
-  "Jump to the first Courier pre-request script block."
-  (interactive)
-  (courier--goto-directive "^#\\s-*@begin\\s-+pre-request\\b"
-                           "pre-request script"))
-
-;;;###autoload
-(defun courier-request-goto-post-response-script ()
-  "Jump to the first Courier post-response script block."
-  (interactive)
-  (courier--goto-directive "^#\\s-*@begin\\s-+post-response\\b"
-                           "post-response script"))
-
-(defun courier-request-goto-url ()
-  "Jump to the current request URL."
-  (interactive)
-  (unless (courier--goto-request-line)
-    (user-error "No Courier request in this buffer"))
-  (if-let* ((bounds (courier--current-request-url-bounds)))
-      (goto-char (car bounds))
-    (end-of-line))
-  (courier--maybe-recenter-current-window))
-
-(defun courier-request-goto-headers ()
-  "Jump to the request headers section."
-  (interactive)
-  (goto-char (courier--request-headers-start-position))
-  (back-to-indentation)
-  (courier--maybe-recenter-current-window))
-
-(defun courier-request-goto-body ()
-  "Jump to the request body section."
-  (interactive)
-  (goto-char (courier--request-body-start-position))
-  (back-to-indentation)
-  (courier--maybe-recenter-current-window))
-
-(defun courier-request-goto-vars ()
-  "Jump to the first Courier variable directive in the current request."
-  (interactive)
-  (courier--goto-directive "^#\\s-*@var\\b" "variable directive"))
-
-(defun courier-request-goto-tests ()
-  "Jump to the first Courier test directive in the current request."
-  (interactive)
-  (courier--goto-directive "^#\\s-*@test\\b" "test directive"))
-
 (defun courier--request-jump-section (section)
-  "Jump to request SECTION in the current Courier buffer."
-  (pcase section
-    ('url (courier-request-goto-url))
-    ('headers (courier-request-goto-headers))
-    ('body (courier-request-goto-body))
-    ('params (courier-request-edit-params))
-    ('auth (courier-request-goto-auth))
-    ('vars (courier-request-goto-vars))
-    ('tests (courier-request-goto-tests))
-    ('pre-request (courier-request-goto-pre-request-script))
-    ('post-response (courier-request-goto-post-response-script))
-    (_ (user-error "Unknown Courier section: %s" section))))
+  "Show request SECTION in the current Courier buffer."
+  (unless (memq section (courier--request-all-sections))
+    (user-error "Unknown Courier section: %s" section))
+  (courier--sync-request-model)
+  (setq courier--request-tab section)
+  (courier--render-request-buffer))
 
 ;;;###autoload
 (defun courier-request-jump-section (section)
   "Jump to request SECTION in the current Courier buffer."
   (interactive
-   (let* ((choices (mapcar (lambda (item)
-                             (cons (courier--request-section-label item) item))
-                           (append courier--request-primary-sections
-                                   courier--request-secondary-sections)))
-          (selection (completing-read "Jump to section: " choices nil t)))
+   (let* ((choices (courier--request-jump-choices))
+          (current-section (courier--request-current-section))
+          (current (and (memq current-section
+                              (append courier--request-primary-sections
+                                      courier--request-secondary-sections))
+                        (courier--request-section-label current-section)))
+          (selection (completing-read "Jump to section: " choices nil t nil nil current)))
      (list (cdr (assoc selection choices)))))
   (courier--request-jump-section section))
 
@@ -4061,8 +4699,11 @@ For `header', FIRST is the header name and SECOND is the header value."
   "Save the current Courier request buffer.
 Unsaved request buffers choose a collection on first save."
   (interactive)
+  (courier--sync-request-model)
   (if buffer-file-name
-      (save-buffer)
+      (progn
+        (write-region (courier--serialize-request courier--request-model) nil buffer-file-name nil 'silent)
+        (set-buffer-modified-p nil))
     (let* ((collection-root (courier--read-save-collection-root))
            (request-root (courier--preferred-requests-root collection-root))
            (request-name (courier--buffer-request-name))
@@ -4072,7 +4713,8 @@ Unsaved request buffers choose a collection on first save."
       (setq-local default-directory (file-name-directory path))
       (setq-local courier--request-path path)
       (setq-local courier--collection-root-hint collection-root)
-      (save-buffer)
+      (write-region (courier--serialize-request courier--request-model) nil path nil 'silent)
+      (set-buffer-modified-p nil)
       (courier--refresh-overview-buffers)
       (message "Courier request saved to %s" path))))
 
@@ -4137,7 +4779,6 @@ Unsaved request buffers choose a collection on first save."
       (courier-request-mode)
       (setq-local courier--collection-root-hint origin-root)
       (goto-char (point-min))
-      (forward-line 1)
       (end-of-line))
     (switch-to-buffer buffer)
     (message "Courier draft created. Save it into a collection with C-x C-s.")))
@@ -4169,7 +4810,7 @@ Unsaved request buffers choose a collection on first save."
 ;;;###autoload
 (defun courier-rename-request (name)
   "Rename the current Courier request to NAME.
-This renames the request file and updates its `# @name' directive."
+This renames the request file and updates its front matter name."
   (interactive
    (let ((path (or (courier--context-request-path)
                    (user-error "No Courier request in current context"))))
@@ -4189,13 +4830,14 @@ This renames the request file and updates its `# @name' directive."
                  (file-exists-p new-path))
         (user-error "File already exists: %s" new-path))
       (with-current-buffer buffer
-        (courier-request-mode)
+        (unless (derived-mode-p 'courier-request-mode)
+          (courier-request-mode))
         (courier--write-request-name buffer name)
         (unless (equal old-path new-path)
           (rename-file old-path new-path)
           (set-visited-file-name new-path t))
         (setq-local courier--request-path new-path)
-        (save-buffer))
+        (courier-request-save-buffer))
       (unless (equal old-path new-path)
         (courier--migrate-request-artifacts old-path new-path name))
       (when (and created-buffer-p (buffer-live-p buffer))
@@ -4229,10 +4871,11 @@ This renames the request file and updates its `# @name' directive."
     (unless (equal old-path new-path)
       (rename-file old-path new-path)
       (with-current-buffer buffer
-        (courier-request-mode)
+        (unless (derived-mode-p 'courier-request-mode)
+          (courier-request-mode))
         (set-visited-file-name new-path t)
         (setq-local courier--request-path new-path)
-        (save-buffer))
+        (courier-request-save-buffer))
       (courier--migrate-request-artifacts old-path new-path)
       (when (and created-buffer-p (buffer-live-p buffer))
         (kill-buffer buffer))
@@ -4252,11 +4895,13 @@ This renames the request file and updates its `# @name' directive."
 (transient-define-prefix courier-request-menu ()
   "Show request actions for the current Courier buffer."
   [["Run"
-    ("c" "Send" courier-request-send)
-    ("p" "Preview" courier-request-preview)
-    ("l" "Validate" courier-request-validate)]
+   ("c" "Send" courier-request-send)
+   ("p" "Preview" courier-request-preview)
+   ("l" "Validate" courier-request-validate)]
    ["Edit"
     ("m" "Method" courier-request-set-method)
+    ("B" "Body type" courier-request-set-body-type)
+    ("A" "Auth type" courier-request-set-auth-type)
     ("j" "Jump section" courier-request-jump-section)
     ("e" "Environment" courier-request-switch-env)
     ("s" "Save" courier-request-save-buffer)]

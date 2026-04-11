@@ -39,12 +39,24 @@ Clone this repository and add it to your =load-path=:
 Create a file =example.http=:
 
 #+begin_src http
-# @name Get User
-# @auth bearer {{token}}
-# @var user_id 42
-# @param expand profile
-# @test status == 200
-GET https://httpbin.org/get/{{user_id}}
++++
+name = "Get User"
+
+[body]
+type = "json"
+
+[auth]
+type = "bearer"
+token = "{{token}}"
+
+[vars]
+user_id = "42"
+token = "abc123"
+
+tests = ["status == 200"]
++++
+
+GET https://httpbin.org/get/{{user_id}}?expand=profile
 Accept: application/json
 #+end_src
 
@@ -68,75 +80,157 @@ Minimal =courier.json= example:
 
 * File Format
 
-A =.http= file contains one HTTP request:
+A =.http= file contains one request using:
 
-#+begin_example
-DIRECTIVES
-METHOD URL
-HEADERS
+- optional TOML front matter between =+++= markers
+- one raw HTTP request block after the front matter
 
-BODY
-#+end_example
+Example:
 
-** Directives
+#+begin_src http
++++
+name = "Create User"
+timeout = 10
+follow_redirects = true
 
-Directives are comment lines before the request line:
+[body]
+type = "json"
 
-| Directive               | Example                       | Description           |
-|-------------------------+-------------------------------+-----------------------|
-| =# @name=               | =# @name Get User=            | Human-readable name   |
-| =# @timeout=            | =# @timeout 10=               | Timeout in seconds    |
-| =# @follow-redirects=   | =# @follow-redirects true=    | Follow redirects      |
-| =# @auth=               | =# @auth bearer {{token}}=    | Add auth header       |
-| =# @param=              | =# @param page 1=             | Add query parameter   |
-| =# @var=                | =# @var key value=            | Define a variable     |
-| =# @test=               | =# @test status == 200=       | Test assertion        |
+[auth]
+type = "bearer"
+token = "{{token}}"
+
+[vars]
+token = "abc123"
+user_id = "42"
+
+tests = ["status == 201"]
+
+[scripts]
+pre_request = """
+(setq courier-script-request
+      (plist-put courier-script-request :url "https://example.com/users/42"))
+"""
++++
+
+POST https://example.com/users?page=1
+Accept: application/json
+Content-Type: application/json
+
+{
+  "name": "Lucy"
+}
+#+end_src
+
+Metadata belongs in TOML front matter:
+
+| Key / Table           | Example                                | Description             |
+|-----------------------+----------------------------------------+-------------------------|
+| =name=                | =name = "Get User"=                    | Human-readable name     |
+| =timeout=             | =timeout = 10=                         | Timeout in seconds      |
+| =follow_redirects=    | =follow_redirects = true=              | Follow redirects        |
+| =[body]=              | =type = "json"=                        | Body serialization type |
+| =[auth]=              | =type = "bearer"=                      | Auth metadata           |
+| =[vars]=              | =token = "abc123"=                     | Request-scoped vars     |
+| =tests=               | =tests = ["status == 200"]=            | Test assertions         |
+| =[scripts]=           | =pre_request = """..."""=              | Pre/post scripts        |
+
+Method, URL, headers, and body stay in the raw HTTP block.
 
 ** Variables
 
 Use ={{name}}= anywhere in the URL, headers, or body. Variables are defined
-with =# @var= directives. Recursive expansion is supported up to 10 levels.
-Use =# @param= for query parameters; path parameters should stay in the URL
-itself and use ={{var}}= placeholders when needed.
+with the front matter =[vars]= table. Recursive expansion is supported up to 10
+levels. Query parameters stay attached to the URL itself and use ={{var}}=
+placeholders when needed.
 If you prefer editing URL query params as key/value lines, use
 =M-x courier-request-edit-params= or the request action menu. Courier opens a
-small editor buffer and writes the result back into the request URL.
+small editor buffer and normalizes the result back into the request URL when
+you apply it.
+
+** Body Types
+
+=[body].type= controls how Courier interprets and sends the request body.
+
+Supported types:
+
+- =json=
+- =xml=
+- =text=
+- =form-urlencoded=
+- =none=
+
+Example:
+
+#+begin_src http
++++
+[body]
+type = "form-urlencoded"
++++
+
+POST https://example.com/session
+Accept: application/json
+
+username={{user}}&password={{password}}
+#+end_src
+
+Send-time behavior:
+
+- =json= adds =Content-Type: application/json= when no explicit content type is present
+- =xml= adds =Content-Type: application/xml= when missing
+- =text= adds =Content-Type: text/plain; charset=utf-8= when missing
+- =form-urlencoded= URL-encodes the body and adds
+  =Content-Type: application/x-www-form-urlencoded= when missing
+- =none= requires an empty body and sends no request body
+
+Use =M-x courier-request-set-body-type= or =C-c ?= in a request buffer to set
+the body type. In the request section view, the active body type is shown in
+the header line as =Body(JSON)=, =Body(XML)=, and so on.
 
 ** Auth
 
-=# @auth= currently supports three forms:
+=[auth]= currently supports three forms:
 
-- =# @auth bearer {{token}}=
-- =# @auth basic {{user}} {{password}}=
-- =# @auth header X-API-Key {{token}}=
+- bearer
+- basic
+- header
 
 Courier resolves auth values through the same variable expansion path as the
 rest of the request. If an explicit header with the same name already exists in
 the request, that explicit header wins.
 
+Use =M-x courier-request-set-auth-type= or =C-c ?= in a request buffer to set
+the auth type. Courier supports =none=, =bearer=, =basic=, and =header= in the
+editor. In the request section view, the active auth type is shown in the
+header line as =Auth(None)=, =Auth(Bearer)=, =Auth(Basic)=, or
+=Auth(Header)=.
+
 ** Scripts
 
-Courier supports optional Elisp script blocks before the request line:
+Courier supports optional Elisp script blocks in front matter:
 
-#+begin_example
-# @begin pre-request
-# (setq courier-script-request
-#       (plist-put courier-script-request :url "https://example.com/from-script"))
-# courier-script-request
-# @end
-#
-# @begin post-response
-# (setq courier-script-response
-#       (plist-put courier-script-response :reason "Changed"))
-# courier-script-response
-# @end
+#+begin_src http
++++
+[scripts]
+pre_request = """
+(setq courier-script-request
+      (plist-put courier-script-request :url "https://example.com/from-script"))
+courier-script-request
+"""
+post_response = """
+(setq courier-script-response
+      (plist-put courier-script-response :reason "Changed"))
+courier-script-response
+"""
++++
+
 GET https://example.com
-#+end_example
+#+end_src
 
 - =pre-request= runs after parsing and env loading but before validation and
   variable resolution.
 - =post-response= runs after the response is parsed but before Courier runs
-  =# @test= assertions.
+  =tests= assertions.
 
 Scripts run as Elisp. The main bound variables are:
 
@@ -156,7 +250,7 @@ named =default=.
 If =defaultEnv= is set in =courier.json= and that environment exists, Courier
 activates it automatically for the current request buffer. Otherwise, Courier
 prompts with =completing-read= when multiple environments are available. The
-choice remains buffer-local. Variables from =# @var= directives override values
+choice remains buffer-local. Values from front matter =[vars]= override values
 from environment files.
 
 Example =env/local.env=:
@@ -199,7 +293,8 @@ token=abc123
 | =C-x C-s= | =courier-request-save-buffer=  | Save draft or file     |
 
 Use =M-x courier-new-request= or =C-c C-n= to open an unsaved draft buffer. The
-draft starts with =# @name Untitled N= and a request line using
+draft stores =name = "Untitled N"= in front matter and uses the same value in
+its buffer name, but the request editor itself starts at the request line using
 =courier-default-request-method=, which defaults to =GET=. On the first
 =C-x C-s=, Courier asks which collection should own the request, starting from
 =courier-default-collection-directory=, which defaults to a =courier/=
@@ -208,26 +303,32 @@ not already a Courier collection, Courier offers to create one there before
 saving the request into that collection's =requests/= directory.
 The request-line method token is highlighted with a lightweight overlay so
 =GET=/=POST=/etc. remain visually obvious while editing.
-The request buffer also shows a navigation header line:
+The request buffer uses a section view model with a navigation header line:
 
 #+begin_example
-URL  Headers  Body  >>
+Params  Body  Headers  >>
 #+end_example
 
-That line is informational, not a second editor. Use =C-c [= and =C-c ]= to
-move between the main sections, or =C-c C-j= to jump to any section, including
-=Params=, =Auth=, =Vars=, =Tests=, =Pre-request=, and =Post-response=. Query
-params stay URL-backed: choosing =Params= opens the dedicated key/value editor
-and writes changes back into the request URL.
+Use =C-c [= and =C-c ]= to switch the main request sections rendered below the
+divider, or =C-c C-j= to jump to any section, including =Auth=, =Vars=,
+=Tests=, =Pre-request=, and =Post-response=. The request line stays fixed as
+the request identity block; the area below it is the active section view, not a
+jump target into raw source text, and the current section is indicated in the
+=header-line= rather than repeated as a second in-buffer title.
+
+=Params= can still be edited directly as part of the URL, but the request-side
+params views normalize those values into Courier params when you edit them.
+Saving then writes them back into the request URL instead of keeping two
+separate truths.
 
 Use =M-x courier-create-collection= to create a collection explicitly. Use
 =C-c C-o= inside a collection to open another =.http= file or switch the
 current buffer to a different environment from the same minibuffer picker.
 Use =C-c ?= in a request buffer for request actions, including the export
 submenu for copying =curl=, =httpie=, or =wget= commands with or without
-variable interpolation. Request content itself stays plain text: Courier does
-not use transient submenus as the primary way to add params, auth, or script
-blocks.
+variable interpolation. Request content itself stays source-backed: Courier
+uses transient for actions, not as the primary editor for params, auth, or
+script content.
 
 Use =C-c C-b= to open the current collection overview. The overview buffer
 lists requests, shows recent status and environment context, and supports:
@@ -291,14 +392,14 @@ The response buffer has four top-level views:
   - *Request* shows the request URL, headers, and body snapshot that produced
     the selected history entry.
   - *Response* shows the selected historical response headers and body.
-  - *Network Logs* shows curl-level diagnostics such as argv, stderr, and exit
-    code.
+- *Network Logs* shows curl-level diagnostics such as argv, stderr, and exit
+  code.
   Those section headings are buttons: use =RET= or mouse-1 on them to toggle
   sections open and closed. Use =M-x courier-response-clear-timeline= or the
   response transient menu to clear the current response buffer's timeline
   history, or press =RET= on the same history entry again to collapse the
   expanded view.
-- *Tests* shows pass/fail indicators for all =# @test= directives.
+- *Tests* shows pass/fail indicators for all request =tests=.
 
 The header line shows the current response view first, then status, duration,
 and size; when visiting an older timeline entry it also shows the history

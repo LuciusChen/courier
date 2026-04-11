@@ -45,8 +45,8 @@ live inside a Git repository, but the Courier concept itself is `collection`.
 - No promotion of directories into complex first-class objects.
 - No Org-mode data model.
 - No Bruno-style mouse-centric UI.
-- No scripting engine, OAuth manager, or advanced workflow runtime in the next
-  milestone set.
+- No OAuth manager or advanced workflow runtime beyond request-local Elisp
+  hooks in the next milestone set.
 
 ## Architecture Principles
 
@@ -101,7 +101,7 @@ data store for requests.
 
 A request is a `.http` file with:
 
-- directives
+- optional TOML front matter
 - request line
 - headers
 - body
@@ -109,11 +109,27 @@ A request is a `.http` file with:
 Courier should continue to treat the request text itself as authoritative.
 Request method, URL, headers, and body should always round-trip through the
 file. Commands may edit the file, but no hidden request state should exist.
-Query params may be expressed with request directives and resolved into the
-final URL, but path params still belong in the URL text itself.
-Auth metadata may also be expressed with directives and resolved into headers.
+Query params remain part of the URL text itself; structured params views may
+edit them, but saving must write them back into the URL rather than storing a
+second truth.
+Body type, auth metadata, request vars, tests, and scripts belong in front
+matter.
 Request-side scripting is allowed, but only through explicit text blocks in the
 request file; Courier should not invent hidden UI-only state for scripts.
+
+### Request Format
+
+The request-file format is defined in [HTTP-FORMAT-V1.md](./HTTP-FORMAT-V1.md):
+
+- keep `.http` as the extension
+- move Courier metadata into TOML front matter
+- keep one raw HTTP request block for method, URL, headers, and body
+- make `body.type` an explicit metadata field with real send-time semantics
+- keep query params attached to the URL instead of creating a second stored
+  params representation
+
+This direction is meant to make request-side views source-backed and
+round-trippable without hidden state.
 
 ## Environment Model
 
@@ -132,7 +148,7 @@ Rules:
 - env files live under `env/`
 - env names come from filenames like `local.env`, `staging.env`, `prod.env`
 - collection-level `defaultEnv` may be used when no explicit env is selected
-- request-level `# @var` values override env values
+- request-level front matter `[vars]` values override env values
 - env selection is buffer-local unless a broader command explicitly changes it
 
 `env` is not collection metadata, not response history, and not a secret
@@ -213,17 +229,32 @@ manager. It is a source of variable values for request resolution.
 - user creates a new request draft without choosing a path first
 - Courier gives it an `Untitled N` name and opens it as an unsaved buffer
 - the draft request line uses a configurable default method, with `GET` as the default
+- the draft name remains metadata and buffer identity; the editor body starts
+  at the request line instead of showing the name as editable first-line content
 - on first save, Courier asks which collection should own the request, defaulting
   to a `courier/` directory under the current user's home directory unless the
   user customizes the default collection directory
 - if the target directory is not a collection, Courier offers to create one
 - the request is then saved into that collection's `requestsDir`
-- request editing stays text-first; the buffer shows `URL  Headers  Body  >>`
-  as a navigation layer, while `C-c C-j` jumps to any request section
+- request editing stays text-first; the buffer shows
+  `Params  Body  Headers  >>` as the current request view indicator, while
+  `C-c C-j` switches to any request section
 - transient remains for actions such as send, preview, save, env switching, and
   export, not for primary content editing
 - query params may be edited either directly in the URL or through a dedicated
-  key/value editor that writes back into the URL query string
+  key/value editor; once edited structurally, Courier normalizes them into
+  request params instead of keeping a duplicated URL-query truth
+- request body handling is type-aware rather than implicit:
+  - `json`, `xml`, `text`, `form-urlencoded`, and `none` are first-class
+  - the body type is stored in front matter and applied during request
+    resolution and export
+  - missing body-type-specific `Content-Type` headers are filled in only when
+    the request did not already declare one
+- request auth handling is also type-aware:
+  - `none`, `bearer`, `basic`, and `header` are first-class
+  - the auth type remains stored in front matter
+  - the request editor exposes auth type as an explicit setting instead of
+    making users infer it from free-form text
 
 ### 6. Work from overview
 

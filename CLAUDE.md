@@ -17,6 +17,34 @@
 - **Keep experiments narrow**: Start new directions with the smallest slice that proves the workflow is worth having. Do not expand scope before the first slice shows real user value.
 - **Flag compensating code as design debt**: When touching a subsystem, note silent fallbacks, compatibility aliases, and swallowed internal errors as debt instead of layering more compensation on top.
 
+## Postmortems
+
+The `postmortem/` directory contains design decision records. Read them before
+making significant changes to request storage, save flow, UI model, or
+collection behavior.
+
+Each postmortem should record:
+
+- background
+- decision
+- rationale
+- alternatives considered
+- known limitations
+
+Write a postmortem when:
+
+- changing the `.http` file format or parsing model
+- changing a primary request or response workflow
+- switching between non-obvious UI models
+- abandoning an approach after real implementation work
+- deliberately deferring a limitation that will shape later design
+
+Write why, not what. The code already shows what changed.
+
+Long technical specifications do not belong in `CLAUDE.md`. Put detailed
+formats, protocols, or migration rules in a separate document and link to them
+from the relevant postmortem.
+
 ## Error Handling and Testing
 
 - **Errors must surface, not hide**: Do not add fallback/default returns that silently swallow failures. Let errors propagate immediately.
