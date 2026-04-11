@@ -18,9 +18,15 @@
 
 ;;; Code:
 
+(require 'cl-lib)
+(require 'button)
 (require 'json)
 (require 'seq)
 (require 'subr-x)
+
+(defconst courier--allowed-methods
+  '("GET" "POST" "PUT" "PATCH" "DELETE" "HEAD" "OPTIONS")
+  "Allowed HTTP methods in request files.")
 
 ;;;; Customization
 
@@ -46,6 +52,17 @@ Set to nil to disable the default timeout."
                  integer)
   :group 'courier)
 
+(defcustom courier-default-request-method "GET"
+  "Default HTTP method used when creating a new Courier request draft."
+  :type '(choice (const "GET")
+                 (const "POST")
+                 (const "PUT")
+                 (const "PATCH")
+                 (const "DELETE")
+                 (const "HEAD")
+                 (const "OPTIONS"))
+  :group 'courier)
+
 (defcustom courier-history-max 20
   "Maximum number of response history entries per request."
   :type 'integer
@@ -59,6 +76,9 @@ Set to nil to disable the default timeout."
 (defconst courier--collection-marker-file "courier.json"
   "Filename that marks the root of a Courier collection.")
 
+(defvar courier--untitled-request-counter 0
+  "Running counter used for untitled Courier request drafts.")
+
 (defvar courier--request-metadata (make-hash-table :test 'equal)
   "Hash table of request metadata keyed by absolute request path.")
 
@@ -66,11 +86,106 @@ Set to nil to disable the default timeout."
   '(auto json html xml javascript raw hex base64 image)
   "Supported Courier response body views.")
 
-;;;; Parsing
+(defconst courier--response-tabs
+  '(response headers timeline tests)
+  "Supported Courier response tabs.")
 
-(defconst courier--allowed-methods
-  '("GET" "POST" "PUT" "PATCH" "DELETE" "HEAD" "OPTIONS")
-  "Allowed HTTP methods in request files.")
+(defconst courier--timeline-tabs
+  '(request response network-logs)
+  "Supported Courier timeline detail sections.")
+
+(defconst courier--header-separator
+  (propertize "  •  " 'face 'shadow)
+  "Separator used in Courier header lines.")
+
+(defconst courier--status-reason-phrases
+  '((100 . "Continue")
+    (101 . "Switching Protocols")
+    (102 . "Processing")
+    (200 . "OK")
+    (201 . "Created")
+    (202 . "Accepted")
+    (203 . "Non-Authoritative Information")
+    (204 . "No Content")
+    (205 . "Reset Content")
+    (206 . "Partial Content")
+    (300 . "Multiple Choices")
+    (301 . "Moved Permanently")
+    (302 . "Found")
+    (303 . "See Other")
+    (304 . "Not Modified")
+    (307 . "Temporary Redirect")
+    (308 . "Permanent Redirect")
+    (400 . "Bad Request")
+    (401 . "Unauthorized")
+    (403 . "Forbidden")
+    (404 . "Not Found")
+    (405 . "Method Not Allowed")
+    (406 . "Not Acceptable")
+    (408 . "Request Timeout")
+    (409 . "Conflict")
+    (410 . "Gone")
+    (413 . "Payload Too Large")
+    (415 . "Unsupported Media Type")
+    (418 . "I'm a teapot")
+    (422 . "Unprocessable Content")
+    (429 . "Too Many Requests")
+    (500 . "Internal Server Error")
+    (501 . "Not Implemented")
+    (502 . "Bad Gateway")
+    (503 . "Service Unavailable")
+    (504 . "Gateway Timeout"))
+  "Fallback HTTP reason phrases keyed by status code.")
+
+(defface courier-response-tab-active-face
+  '((t :inherit header-line :weight bold :underline t))
+  "Face used for the active Courier response tab.")
+
+(defface courier-response-tab-inactive-face
+  '((t :inherit shadow))
+  "Face used for inactive Courier response tabs.")
+
+(defface courier-response-tab-count-face
+  '((t :inherit shadow :height 0.95))
+  "Face used for response tab counts in Courier.")
+
+(defface courier-response-timeline-tab-active-face
+  '((t :inherit font-lock-keyword-face :weight bold :underline t))
+  "Face used for the active Courier timeline detail tab.")
+
+(defface courier-response-timeline-tab-inactive-face
+  '((t :inherit shadow))
+  "Face used for inactive Courier timeline detail tabs.")
+
+(defface courier-response-timeline-heading-face
+  '((t :inherit warning :weight bold))
+  "Face used for Courier timeline section headings.")
+
+(defface courier-response-status-success-face
+  '((t :inherit success :weight bold))
+  "Face used for successful Courier response statuses.")
+
+(defface courier-response-status-warning-face
+  '((t :inherit warning :weight bold))
+  "Face used for warning Courier response statuses.")
+
+(defface courier-response-status-error-face
+  '((t :inherit error :weight bold))
+  "Face used for error Courier response statuses.")
+
+(defface courier-response-method-face
+  '((t :inherit font-lock-keyword-face :weight bold))
+  "Face used for Courier response request methods.")
+
+(defface courier-response-url-face
+  '((t :inherit link))
+  "Face used for Courier response URLs.")
+
+(defface courier-response-timeline-selected-face
+  '((t :inherit highlight))
+  "Face used for the selected Courier timeline history entry.")
+
+;;;; Parsing
 
 (defconst courier--directive-regexp
   "^\\(#\\)\\s-*\\(@[[:alnum:]-]+\\)\\(?:\\s-+\\(.*\\)\\)?$"
@@ -323,36 +438,6 @@ Signal `user-error' when KEY is present but not a string."
       vars)))
 
 ;;;###autoload
-(defun courier-scan-env-files (dir &optional stop-dir)
-  "Walk upward from DIR and return `(NAME . PATH)' env entries.
-When STOP-DIR is non-nil, do not scan above that directory."
-  (let ((directories nil)
-        (current (file-name-as-directory (expand-file-name dir)))
-        (limit (and stop-dir
-                    (file-name-as-directory (expand-file-name stop-dir))))
-        results)
-    (while current
-      (push current directories)
-      (if (and limit
-               (file-equal-p current limit))
-          (setq current nil)
-        (let* ((parent (file-name-directory (directory-file-name current))))
-          (setq current (unless (or (null parent)
-                                    (string= parent current))
-                          parent)))))
-    (dolist (directory directories)
-      (dolist (file (directory-files directory nil nil t))
-        (when (courier--env-file-name-p file)
-          (setq results
-                (append results
-                        (list (cons (courier--env-name-for-file file)
-                                    (expand-file-name file directory))))))))
-    (sort results
-          (lambda (left right)
-            (string< (format "%s:%s" (car left) (cdr left))
-                     (format "%s:%s" (car right) (cdr right)))))))
-
-;;;###autoload
 (defun courier-merge-vars (env-vars request-vars)
   "Merge ENV-VARS with REQUEST-VARS, with REQUEST-VARS taking precedence."
   (let ((merged (copy-tree env-vars)))
@@ -479,9 +564,16 @@ When STOP-DIR is non-nil, do not scan above that directory."
 (defun courier--human-readable-size (size)
   "Return a human-readable string for SIZE bytes."
   (cond
-   ((>= size 1048576) (format "%.1f MB" (/ size 1048576.0)))
-   ((>= size 1024) (format "%.1f KB" (/ size 1024.0)))
-   (t (format "%d B" size))))
+   ((>= size 1048576) (format "%.1fMB" (/ size 1048576.0)))
+   ((>= size 1024) (format "%.1fKB" (/ size 1024.0)))
+   (t (format "%dB" size))))
+
+(defun courier--human-readable-duration (duration-ms)
+  "Return a human-readable string for DURATION-MS."
+  (let ((duration-ms (or duration-ms 0)))
+    (if (>= duration-ms 1000)
+        (format "%.2fs" (/ duration-ms 1000.0))
+      (format "%dms" duration-ms))))
 
 (defun courier--text-content-type-p (content-type)
   "Return non-nil when CONTENT-TYPE should be decoded as text."
@@ -496,23 +588,22 @@ When STOP-DIR is non-nil, do not scan above that directory."
            (string-suffix-p "+xml" content-type))))
 
 (defun courier--decode-body-file (body-file charset)
-  "Decode BODY-FILE using CHARSET with Courier fallbacks."
+  "Decode BODY-FILE using CHARSET.
+
+Signal `user-error' when CHARSET is unsupported. Let decoding failures
+surface to the request boundary."
   (with-temp-buffer
     (set-buffer-multibyte nil)
     (insert-file-contents-literally body-file)
     (let* ((bytes (buffer-string))
-           (coding-systems
-            (delq nil
-                  (list (and charset
-                             (ignore-errors (coding-system-from-name charset)))
-                        'utf-8
-                        'undecided))))
-      (catch 'decoded
-        (dolist (coding-system coding-systems)
-          (condition-case nil
-              (throw 'decoded (decode-coding-string bytes coding-system))
-            (error nil)))
-        nil))))
+           (coding-system
+            (if charset
+                (let ((symbol (intern-soft charset)))
+                  (if (and symbol (coding-system-p symbol))
+                      symbol
+                    (user-error "Unsupported response charset: %s" charset)))
+              'utf-8)))
+      (decode-coding-string bytes coding-system))))
 
 (defun courier--parse-content-type (value)
   "Parse CONTENT-TYPE header VALUE."
@@ -524,6 +615,12 @@ When STOP-DIR is non-nil, do not scan above that directory."
         (when (string-match "\\`\\s-*charset=\\([^;]+\\)\\s-*\\'" part)
           (setq charset (downcase (string-trim (match-string 1 part))))))
       (list content-type charset))))
+
+(defun courier--response-content-length (headers)
+  "Return numeric content-length from HEADERS, or nil."
+  (when-let* ((value (cdr (assoc-string "content-length" headers nil)))
+              ((string-match-p "\\`[0-9]+\\'" value)))
+    (string-to-number value)))
 
 (defun courier--parse-meta-file (meta-file)
   "Parse META-FILE and return a plist."
@@ -620,10 +717,16 @@ Use HEADER-FILE, BODY-FILE, and META-FILE for curl output."
          (parsed-type (courier--parse-content-type content-type-header))
          (content-type (car parsed-type))
          (charset (cadr parsed-type))
-         (size (or (plist-get meta :size)
-                   (if (file-exists-p body-file)
-                       (file-attribute-size (file-attributes body-file))
-                     0)))
+         (meta-size (plist-get meta :size))
+         (header-size (courier--response-content-length headers))
+         (body-size (if (file-exists-p body-file)
+                        (file-attribute-size (file-attributes body-file))
+                      0))
+         (size (cond
+                ((and (numberp meta-size) (> meta-size 0)) meta-size)
+                ((and (numberp header-size) (> header-size 0)) header-size)
+                ((and (numberp body-size) (> body-size 0)) body-size)
+                (t 0)))
          body-text)
     (when (and status-line
                (string-match "\\`HTTP/[0-9.]+\\s-+\\([0-9]+\\)\\(?:\\s-+\\(.*\\)\\)?\\'" status-line))
@@ -649,6 +752,22 @@ Use HEADER-FILE, BODY-FILE, and META-FILE for curl output."
       (plist-put response :tests
                  (courier-run-tests response (plist-get request :tests)))
       response)))
+
+(defun courier--apply-response-fallbacks (response &optional start-time)
+  "Apply fallback metrics to RESPONSE using START-TIME when needed."
+  (unless (> (or (plist-get response :size) 0) 0)
+    (plist-put response :size
+               (or (courier--response-content-length (plist-get response :headers))
+                   (when-let* ((body-file (plist-get response :body-file))
+                               ((file-exists-p body-file)))
+                     (file-attribute-size (file-attributes body-file)))
+                   0)))
+  (unless (> (or (plist-get response :duration-ms) 0) 0)
+    (when start-time
+      (let ((elapsed-ms (max 0 (round (* 1000 (- (float-time) start-time))))))
+        (when (> elapsed-ms 0)
+          (plist-put response :duration-ms elapsed-ms)))))
+  response)
 
 (defun courier--request-error-response (request body-file exit-code command err)
   "Return a response plist for REQUEST when ERR occurs."
@@ -685,7 +804,7 @@ Use HEADER-FILE, BODY-FILE, and META-FILE for curl output."
             (with-temp-file meta-file
               (when (buffer-live-p stdout-buffer)
                 (insert (with-current-buffer stdout-buffer (buffer-string)))))
-            (setq response
+           (setq response
                   (condition-case err
                       (courier-parse-response
                        header-file
@@ -699,6 +818,9 @@ Use HEADER-FILE, BODY-FILE, and META-FILE for curl output."
                     (error
                      (courier--request-error-response
                       request body-file exit-code command err))))
+            (courier--apply-response-fallbacks
+             response
+             (process-get process 'courier-start-time))
             (plist-put response :command command)
             (when callback
               (funcall callback response)))
@@ -733,6 +855,7 @@ Use HEADER-FILE, BODY-FILE, and META-FILE for curl output."
     (process-put process 'courier-temp-files (list header-file body-file meta-file))
     (process-put process 'courier-stdout-buffer stdout-buffer)
     (process-put process 'courier-stderr-buffer stderr-buffer)
+    (process-put process 'courier-start-time (float-time))
     process))
 
 ;;;###autoload
@@ -765,7 +888,9 @@ Use HEADER-FILE, BODY-FILE, and META-FILE for curl output."
     (when (buffer-live-p buffer)
       (with-current-buffer buffer
         (when (derived-mode-p 'courier-overview-mode)
-          (courier-overview-refresh))))))
+          (when (and courier--overview-root
+                     courier--overview-collection-root)
+            (courier-overview-refresh)))))))
 
 (defun courier--request-metadata (path)
   "Return metadata plist stored for PATH, or nil."
@@ -788,9 +913,11 @@ Use HEADER-FILE, BODY-FILE, and META-FILE for curl output."
   (if-let* ((config (courier--collection-config start))
             (name (plist-get config :name)))
       name
-    (file-name-nondirectory
-     (directory-file-name (or (courier--collection-root start)
-                              (courier--request-search-root))))))
+    (if-let* ((root (or (courier--collection-root start)
+                        (courier--request-search-root))))
+        (file-name-nondirectory
+         (directory-file-name root))
+      "Courier")))
 
 (defun courier--request-display-env (path)
   "Return the most relevant environment name for request PATH."
@@ -815,7 +942,7 @@ Use HEADER-FILE, BODY-FILE, and META-FILE for curl output."
 
 (defun courier--overview-entry (path root)
   "Return an overview entry for request PATH under ROOT."
-  (let* ((request (courier--request-object-for-path path))
+  (let* ((request (courier-parse-file path))
          (method (or (plist-get request :method) ""))
          (name (or (plist-get request :name)
                    (file-name-base path)))
@@ -826,8 +953,7 @@ Use HEADER-FILE, BODY-FILE, and META-FILE for curl output."
           :relative-path relative-path
           :status (courier--request-status-string path)
           :env (courier--request-display-env path)
-          :updated-at (courier--request-updated-at-string path)
-          :parse-error (plist-get request :parse-error))))
+          :updated-at (courier--request-updated-at-string path))))
 
 (defun courier--overview-matches-filter-p (entry)
   "Return non-nil when ENTRY matches `courier--overview-filter'."
@@ -889,10 +1015,7 @@ Use HEADER-FILE, BODY-FILE, and META-FILE for curl output."
                   status
                   env
                   updated-at)))
-    (insert line)
-    (when-let* ((parse-error (plist-get entry :parse-error)))
-      (insert (format "  ! %s" parse-error)))
-    (insert "\n")
+    (insert line "\n")
     (add-text-properties
      start (point)
      `(courier-request-path ,(plist-get entry :path)
@@ -1021,102 +1144,20 @@ Use HEADER-FILE, BODY-FILE, and META-FILE for curl output."
   "Whether the current Courier response buffer pretty-prints JSON bodies.")
 
 (defvar-local courier--body-view nil
-  "Explicit body view for the current Courier response buffer.
-Nil keeps compatibility with the older pretty/raw toggle behavior.")
+  "Explicit body view for the current Courier response buffer.")
+
+(defvar-local courier--response-tab 'response
+  "Current tab displayed in the current Courier response buffer.")
+
+(defvar-local courier--timeline-expanded-sections '(request)
+  "Expanded detail sections in the Courier timeline view.")
 
 (defvar-local courier--history nil
   "Response history for the current Courier response buffer.
 Each entry is a cons cell of the form `(TIMESTAMP . RESPONSE)'.")
 
 (defvar-local courier--history-index nil
-  "Index into `courier--history' currently displayed, or nil for latest.")
-
-(defun courier--section-underline (title)
-  "Return a section heading string for TITLE."
-  (format "%s\n" title))
-
-(defun courier--section-symbol (name)
-  "Return the invisibility symbol used for section NAME."
-  (intern (format "courier-section-%s" (downcase name))))
-
-(defun courier--hide-section (symbol)
-  "Hide section content associated with SYMBOL."
-  (add-to-invisibility-spec symbol))
-
-(defun courier--show-section (symbol)
-  "Show section content associated with SYMBOL."
-  (remove-from-invisibility-spec symbol))
-
-(defun courier--section-hidden-p (symbol)
-  "Return non-nil when section SYMBOL is hidden."
-  (and (listp buffer-invisibility-spec)
-       (memq symbol buffer-invisibility-spec)))
-
-(defun courier--insert-section (name collapsed body)
-  "Insert section NAME with COLLAPSED state and BODY string."
-  (let* ((symbol (courier--section-symbol name))
-         (title-start (point)))
-    (insert (courier--section-underline name))
-    (add-text-properties
-     title-start (1- (point))
-     `(courier-section ,name
-                       courier-section-symbol ,symbol
-                       mouse-face highlight
-                       face bold))
-    (let ((content-start (point)))
-      (insert body)
-      (unless (or (string-empty-p body) (string-suffix-p "\n" body))
-        (insert "\n"))
-      (insert "\n")
-      (add-text-properties content-start (point) `(invisible ,symbol)))
-    (if collapsed
-        (courier--hide-section symbol)
-      (courier--show-section symbol))))
-
-(defun courier--section-symbol-at-point ()
-  "Return the section symbol for the section at point."
-  (or (get-text-property (point) 'courier-section-symbol)
-      (save-excursion
-        (beginning-of-line)
-        (while (and (not (bobp))
-                    (not (get-text-property (point) 'courier-section-symbol)))
-          (forward-line -1))
-        (get-text-property (point) 'courier-section-symbol))))
-
-(defun courier--section-match (name)
-  "Return the property match object for section NAME."
-  (save-excursion
-    (goto-char (point-min))
-    (text-property-search-forward 'courier-section name)))
-
-(defun courier--section-content-bounds (name)
-  "Return `(START END SYMBOL HIDDENP)' for section NAME."
-  (when-let* ((match (courier--section-match name)))
-    (let* ((title-start (prop-match-beginning match))
-           (symbol (get-text-property title-start 'courier-section-symbol))
-           (hiddenp (courier--section-hidden-p symbol))
-           (content-start (save-excursion
-                            (goto-char title-start)
-                            (forward-line 1)
-                            (point)))
-           (content-end (save-excursion
-                          (goto-char content-start)
-                          (if-let* ((next-match
-                                     (text-property-search-forward 'courier-section nil nil t)))
-                              (prop-match-beginning next-match)
-                            (point-max)))))
-      (list content-start content-end symbol hiddenp))))
-
-(defun courier--previous-section-position (position)
-  "Return the previous section heading position before POSITION."
-  (let ((previous nil))
-    (save-excursion
-      (goto-char (point-min))
-      (while (< (point) position)
-        (when (get-text-property (point) 'courier-section)
-          (setq previous (point)))
-        (forward-line 1)))
-    previous))
+  "Expanded history index in the current timeline, or nil when collapsed.")
 
 (defun courier--json-content-type-p (content-type)
   "Return non-nil when CONTENT-TYPE identifies JSON."
@@ -1253,23 +1294,211 @@ Each entry is a cons cell of the form `(TIMESTAMP . RESPONSE)'.")
            ""))
       "(empty)\n")))
 
+(defun courier--response-reason (response)
+  "Return the best available reason phrase for RESPONSE."
+  (let* ((status (or (plist-get response :status-code) 0))
+         (reason (string-trim (or (plist-get response :reason) ""))))
+    (if (string-empty-p reason)
+        (or (alist-get status courier--status-reason-phrases) "")
+      reason)))
+
+(defun courier--response-status-label (response)
+  "Return a status label for RESPONSE."
+  (let* ((status (or (plist-get response :status-code) 0))
+         (reason (courier--response-reason response)))
+    (if (string-empty-p reason)
+        (number-to-string status)
+      (format "%d %s" status reason))))
+
+(defun courier--response-tab-display-name (tab)
+  "Return a display name for response TAB."
+  (pcase tab
+    ('response "Response")
+    ('headers "Headers")
+    ('timeline "Timeline")
+    ('tests "Tests")
+    (_ "Response")))
+
+(defun courier--timeline-tab-display-name (tab)
+  "Return a display name for timeline TAB."
+  (pcase tab
+    ('request "Request")
+    ('response "Response")
+    ('network-logs "Network Logs")
+    (_ "Request")))
+
+(defun courier--response-status-face (response)
+  "Return a face appropriate for RESPONSE status."
+  (let ((status (or (plist-get response :status-code) 0)))
+    (cond
+     ((and (>= status 200) (< status 300))
+      'courier-response-status-success-face)
+     ((and (>= status 300) (< status 400))
+      'courier-response-status-warning-face)
+     ((and (>= status 400) (< status 600))
+      'courier-response-status-error-face)
+     (t
+      'bold))))
+
+(defun courier--current-history-index ()
+  "Return the selected history index for the current response buffer."
+  courier--history-index)
+
+(defun courier--current-history-entry ()
+  "Return the currently selected history entry, or nil."
+  (and (numberp (courier--current-history-index))
+       (nth (courier--current-history-index) courier--history)))
+
+(defun courier--current-history-response ()
+  "Return the response displayed by the current history selection."
+  (cdr-safe (courier--current-history-entry)))
+
+(defun courier--current-history-request ()
+  "Return the request snapshot displayed by the current history selection."
+  (when-let* ((response (courier--current-history-response)))
+    (or (plist-get response :request-snapshot)
+        courier--request)))
+
+(defun courier--response-tab-count (tab response)
+  "Return a count for response TAB using RESPONSE when appropriate."
+  (pcase tab
+    ('headers
+     (length (plist-get response :headers)))
+    ('tests
+     (length (plist-get response :tests)))
+    (_
+     nil)))
+
+(defun courier--response-tab-button (tab response)
+  "Return a clickable header-line button string for TAB using RESPONSE."
+  (let* ((label (courier--response-tab-display-name tab))
+         (count (courier--response-tab-count tab response))
+         (text (if (and count (> count 0))
+                   (concat label " "
+                           (propertize (number-to-string count)
+                                       'face 'courier-response-tab-count-face))
+                 label))
+         (map (make-sparse-keymap))
+         (face (if (eq tab courier--response-tab)
+                   'courier-response-tab-active-face
+                 'courier-response-tab-inactive-face)))
+    (define-key map [header-line mouse-1]
+      (lambda ()
+        (interactive)
+        (courier-response-set-tab tab)))
+    (define-key map [header-line down-mouse-1] #'ignore)
+    (propertize text
+                'face face
+                'mouse-face 'mode-line-highlight
+                'help-echo (format "Switch to %s"
+                                   (courier--response-tab-display-name tab))
+                'follow-link t
+                'local-map map)))
+
+(defun courier--current-response-tab-button (response)
+  "Return the clickable header-line button for the current response tab."
+  (let ((tab (or courier--response-tab 'response))
+        (map (make-sparse-keymap)))
+    (define-key map [header-line mouse-1] #'courier-response-set-tab)
+    (define-key map [header-line down-mouse-1] #'ignore)
+    (propertize (substring-no-properties
+                 (courier--response-tab-button tab response))
+                'face 'courier-response-tab-active-face
+                'mouse-face 'mode-line-highlight
+                'help-echo "Switch response view"
+                'follow-link t
+                'local-map map)))
+
+(defun courier--timeline-entry-button-action (button)
+  "Toggle the timeline entry referenced by BUTTON."
+  (courier--select-history-index (button-get button 'courier-history-index)))
+
+(defun courier--timeline-section-expanded-p (tab)
+  "Return non-nil when timeline detail section TAB is expanded."
+  (memq tab courier--timeline-expanded-sections))
+
+(defun courier--timeline-section-button-action (button)
+  "Switch to the timeline detail section referenced by BUTTON."
+  (courier--toggle-timeline-section (button-get button 'courier-timeline-tab)))
+
+(defun courier--insert-timeline-section-heading (tab)
+  "Insert a clickable heading for timeline detail section TAB."
+  (let ((label (format "%s %s"
+                       (if (courier--timeline-section-expanded-p tab) "[-]" "[+]")
+                       (courier--timeline-tab-display-name tab))))
+    (insert-text-button
+     label
+     'action #'courier--timeline-section-button-action
+     'follow-link t
+     'courier-timeline-tab tab
+     'face (if (courier--timeline-section-expanded-p tab)
+               'courier-response-timeline-tab-active-face
+             'courier-response-timeline-tab-inactive-face)
+     'help-echo (format "RET or mouse-1 to show %s"
+                        (courier--timeline-tab-display-name tab)))
+    (insert "\n")))
+
 (defun courier--response-header-line (response)
   "Return a header line string for RESPONSE."
-  (format " %s %s | %d ms | %s | %s | %s "
-          (or (plist-get response :status-code) 0)
-          (or (plist-get response :reason) "")
-          (or (plist-get response :duration-ms) 0)
-          (courier--human-readable-size (or (plist-get response :size) 0))
-          (or (plist-get response :content-type) "unknown")
-          (courier--body-view-label response)))
+  (concat
+   (propertize (courier--response-status-label response)
+               'face (courier--response-status-face response))
+   courier--header-separator
+   (courier--human-readable-duration (plist-get response :duration-ms))
+   courier--header-separator
+   (courier--human-readable-size (or (plist-get response :size) 0))))
 
 (defun courier--response-header-line-with-history (response timestamp index total)
   "Return a history header line for RESPONSE at TIMESTAMP, INDEX, and TOTAL."
-  (format "%s  [%s %d/%d]"
-          (courier--response-header-line response)
-          timestamp
-          (1+ index)
-          total))
+  (concat
+   (courier--response-header-line response)
+   courier--header-separator
+   (propertize (format "[%s %d/%d]" timestamp (1+ index) total)
+               'face 'shadow)))
+
+(defun courier--header-summary-response ()
+  "Return the response that should drive the current header summary."
+  (if (and (eq courier--response-tab 'timeline)
+           (numberp courier--history-index))
+      (or (courier--current-history-response)
+          courier--response)
+    courier--response))
+
+(defun courier--clear-timeline-button ()
+  "Return a clickable header-line button that collapses the timeline."
+  (let ((map (make-sparse-keymap)))
+    (define-key map [header-line mouse-1] #'courier-response-clear-timeline)
+    (define-key map [header-line down-mouse-1] #'ignore)
+    (propertize "Clear Timeline"
+                'face 'link
+                'mouse-face 'mode-line-highlight
+                'help-echo "Collapse the expanded timeline entry"
+                'follow-link t
+                'local-map map)))
+
+(defun courier--response-header-line-format (response)
+  "Return the complete header line format for RESPONSE."
+  (let* ((summary-response (or (courier--header-summary-response)
+                               response))
+         (summary
+          (if (and (eq courier--response-tab 'timeline)
+                   (numberp courier--history-index))
+              (let* ((entry (courier--current-history-entry))
+                     (timestamp (car entry)))
+                (courier--response-header-line-with-history
+                 summary-response timestamp courier--history-index
+                 (length courier--history)))
+            (courier--response-header-line summary-response))))
+    (concat
+     " "
+     (courier--current-response-tab-button response)
+     courier--header-separator
+     summary
+     (if (and (eq courier--response-tab 'timeline)
+              (numberp courier--history-index))
+         (concat courier--header-separator
+                 (courier--clear-timeline-button))
+       ""))))
 
 (defun courier--body-viewer-buffer-name ()
   "Return the body viewer buffer name for the current response buffer."
@@ -1297,6 +1526,19 @@ Each entry is a cons cell of the form `(TIMESTAMP . RESPONSE)'.")
     (_
      #'fundamental-mode)))
 
+(defun courier--fontify-string-for-view (string view)
+  "Return STRING fontified for response body VIEW."
+  (let ((mode (courier--body-view-major-mode view)))
+    (if (or (null string)
+            (string-empty-p string)
+            (eq mode #'fundamental-mode))
+        string
+      (with-temp-buffer
+        (insert string)
+        (funcall mode)
+        (font-lock-ensure)
+        (buffer-substring (point-min) (point-max))))))
+
 (defun courier--format-summary (response)
   "Return a summary section string for RESPONSE."
   (format "Status: %s %s\nDuration: %d ms\nSize: %s\nContent-Type: %s\n"
@@ -1307,46 +1549,112 @@ Each entry is a cons cell of the form `(TIMESTAMP . RESPONSE)'.")
           (or (cdr (assoc-string "content-type" (plist-get response :headers) nil))
               "unknown")))
 
+(defun courier--response-text-width ()
+  "Return the preferred text width for the current Courier response buffer."
+  (let ((window (get-buffer-window (current-buffer) t)))
+    (max 60
+         (or (and window (window-body-width window))
+             100))))
+
+(defun courier--wrap-response-cell (text width)
+  "Wrap TEXT into a list of lines no wider than WIDTH when practical."
+  (let ((words (split-string (or text "") "[[:space:]\n]+" t))
+        (lines nil)
+        (current ""))
+    (dolist (word words)
+      (if (string-empty-p current)
+          (setq current word)
+        (if (<= (+ (string-width current) 1 (string-width word)) width)
+            (setq current (concat current " " word))
+          (push current lines)
+          (setq current word))))
+    (when (or (not (string-empty-p current))
+              (null lines))
+      (push current lines))
+    (nreverse lines)))
+
 (defun courier--format-headers (response)
   "Return formatted headers for RESPONSE."
   (if-let* ((headers (plist-get response :headers)))
-      (concat
-       (mapconcat (lambda (header)
-                    (format "%s: %s" (car header) (cdr header)))
-                  headers
-                  "\n")
-       "\n")
+      (let* ((name-width
+              (min 24
+                   (max 8
+                        (apply #'max
+                               (string-width "Name")
+                               (mapcar (lambda (header)
+                                         (string-width (car header)))
+                                       headers)))))
+             (value-width (max 24 (- (courier--response-text-width)
+                                     name-width
+                                     3)))
+             (indent (make-string (+ name-width 2) ?\s))
+             (header-name (propertize
+                           (format (format "%%-%ds" name-width) "Name")
+                           'face 'bold))
+             (header-value (propertize "Value" 'face 'bold))
+             (divider (concat (make-string name-width ?-)
+                              "  "
+                              (make-string (min 40 value-width) ?-)))
+             (rows
+              (mapcar
+               (lambda (header)
+                 (let* ((name (car header))
+                        (value-lines (courier--wrap-response-cell
+                                      (cdr header) value-width))
+                        (first-line
+                         (concat
+                          (propertize
+                           (format (format "%%-%ds" name-width) name)
+                           'face 'font-lock-variable-name-face)
+                          "  "
+                          (car value-lines)))
+                        (rest-lines
+                         (mapcar (lambda (line)
+                                   (concat indent line))
+                                 (cdr value-lines))))
+                   (mapconcat #'identity (cons first-line rest-lines) "\n")))
+               headers)))
+        (concat
+         header-name "  " header-value "\n"
+         divider "\n"
+         (mapconcat #'identity rows "\n")
+         "\n"))
     "(none)\n"))
 
 (defun courier--format-body (response)
   "Return formatted body text for RESPONSE."
-  (pcase (courier--effective-body-view response)
-    ('json
-     (if-let* ((body-text (plist-get response :body-text)))
-         (concat
-          (condition-case _err
-              (courier--pretty-json-body body-text)
-            (error body-text))
-          "\n")
-       (format "Body saved to %s\n" (plist-get response :body-file))))
-    ((or 'html 'xml 'javascript 'raw)
-     (cond
-      ((plist-get response :body-text)
-       (concat (plist-get response :body-text) "\n"))
-      ((plist-get response :body-file)
-       (format "Body saved to %s\n" (plist-get response :body-file)))
-      (t
-       "(empty)\n")))
-    ('base64
-     (courier--base64-body-string response))
-    ('hex
-     (courier--hex-body-string response))
-    ('image
-     (if-let* ((body-file (plist-get response :body-file)))
-         (format "Image body saved to %s\n" body-file)
-       "(empty)\n"))
-    (_
-     "(empty)\n")))
+  (let* ((view (courier--effective-body-view response))
+         (body
+          (pcase view
+            ('json
+             (if-let* ((body-text (plist-get response :body-text)))
+                 (concat
+                  (condition-case _err
+                      (courier--pretty-json-body body-text)
+                    (error body-text))
+                  "\n")
+               (format "Body saved to %s\n" (plist-get response :body-file))))
+            ((or 'html 'xml 'javascript 'raw)
+             (cond
+              ((plist-get response :body-text)
+               (concat (plist-get response :body-text) "\n"))
+              ((plist-get response :body-file)
+               (format "Body saved to %s\n" (plist-get response :body-file)))
+              (t
+               "(empty)\n")))
+            ('base64
+             (courier--base64-body-string response))
+            ('hex
+             (courier--hex-body-string response))
+            ('image
+             (if-let* ((body-file (plist-get response :body-file)))
+                 (format "Image body saved to %s\n" body-file)
+               "(empty)\n"))
+            (_
+             "(empty)\n"))))
+    (if (memq view '(json html xml javascript))
+        (courier--fontify-string-for-view body view)
+      body)))
 
 (defun courier--format-tests (response)
   "Return formatted test results for RESPONSE."
@@ -1382,17 +1690,177 @@ Each entry is a cons cell of the form `(TIMESTAMP . RESPONSE)'.")
                (plist-get request :method)
                (plist-get request :url))))))
 
-(defun courier--insert-response-sections (response request)
-  "Insert rendered sections for RESPONSE and REQUEST."
-  (let* ((tests (plist-get response :tests))
-         (tests-failed (seq-some (lambda (result)
-                                   (not (plist-get result :passed)))
-                                 tests)))
-    (courier--insert-section "Summary" nil (courier--format-summary response))
-    (courier--insert-section "Headers" t (courier--format-headers response))
-    (courier--insert-section "Body" nil (courier--format-body response))
-    (courier--insert-section "Tests" (not tests-failed) (courier--format-tests response))
-    (courier--insert-section "Trace" t (courier--format-trace response request))))
+(defun courier--insert-timeline-heading (title)
+  "Insert timeline section heading TITLE."
+  (insert (propertize title 'face 'courier-response-timeline-heading-face))
+  (insert "\n"))
+
+(defun courier--set-response-tab-local (tab)
+  "Set the current response TAB locally."
+  (setq courier--response-tab tab))
+
+(defun courier--set-timeline-expanded-sections-local (sections)
+  "Set expanded timeline detail SECTIONS locally."
+  (setq courier--timeline-expanded-sections sections))
+
+(defun courier--response-timeline-entry-line (index timestamp response)
+  "Return one formatted timeline entry for INDEX, TIMESTAMP, and RESPONSE."
+  (let* ((selectedp (and (numberp courier--history-index)
+                         (= index courier--history-index)))
+         (status (courier--response-status-label response))
+         (duration (courier--human-readable-duration
+                    (plist-get response :duration-ms)))
+         (size (courier--human-readable-size
+                (or (plist-get response :size) 0)))
+         (method (or (plist-get response :request-method)
+                     (plist-get courier--request :method)
+                     ""))
+         (url (or (plist-get response :request-url)
+                  (plist-get courier--request :url)
+                  ""))
+         (status-face (courier--response-status-face response))
+         (line-face (when selectedp 'courier-response-timeline-selected-face)))
+    (concat
+     (propertize status 'face (if selectedp
+                                  `(,status-face courier-response-timeline-selected-face)
+                                status-face))
+     (propertize (format "  %s" timestamp)
+                 'face (or line-face 'shadow))
+     "\n"
+     (propertize method
+                 'face (if selectedp
+                           '(courier-response-method-face courier-response-timeline-selected-face)
+                         'courier-response-method-face))
+     " "
+     (propertize url
+                 'face (if selectedp
+                           '(courier-response-url-face courier-response-timeline-selected-face)
+                         'courier-response-url-face))
+     "\n"
+     (propertize (concat duration courier--header-separator size)
+                 'face (or line-face 'shadow))
+     "\n")))
+
+(defun courier--insert-response-body (response)
+  "Insert the active response body for RESPONSE."
+  (let ((view (courier--effective-body-view response))
+        (body-file (plist-get response :body-file)))
+    (pcase view
+      ('image
+       (cond
+        ((and body-file
+              (display-images-p)
+              (ignore-errors (create-image body-file)))
+         (insert-image (create-image body-file))
+         (insert "\n\n")
+         (insert body-file "\n"))
+        (body-file
+         (insert (format "Image body saved to %s\n" body-file)))
+        (t
+         (insert "(empty)\n"))))
+      (_
+       (insert (courier--format-body response))))))
+
+(defun courier--insert-timeline-request-view (request)
+  "Insert timeline request details for REQUEST."
+  (insert (propertize (or (plist-get request :url) "(no URL)")
+                      'face 'courier-response-url-face))
+  (insert "\n\n")
+  (courier--insert-timeline-heading "Headers")
+  (if-let* ((headers (plist-get request :headers)))
+      (insert (courier--format-headers (list :headers headers)))
+    (insert "No Headers found\n"))
+  (insert "\n")
+  (courier--insert-timeline-heading "Body")
+  (let ((body (plist-get request :body)))
+    (if (and body (not (string-empty-p body)))
+        (progn
+          (insert body)
+          (unless (string-suffix-p "\n" body)
+            (insert "\n")))
+      (insert "No Body found\n"))))
+
+(defun courier--insert-timeline-response-view (response)
+  "Insert timeline response details for RESPONSE."
+  (courier--insert-timeline-heading "Headers")
+  (if (plist-get response :headers)
+      (insert (courier--format-headers response))
+    (insert "No Headers found\n"))
+  (insert "\n")
+  (courier--insert-timeline-heading "Body")
+  (let ((body (courier--format-body response)))
+    (if (string-empty-p (string-trim body))
+        (insert "No Body found\n")
+      (insert body))))
+
+(defun courier--insert-timeline-network-logs-view (response request)
+  "Insert timeline network logs for RESPONSE and REQUEST."
+  (let ((trace (string-trim-right (courier--format-trace response request))))
+    (if (string-empty-p trace)
+        (insert "No network logs found\n")
+      (insert trace "\n"))))
+
+(defun courier--insert-expanded-timeline-details (response request timestamp)
+  "Insert expanded timeline details for RESPONSE, REQUEST, and TIMESTAMP."
+  (ignore timestamp)
+  (dolist (tab courier--timeline-tabs)
+    (courier--insert-timeline-section-heading tab)
+    (when (courier--timeline-section-expanded-p tab)
+      (pcase tab
+        ('request
+         (courier--insert-timeline-request-view request))
+        ('response
+         (courier--insert-timeline-response-view response))
+        ('network-logs
+         (courier--insert-timeline-network-logs-view response request)))
+      (insert "\n"))))
+
+(defun courier--insert-response-timeline ()
+  "Insert the response timeline for the current request history."
+  (if (null courier--history)
+      (insert "No history yet.\n")
+    (cl-loop for history-entry in courier--history
+             for index from 0
+             for response = (cdr history-entry)
+             for request = (or (plist-get response :request-snapshot)
+                               courier--request)
+             for timestamp = (car history-entry)
+             do
+             (insert-text-button
+              (courier--response-timeline-entry-line
+               index timestamp response)
+              'action #'courier--timeline-entry-button-action
+              'follow-link t
+              'courier-history-index index
+              'help-echo "RET, TAB, or mouse-1 to expand or collapse this response history entry")
+             (insert "\n")
+             (when (and (numberp courier--history-index)
+                        (= index courier--history-index))
+               (courier--insert-expanded-timeline-details response request timestamp)
+               (insert "\n")))))
+
+(defun courier--insert-response-tab (response _request)
+  "Insert the currently selected response tab for RESPONSE."
+  (pcase courier--response-tab
+    ('response
+     (courier--insert-response-body response))
+    ('headers
+     (insert (courier--format-headers response)))
+    ('timeline
+     (courier--insert-response-timeline))
+    ('tests
+     (insert (courier--format-tests response)))
+    (_
+     (courier--insert-response-body response))))
+
+(defun courier--refresh-response-display ()
+  "Refresh the current Courier response buffer."
+  (let ((inhibit-read-only t))
+    (erase-buffer)
+    (setq header-line-format
+          (courier--response-header-line-format courier--response))
+    (courier--insert-response-tab courier--response courier--request)
+    (goto-char (point-min))))
 
 (defun courier--history-push (response)
   "Push RESPONSE onto the history for the current response buffer."
@@ -1407,33 +1875,7 @@ Each entry is a cons cell of the form `(TIMESTAMP . RESPONSE)'.")
   "Render the response at `courier--history-index'."
   (unless courier--history
     (user-error "No response history"))
-  (let* ((index (or courier--history-index 0))
-         (entry (nth index courier--history))
-         (timestamp (car entry))
-         (response (cdr entry))
-         (inhibit-read-only t)
-         (request courier--request)
-         (history courier--history)
-         (history-index courier--history-index)
-         (temp-files courier--temp-files)
-         (body-view courier--body-view))
-    (courier--response-mode)
-    (erase-buffer)
-    (setq courier--response response
-          courier--request request
-          courier--process nil
-          courier--body-pretty t
-          courier--body-view body-view
-          courier--temp-files temp-files
-          courier--history history
-          courier--history-index history-index)
-    (setq header-line-format
-          (if history-index
-              (courier--response-header-line-with-history
-               response timestamp index (length history))
-            (courier--response-header-line response)))
-    (courier--insert-response-sections response request)
-    (goto-char (point-min))))
+  (courier--refresh-response-display))
 
 (defun courier--response-cleanup ()
   "Clean up process and temp files for the current response buffer."
@@ -1446,13 +1888,12 @@ Each entry is a cons cell of the form `(TIMESTAMP . RESPONSE)'.")
 
 (define-derived-mode courier--response-mode special-mode "Courier-Response"
   "Major mode used for Courier response buffers."
-  (setq-local truncate-lines t)
-  (setq-local buffer-invisibility-spec nil)
+  (setq-local truncate-lines nil)
   (add-hook 'kill-buffer-hook #'courier--response-cleanup nil t))
 
 (defun courier--response-buffer-name (request)
   "Return a response buffer name for REQUEST."
-  (format "*courier: %s*"
+  (format "*courier-response: %s*"
           (or (plist-get request :name)
               (format "%s %s"
                       (plist-get request :method)
@@ -1463,14 +1904,19 @@ Each entry is a cons cell of the form `(TIMESTAMP . RESPONSE)'.")
   (let ((inhibit-read-only t)
         (history courier--history)
         (temp-files courier--temp-files)
-        (body-view courier--body-view))
+        (body-view courier--body-view)
+        (body-pretty courier--body-pretty)
+        (tab courier--response-tab)
+        (timeline-sections courier--timeline-expanded-sections))
     (courier--response-mode)
     (erase-buffer)
     (setq courier--request request
           courier--response nil
           courier--process nil
-          courier--body-pretty t
+          courier--body-pretty body-pretty
           courier--body-view body-view
+          courier--response-tab tab
+          courier--timeline-expanded-sections timeline-sections
           courier--temp-files temp-files
           courier--history history
           courier--history-index nil)
@@ -1493,73 +1939,28 @@ Each entry is a cons cell of the form `(TIMESTAMP . RESPONSE)'.")
   (let* ((inhibit-read-only t)
          (prev-history courier--history)
          (prev-temp-files courier--temp-files)
-         (body-view courier--body-view))
+         (body-view courier--body-view)
+         (body-pretty courier--body-pretty)
+         (tab courier--response-tab)
+         (timeline-sections courier--timeline-expanded-sections))
     (courier--response-mode)
     (erase-buffer)
+    (plist-put response :request-method (plist-get request :method))
+    (plist-put response :request-url (plist-get request :url))
+    (plist-put response :request-snapshot (copy-tree request t))
     (setq courier--response response
           courier--request request
           courier--process nil
-          courier--body-pretty t
+          courier--body-pretty body-pretty
           courier--body-view body-view
+          courier--response-tab (or tab 'response)
+          courier--timeline-expanded-sections (or timeline-sections '(request))
           courier--temp-files prev-temp-files
           courier--history prev-history
           courier--history-index nil)
     (courier--history-push response)
     (courier--record-request-metadata request response)
-    (setq header-line-format (courier--response-header-line response))
-    (courier--insert-response-sections response request)
-    (goto-char (point-min))))
-
-(defun courier--rerender-body-section ()
-  "Re-render the body section in the current Courier response buffer."
-  (let* ((inhibit-read-only t)
-         (bounds (courier--section-content-bounds "Body")))
-    (when bounds
-      (pcase-let ((`(,start ,end ,symbol ,hiddenp) bounds))
-        (delete-region start end)
-        (goto-char start)
-        (let ((content-start (point)))
-          (insert (courier--format-body courier--response))
-          (unless (or (eobp)
-                      (eq (char-before) ?\n))
-            (insert "\n"))
-          (insert "\n")
-          (add-text-properties content-start (point) `(invisible ,symbol)))
-        (if hiddenp
-            (courier--hide-section symbol)
-          (courier--show-section symbol))))))
-
-;;;###autoload
-(defun courier-response-toggle-section ()
-  "Toggle the visibility of the section at point."
-  (interactive)
-  (if-let* ((symbol (courier--section-symbol-at-point)))
-      (if (courier--section-hidden-p symbol)
-          (courier--show-section symbol)
-        (courier--hide-section symbol))
-    (user-error "No Courier section at point")))
-
-;;;###autoload
-(defun courier-response-next-section ()
-  "Move point to the next section heading."
-  (interactive)
-  (let ((start (point)))
-    (forward-line 1)
-    (if-let* ((match (text-property-search-forward 'courier-section nil nil t)))
-        (goto-char (prop-match-beginning match))
-      (goto-char start)
-      (user-error "No next section"))))
-
-;;;###autoload
-(defun courier-response-prev-section ()
-  "Move point to the previous section heading."
-  (interactive)
-  (let ((start (point)))
-    (beginning-of-line)
-    (if-let* ((position (courier--previous-section-position (point))))
-        (goto-char position)
-      (goto-char start)
-      (user-error "No previous section"))))
+    (courier--refresh-response-display)))
 
 ;;;###autoload
 (defun courier-response-retry ()
@@ -1591,15 +1992,8 @@ Each entry is a cons cell of the form `(TIMESTAMP . RESPONSE)'.")
   (if (eq (courier--effective-body-view courier--response) 'raw)
       (courier--set-body-view-local 'auto)
     (courier--set-body-view-local 'raw))
-  (setq header-line-format
-        (if courier--history-index
-            (let* ((entry (nth courier--history-index courier--history))
-                   (timestamp (car entry)))
-              (courier--response-header-line-with-history
-               courier--response timestamp courier--history-index
-               (length courier--history)))
-          (courier--response-header-line courier--response)))
-  (courier--rerender-body-section))
+  (courier--set-response-tab-local 'response)
+  (courier--refresh-response-display))
 
 ;;;###autoload
 (defun courier-response-set-view (view)
@@ -1616,15 +2010,216 @@ Each entry is a cons cell of the form `(TIMESTAMP . RESPONSE)'.")
   (unless courier--response
     (user-error "No Courier response is available"))
   (courier--set-body-view-local view)
-  (setq header-line-format
-        (if courier--history-index
-            (let* ((entry (nth courier--history-index courier--history))
-                   (timestamp (car entry)))
-              (courier--response-header-line-with-history
-               courier--response timestamp courier--history-index
-               (length courier--history)))
-          (courier--response-header-line courier--response)))
-  (courier--rerender-body-section))
+  (courier--set-response-tab-local 'response)
+  (courier--refresh-response-display))
+
+(defun courier--set-response-tab (tab)
+  "Switch the current response buffer to TAB."
+  (unless courier--response
+    (user-error "No Courier response is available"))
+  (when (and (eq tab 'timeline)
+             (null courier--timeline-expanded-sections))
+    (courier--set-timeline-expanded-sections-local '(request)))
+  (courier--set-response-tab-local tab)
+  (courier--refresh-response-display))
+
+(defun courier--toggle-timeline-section (tab)
+  "Toggle timeline detail section TAB in the current response buffer."
+  (unless courier--response
+    (user-error "No Courier response is available"))
+  (courier--set-response-tab-local 'timeline)
+  (courier--set-timeline-expanded-sections-local
+   (if (courier--timeline-section-expanded-p tab)
+       (delq tab (copy-sequence courier--timeline-expanded-sections))
+     (append courier--timeline-expanded-sections (list tab))))
+  (courier--refresh-response-display)
+  (courier--goto-timeline-section-button tab))
+
+;;;###autoload
+(defun courier-response-set-tab (tab)
+  "Set the current Courier response TAB."
+  (interactive
+   (list
+    (intern
+     (completing-read "Courier tab: "
+                      (mapcar #'symbol-name courier--response-tabs)
+                      nil t nil nil
+                      (symbol-name (or courier--response-tab 'response))))))
+  (courier--set-response-tab tab))
+
+;;;###autoload
+(defun courier-response-show-response ()
+  "Show the response tab in the current Courier response buffer."
+  (interactive)
+  (courier--set-response-tab 'response))
+
+;;;###autoload
+(defun courier-response-show-headers ()
+  "Show the headers tab in the current Courier response buffer."
+  (interactive)
+  (courier--set-response-tab 'headers))
+
+;;;###autoload
+(defun courier-response-show-timeline ()
+  "Show the timeline tab in the current Courier response buffer."
+  (interactive)
+  (courier--set-response-tab 'timeline))
+
+;;;###autoload
+(defun courier-response-show-tests ()
+  "Show the tests tab in the current Courier response buffer."
+  (interactive)
+  (courier--set-response-tab 'tests))
+
+;;;###autoload
+(defun courier-response-next-tab ()
+  "Move to the next Courier response tab."
+  (interactive)
+  (unless courier--response
+    (user-error "No Courier response is available"))
+  (let* ((tabs courier--response-tabs)
+         (current (or courier--response-tab 'response))
+         (position (or (cl-position current tabs) 0))
+         (next (nth (mod (1+ position) (length tabs)) tabs)))
+    (courier--set-response-tab next)))
+
+;;;###autoload
+(defun courier-response-prev-tab ()
+  "Move to the previous Courier response tab."
+  (interactive)
+  (unless courier--response
+    (user-error "No Courier response is available"))
+  (let* ((tabs courier--response-tabs)
+         (current (or courier--response-tab 'response))
+         (position (or (cl-position current tabs) 0))
+         (prev (nth (mod (1- position) (length tabs)) tabs)))
+    (courier--set-response-tab prev)))
+
+(defun courier--timeline-index-at-point ()
+  "Return the timeline history index stored at point, or nil."
+  (or (button-get (button-at (point)) 'courier-history-index)
+      (get-text-property (point) 'courier-history-index)
+      (and (> (point) (point-min))
+           (button-get (button-at (1- (point))) 'courier-history-index))
+      (and (> (point) (point-min))
+           (get-text-property (1- (point)) 'courier-history-index))
+      (save-excursion
+        (let ((start (line-beginning-position))
+              (end (min (point-max) (1+ (line-end-position))))
+              found)
+          (while (and (< start end)
+                      (not found))
+            (setq found
+                  (or (button-get (button-at start) 'courier-history-index)
+                      (get-text-property start 'courier-history-index)))
+            (setq start (1+ start)))
+          found))))
+
+(defun courier--timeline-tab-at-point ()
+  "Return the timeline detail tab stored at point, or nil."
+  (or (button-get (button-at (point)) 'courier-timeline-tab)
+      (get-text-property (point) 'courier-timeline-tab)
+      (save-excursion
+        (let ((start (line-beginning-position))
+              (end (min (point-max) (1+ (line-end-position))))
+              found)
+          (while (and (< start end)
+                      (not found))
+            (setq found
+                  (or (button-get (button-at start) 'courier-timeline-tab)
+                      (get-text-property start 'courier-timeline-tab)))
+            (setq start (1+ start)))
+          found))))
+
+(defun courier--timeline-action-at-point ()
+  "Return the timeline action at point, or nil.
+
+The return value is one of:
+- `(section . TAB)` for a timeline detail section heading
+- `(history . INDEX)` for a timeline history entry"
+  (cond
+   ((and (eq courier--response-tab 'timeline)
+         (courier--timeline-tab-at-point))
+    (cons 'section (courier--timeline-tab-at-point)))
+   ((and (eq courier--response-tab 'timeline)
+         (numberp (courier--timeline-index-at-point)))
+    (cons 'history (courier--timeline-index-at-point)))))
+
+(defun courier--goto-button-matching (predicate)
+  "Move point to the first button for which PREDICATE returns non-nil."
+  (goto-char (point-min))
+  (let ((button (next-button (point-min) t)))
+    (while (and button
+                (not (funcall predicate button)))
+      (setq button (next-button (button-end button) t)))
+    (when button
+      (goto-char (button-start button))
+      button)))
+
+(defun courier--goto-timeline-history-button (index)
+  "Move point to the timeline history button for INDEX."
+  (courier--goto-button-matching
+   (lambda (button)
+     (equal (button-get button 'courier-history-index) index))))
+
+(defun courier--goto-timeline-section-button (tab)
+  "Move point to the timeline section button for TAB."
+  (courier--goto-button-matching
+   (lambda (button)
+     (eq (button-get button 'courier-timeline-tab) tab))))
+
+(defun courier--select-history-index (index)
+  "Select history INDEX in the current response buffer."
+  (unless courier--history
+    (user-error "No response history"))
+  (if (and (numberp courier--history-index)
+           (= courier--history-index index))
+      (setq courier--history-index nil)
+    (setq courier--history-index index)
+    (setq courier--timeline-expanded-sections '(request)))
+  (courier--history-render-current)
+  (courier--goto-timeline-history-button index))
+
+;;;###autoload
+(defun courier-response-clear-timeline ()
+  "Collapse the expanded Courier timeline entry."
+  (interactive)
+  (let ((index courier--history-index))
+    (setq courier--history-index nil)
+    (courier--refresh-response-display)
+    (when (numberp index)
+      (courier--goto-timeline-history-button index))))
+
+;;;###autoload
+(defun courier-response-activate ()
+  "Activate the response UI element at point."
+  (interactive)
+  (pcase (courier--timeline-action-at-point)
+    (`(section . ,tab)
+     (courier--toggle-timeline-section tab))
+    (`(history . ,index)
+     (courier--select-history-index index))
+    (_
+     (if-let* ((button (button-at (point))))
+         (push-button button)
+       (courier-response-open-body)))))
+
+;;;###autoload
+(defun courier-response-context-tab ()
+  "Perform the most useful tab action in the current Courier response buffer."
+  (interactive)
+  (cond
+   ((courier--timeline-action-at-point)
+    (courier-response-activate))
+   ((button-at (point))
+    (push-button (button-at (point))))
+   ((derived-mode-p 'courier--response-mode)
+    (condition-case nil
+        (forward-button 1 t t)
+      (error
+       (courier-response-activate))))
+   (t
+    (courier-response-activate))))
 
 ;;;###autoload
 (defun courier-response-open-body ()
@@ -1658,45 +2253,20 @@ Each entry is a cons cell of the form `(TIMESTAMP . RESPONSE)'.")
            (setq buffer-read-only t)))))
     (display-buffer buffer)))
 
-;;;###autoload
-(defun courier-response-history-prev ()
-  "Show the previous older response from history."
-  (interactive)
-  (unless courier--history
-    (user-error "No response history"))
-  (let* ((max-index (1- (length courier--history)))
-         (next-index (if courier--history-index
-                         (1+ courier--history-index)
-                       1)))
-    (when (> next-index max-index)
-      (user-error "No older responses"))
-    (setq courier--history-index next-index)
-    (courier--history-render-current)))
-
-;;;###autoload
-(defun courier-response-history-next ()
-  "Show the next newer response from history."
-  (interactive)
-  (unless courier--history
-    (user-error "No response history"))
-  (unless (and courier--history-index
-               (> courier--history-index 0))
-    (user-error "Already at latest response"))
-  (setq courier--history-index (1- courier--history-index))
-  (when (= courier--history-index 0)
-    (setq courier--history-index nil))
-  (courier--history-render-current))
-
-(define-key courier--response-mode-map (kbd "TAB") #'courier-response-toggle-section)
-(define-key courier--response-mode-map (kbd "RET") #'courier-response-open-body)
-(define-key courier--response-mode-map (kbd "n") #'courier-response-next-section)
+(define-key courier--response-mode-map (kbd "RET") #'courier-response-activate)
+(define-key courier--response-mode-map (kbd "<return>") #'courier-response-activate)
+(define-key courier--response-mode-map (kbd "TAB") #'courier-response-context-tab)
+(define-key courier--response-mode-map (kbd "<tab>") #'courier-response-context-tab)
+(define-key courier--response-mode-map (kbd "h") #'courier-response-show-headers)
+(define-key courier--response-mode-map (kbd "l") #'courier-response-show-timeline)
 (define-key courier--response-mode-map (kbd "o") #'courier-response-open-body)
-(define-key courier--response-mode-map (kbd "p") #'courier-response-prev-section)
+(define-key courier--response-mode-map (kbd "n") #'courier-response-next-tab)
+(define-key courier--response-mode-map (kbd "p") #'courier-response-prev-tab)
+(define-key courier--response-mode-map (kbd "r") #'courier-response-show-response)
 (define-key courier--response-mode-map (kbd "g") #'courier-response-retry)
+(define-key courier--response-mode-map (kbd "t") #'courier-response-show-tests)
 (define-key courier--response-mode-map (kbd "v") #'courier-response-set-view)
 (define-key courier--response-mode-map (kbd "V") #'courier-response-toggle-pretty)
-(define-key courier--response-mode-map (kbd "[") #'courier-response-history-prev)
-(define-key courier--response-mode-map (kbd "]") #'courier-response-history-next)
 (define-key courier--response-mode-map (kbd "C-c C-k") #'courier-response-cancel)
 
 ;;;; Request mode
@@ -1706,6 +2276,28 @@ Each entry is a cons cell of the form `(TIMESTAMP . RESPONSE)'.")
 
 (defvar-local courier--active-env nil
   "Name of the active Courier environment for the current request buffer.")
+
+(defvar-local courier--collection-root-hint nil
+  "Suggested collection root for first saving the current request buffer.")
+
+(defvar-local courier--method-overlay nil
+  "Overlay highlighting the current Courier request method.")
+
+(defface courier-request-method-get-face
+  '((t :inherit success :weight bold))
+  "Face used for GET request methods in Courier.")
+
+(defface courier-request-method-post-face
+  '((t :inherit font-lock-keyword-face :weight bold))
+  "Face used for POST request methods in Courier.")
+
+(defface courier-request-method-write-face
+  '((t :inherit warning :weight bold))
+  "Face used for mutating Courier request methods.")
+
+(defface courier-request-method-default-face
+  '((t :inherit font-lock-keyword-face :weight bold :underline t))
+  "Fallback face used for Courier request method overlays.")
 
 (defconst courier-request-font-lock-keywords
   '(("^\\(#\\)\\s-*\\(@[[:alnum:]-]+\\)\\(?:\\s-+\\(.*\\)\\)?$"
@@ -1747,6 +2339,13 @@ START defaults to the current buffer directory."
                                           (courier--buffer-start-directory))))))
     (locate-dominating-file directory courier--collection-marker-file)))
 
+(defun courier--active-collection-root ()
+  "Return the active Courier collection root for the current context, or nil."
+  (or (and (derived-mode-p 'courier-overview-mode)
+           courier--overview-collection-root)
+      courier--collection-root-hint
+      (courier--collection-root)))
+
 (defun courier--collection-config-path (&optional start)
   "Return the Courier config path for START, or nil."
   (when-let* ((root (courier--collection-root start)))
@@ -1786,14 +2385,12 @@ directory even when it does not exist yet."
   (if-let* ((config (courier--collection-config start)))
       (expand-file-name (plist-get config :requests-dir)
                         (plist-get config :root))
-    (courier--request-search-root)))
+    nil))
 
 (defun courier--request-search-root ()
   "Return the root directory used to discover Courier request files."
-  (let ((start (courier--buffer-start-directory)))
-    (or (courier--collection-requests-root start)
-        (locate-dominating-file start ".git")
-        start)))
+  (when-let* ((root (courier--active-collection-root)))
+    (courier--collection-requests-root root)))
 
 (defun courier--request-files (root)
   "Return Courier request files found under ROOT."
@@ -1819,8 +2416,6 @@ directory even when it does not exist yet."
    ((and (derived-mode-p 'courier-request-mode)
          courier--request-path)
     courier--request-path)
-   (buffer-file-name
-    (expand-file-name buffer-file-name))
    (t
     nil)))
 
@@ -1838,8 +2433,7 @@ directory even when it does not exist yet."
   "Return the directory used for Courier creation commands."
   (or (when-let* ((path (courier--context-request-path)))
         (file-name-directory path))
-      (courier--management-root)
-      default-directory))
+      (courier--management-root)))
 
 (defun courier--slugify-name (name)
   "Return a filesystem-friendly slug for NAME."
@@ -1850,9 +2444,101 @@ directory even when it does not exist yet."
   "Return a Courier request filename for NAME."
   (concat (courier--slugify-name name) ".http"))
 
+(defun courier--buffer-request-name ()
+  "Return the current buffer request name, or a default untitled name."
+  (save-excursion
+    (goto-char (point-min))
+    (if (re-search-forward "^# @name\\s-+\\(.+\\)\\s-*$" nil t)
+        (string-trim (match-string-no-properties 1))
+      "Untitled")))
+
+(defun courier--next-untitled-request-name ()
+  "Return the next untitled request display name."
+  (setq courier--untitled-request-counter
+        (1+ courier--untitled-request-counter))
+  (format "Untitled %d" courier--untitled-request-counter))
+
+(defun courier--draft-buffer-name (name)
+  "Return a draft buffer name for request NAME."
+  (format "*courier-request: %s*" name))
+
+(defun courier--request-skeleton (name)
+  "Return initial draft text for request NAME."
+  (concat "# @name " name "\n"
+          courier-default-request-method " \n"
+          "Accept: application/json\n"))
+
+(defun courier--unique-request-path (directory name)
+  "Return a unique request path for NAME under DIRECTORY."
+  (let* ((slug (courier--slugify-name name))
+         (base (if (string-empty-p slug) "untitled" slug))
+         (index 1)
+         candidate)
+    (while
+        (progn
+          (setq candidate
+                (expand-file-name
+                 (format "%s%s.http"
+                         base
+                         (if (= index 1)
+                             ""
+                           (format "-%d" index)))
+                 directory))
+          (setq index (1+ index))
+          (file-exists-p candidate)))
+    candidate))
+
+(defun courier--collection-template (root)
+  "Return JSON text for a new Courier collection rooted at ROOT."
+  (let ((json-encoding-pretty-print t))
+    (concat
+     (json-serialize
+      `((name . ,(file-name-nondirectory
+                  (directory-file-name (file-name-as-directory root))))
+        (requestsDir . "requests")
+        (envDir . "env")))
+     "\n")))
+
+(defun courier--create-collection (root)
+  "Create a new Courier collection rooted at ROOT and return it."
+  (let* ((collection-root (file-name-as-directory (expand-file-name root)))
+         (existing-root (courier--collection-root collection-root))
+         (config-path (expand-file-name courier--collection-marker-file collection-root)))
+    (when (and existing-root
+               (not (file-equal-p existing-root collection-root)))
+      (user-error "Directory %s is already inside Courier collection %s"
+                  collection-root existing-root))
+    (when (file-exists-p config-path)
+      (user-error "Courier collection already exists at %s" collection-root))
+    (make-directory collection-root t)
+    (make-directory (expand-file-name "requests" collection-root) t)
+    (make-directory (expand-file-name "env" collection-root) t)
+    (with-temp-file config-path
+      (insert (courier--collection-template collection-root)))
+    collection-root))
+
+(defun courier--read-save-collection-root ()
+  "Prompt for the collection used to save the current request buffer."
+  (let* ((initial (or courier--collection-root-hint
+                      (courier--collection-root)
+                      default-directory))
+         (selected (file-name-as-directory
+                    (expand-file-name
+                     (read-directory-name "Save request to collection: "
+                                          initial nil t)))))
+    (or (courier--collection-root selected)
+        (when (y-or-n-p
+               (format "No Courier collection at %s. Create one? "
+                       (abbreviate-file-name selected)))
+          (courier--create-collection selected))
+        (user-error "No Courier collection selected"))))
+
 (defun courier--request-display-name (path)
   "Return the display name for request PATH."
-  (let ((request (courier--request-object-for-path path)))
+  (let ((request (if-let* ((buffer (courier--request-buffer-for-path path)))
+                     (with-current-buffer buffer
+                       (courier-parse-buffer))
+                   (courier-parse-file path))))
     (or (plist-get request :name)
         (file-name-base path))))
 
@@ -1891,29 +2577,9 @@ When NEW-NAME is non-nil, also update any live response buffer name metadata."
           (plist-put courier--request :name new-name))
         (rename-buffer (courier--response-buffer-name courier--request) t)))))
 
-(defun courier--request-object-for-path (path)
-  "Return Courier request data for PATH.
-When PATH is already visited in a Courier request buffer, use the live buffer
-contents. If parsing fails, return a placeholder request plist."
-  (condition-case err
-      (if-let* ((buffer (courier--request-buffer-for-path path)))
-          (with-current-buffer buffer
-            (courier-parse-buffer))
-        (courier-parse-file path))
-    (error
-     (list :path path
-           :name (file-name-base path)
-           :method "ERR"
-           :headers nil
-           :body ""
-           :vars nil
-           :tests nil
-           :settings nil
-           :parse-error (error-message-string err)))))
-
 (defun courier--request-candidate (path root)
   "Return a completion candidate for request PATH under ROOT."
-  (let* ((request (courier--request-object-for-path path))
+  (let* ((request (courier-parse-file path))
          (method (or (plist-get request :method) ""))
          (name (or (plist-get request :name)
                    (file-name-base path)))
@@ -2037,9 +2703,8 @@ Entries are read from the configured env directory only."
   (when-let* ((path (or courier--request-path
                         (and buffer-file-name (expand-file-name buffer-file-name))))
               (directory (file-name-directory path)))
-    (if (courier--collection-root directory)
-        (courier--collection-env-entries directory)
-      (courier-scan-env-files directory))))
+    (when (courier--collection-root directory)
+      (courier--collection-env-entries directory))))
 
 (defun courier--available-env-names (entries)
   "Return unique environment names from ENTRIES."
@@ -2166,7 +2831,7 @@ Entries are read from the configured env directory only."
     (display-buffer buffer)))
 
 (defun courier--goto-request-line ()
-  "Move point to the Courier request line and return non-nil on success."
+  "Move point to the first Courier request-line candidate and return non-nil."
   (goto-char (point-min))
   (while (and (not (eobp))
               (let ((line (buffer-substring-no-properties
@@ -2175,15 +2840,54 @@ Entries are read from the configured env directory only."
                 (or (string-empty-p line)
                     (string-prefix-p "#" line))))
     (forward-line 1))
-  (when (and (not (eobp))
-             (looking-at courier--request-line-regexp))
-    t))
+  (not (eobp)))
 
 (defun courier--current-method ()
   "Return the current request method from the buffer, or nil."
   (save-excursion
     (when (courier--goto-request-line)
-      (match-string-no-properties 1))))
+      (when (looking-at "^\\([A-Z]+\\)\\(?:\\s-+.*\\)?$")
+        (match-string-no-properties 1)))))
+
+(defun courier--method-overlay-face (method)
+  "Return the overlay face used for request METHOD."
+  (cond
+   ((equal method "GET") 'courier-request-method-get-face)
+   ((equal method "POST") 'courier-request-method-post-face)
+   ((member method '("PUT" "PATCH" "DELETE")) 'courier-request-method-write-face)
+   (t 'courier-request-method-default-face)))
+
+(defun courier--current-method-bounds ()
+  "Return `(START . END)' for the current request method token, or nil."
+  (save-excursion
+    (when (courier--goto-request-line)
+      (when (looking-at "^\\([A-Z]+\\)\\(?:\\s-+.*\\)?$")
+        (cons (match-beginning 1) (match-end 1))))))
+
+(defun courier--after-change-refresh-method-overlay (&rest _args)
+  "Refresh the Courier request method overlay after buffer changes."
+  (when (derived-mode-p 'courier-request-mode)
+    (courier--refresh-method-overlay)))
+
+(defun courier--delete-method-overlay ()
+  "Delete the current Courier request method overlay."
+  (when (overlayp courier--method-overlay)
+    (delete-overlay courier--method-overlay)
+    (setq courier--method-overlay nil)))
+
+(defun courier--refresh-method-overlay ()
+  "Refresh the Courier request method overlay in the current buffer."
+  (if-let* ((bounds (courier--current-method-bounds))
+            (method (courier--current-method)))
+      (let ((overlay (or courier--method-overlay
+                         (make-overlay (car bounds) (cdr bounds) nil t t))))
+        (setq courier--method-overlay overlay)
+        (move-overlay overlay (car bounds) (cdr bounds))
+        (overlay-put overlay 'evaporate t)
+        (overlay-put overlay 'priority 1000)
+        (overlay-put overlay 'face (courier--method-overlay-face method))
+        (overlay-put overlay 'help-echo (format "Courier method: %s" method)))
+    (courier--delete-method-overlay)))
 
 ;;;###autoload
 (define-derived-mode courier-request-mode text-mode "Courier"
@@ -2192,6 +2896,13 @@ Entries are read from the configured env directory only."
   (setq-local font-lock-defaults '(courier-request-font-lock-keywords))
   (setq-local outline-regexp "^# @\\|^[A-Z]+ ")
   (setq-local courier--request-path (and buffer-file-name (expand-file-name buffer-file-name)))
+  (setq-local courier--collection-root-hint
+              (or courier--collection-root-hint
+                  (courier--collection-root)))
+  (add-hook 'after-change-functions
+            #'courier--after-change-refresh-method-overlay nil t)
+  (add-hook 'change-major-mode-hook #'courier--delete-method-overlay nil t)
+  (courier--refresh-method-overlay)
   (unless courier--active-env
     (when-let* ((preferred-env (courier--preferred-env-name
                                 (courier--available-env-entries))))
@@ -2242,10 +2953,35 @@ Entries are read from the configured env directory only."
                      (courier--current-method))))
   (save-excursion
     (unless (courier--goto-request-line)
-      (user-error "No Courier request line found"))
-    (replace-match method t t nil 1))
+      (user-error "No Courier request in this buffer"))
+    (beginning-of-line)
+    (cond
+     ((looking-at "^\\([A-Z]+\\)\\(?:\\s-+.*\\)?$")
+      (replace-match method t t nil 1))
+     (t
+      (insert method " "))))
   (courier--refresh-overview-buffers)
   (message "Courier method set to %s." method))
+
+;;;###autoload
+(defun courier-request-save-buffer ()
+  "Save the current Courier request buffer.
+Unsaved request buffers choose a collection on first save."
+  (interactive)
+  (if buffer-file-name
+      (save-buffer)
+    (let* ((collection-root (courier--read-save-collection-root))
+           (request-root (courier--preferred-requests-root collection-root))
+           (request-name (courier--buffer-request-name))
+           (path (courier--unique-request-path request-root request-name)))
+      (make-directory request-root t)
+      (set-visited-file-name path)
+      (setq-local default-directory (file-name-directory path))
+      (setq-local courier--request-path path)
+      (setq-local courier--collection-root-hint collection-root)
+      (save-buffer)
+      (courier--refresh-overview-buffers)
+      (message "Courier request saved to %s" path))))
 
 ;;;###autoload
 (defun courier-request-send ()
@@ -2279,7 +3015,9 @@ Entries are read from the configured env directory only."
 (defun courier-open ()
   "Open another Courier request or switch environments."
   (interactive)
-  (let ((candidates (courier--open-candidates)))
+  (let ((request-root (or (courier--request-search-root)
+                          (user-error "No Courier collection in current context")))
+        (candidates (courier--open-candidates)))
     (unless candidates
       (user-error "No Courier requests or environments found"))
     (let ((completion-extra-properties
@@ -2287,45 +3025,46 @@ Entries are read from the configured env directory only."
           (selection
            (completing-read
             (format "Courier open (%s): "
-                    (abbreviate-file-name (courier--request-search-root)))
+                    (abbreviate-file-name request-root))
             candidates nil t)))
       (courier--handle-open-selection selection candidates))))
 
 ;;;###autoload
-(defun courier-find-request ()
-  "Compatibility alias for `courier-open'."
+(defun courier-new-request ()
+  "Create a new unsaved Courier request draft."
   (interactive)
-  (courier-open))
+  (let* ((name (courier--next-untitled-request-name))
+         (origin-root (or (and (derived-mode-p 'courier-overview-mode)
+                               courier--overview-collection-root)
+                          (courier--collection-root)))
+         (buffer (generate-new-buffer (courier--draft-buffer-name name))))
+    (with-current-buffer buffer
+      (setq-local default-directory (or origin-root default-directory))
+      (insert (courier--request-skeleton name))
+      (courier-request-mode)
+      (setq-local courier--collection-root-hint origin-root)
+      (goto-char (point-min))
+      (forward-line 1)
+      (end-of-line))
+    (switch-to-buffer buffer)
+    (message "Courier draft created. Save it into a collection with C-x C-s.")))
 
 ;;;###autoload
-(defun courier-new-request (name)
-  "Create a new Courier request file named after NAME.
-The file is placed in the current Courier management directory. When inside a
-collection, creation respects the configured `requestsDir'. The HTTP method
-defaults to GET; change it in the buffer after creation."
-  (interactive (list (read-string "Request name: ")))
-  (let* ((directory (courier--ensure-directory-under-root
-                     (courier--management-directory)
-                     (courier--management-root)))
-         (filename (expand-file-name (courier--request-file-name name) directory)))
-    (when (file-exists-p filename)
-      (user-error "File already exists: %s" filename))
-    (find-file filename)
-    (insert (concat "# @name " name "\n"
-                    "GET \n"
-                    "Accept: application/json\n"))
-    (save-buffer)
-    (goto-char (point-min))
-    (forward-line 1)
-    (end-of-line)
-    (courier--refresh-overview-buffers)
-    (message "Courier request created at %s" filename)))
+(defun courier-create-collection (directory)
+  "Create a Courier collection rooted at DIRECTORY."
+  (interactive
+   (list (read-directory-name "Create Courier collection in: "
+                              default-directory nil t)))
+  (let ((root (courier--create-collection directory)))
+    (message "Courier collection created at %s" root)
+    root))
 
 ;;;###autoload
 (defun courier-new-folder (name)
   "Create a Courier folder named NAME in the current management directory."
   (interactive (list (read-string "Folder name: ")))
-  (let* ((base-directory (courier--management-directory))
+  (let* ((base-directory (or (courier--management-directory)
+                             (user-error "No Courier collection or request context")))
          (root (courier--management-root))
          (directory (courier--ensure-directory-under-root
                      (expand-file-name name base-directory)
@@ -2415,6 +3154,7 @@ This renames the request file and updates its `# @name' directive."
 (define-key courier-request-mode-map (kbd "C-c C-o") #'courier-open)
 (define-key courier-request-mode-map (kbd "C-c C-p") #'courier-request-preview)
 (define-key courier-request-mode-map (kbd "C-c C-r") #'courier-rename-request)
+(define-key courier-request-mode-map [remap save-buffer] #'courier-request-save-buffer)
 
 ;;;###autoload
 (add-to-list 'auto-mode-alist '("\\.http\\'" . courier-request-mode))

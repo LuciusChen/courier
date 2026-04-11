@@ -74,6 +74,15 @@
   (when-let* ((position (cl-position flag argv :test #'string=)))
     (nth (1+ position) argv)))
 
+(defun courier-test--count-matches (regexp string)
+  "Return the number of REGEXP matches in STRING."
+  (let ((count 0)
+        (start 0))
+    (while (string-match regexp string start)
+      (setq count (1+ count)
+            start (match-end 0)))
+    count))
+
 ;; Parser tests.
 
 (ert-deftest courier-parse-minimal-get ()
@@ -475,6 +484,19 @@
       (should (= (plist-get response :status-code) 404))
       (should (equal (plist-get response :reason) "Not Found")))))
 
+(ert-deftest courier-parse-response-falls-back-to-content-length-when-meta-size-zero ()
+  (courier-test--with-temp-files ((header ".headers") (body ".body") (meta ".meta"))
+    (with-temp-file header
+      (insert "HTTP/1.1 403 Forbidden\r\nContent-Type: text/html\r\nContent-Length: 407\r\n\r\n"))
+    (with-temp-file body
+      (insert "short body"))
+    (with-temp-file meta
+      (insert "403\n0\n0.000\n"))
+    (let ((response (courier-parse-response header body meta "" 0 '(:path "/tmp/test.http" :tests nil))))
+      (should (= (plist-get response :status-code) 403))
+      (should (equal (plist-get response :reason) "Forbidden"))
+      (should (= (plist-get response :size) 407)))))
+
 (ert-deftest courier-parse-response-transport-error ()
   (courier-test--with-temp-files ((header ".headers") (body ".body") (meta ".meta"))
     (with-temp-file meta
@@ -495,6 +517,34 @@
     (let ((response (courier-parse-response header body meta "" 0 '(:path "/tmp/test.http" :tests nil))))
       (should (= (plist-get response :status-code) 200))
       (should (equal (plist-get response :headers) nil)))))
+
+(ert-deftest courier-parse-response-errors-on-unsupported-charset ()
+  (courier-test--with-temp-files ((header ".headers") (body ".body") (meta ".meta"))
+    (with-temp-file header
+      (insert "HTTP/1.1 200 OK\nContent-Type: text/plain; charset=madeup-charset\n\n"))
+    (with-temp-file body
+      (insert "hello"))
+    (with-temp-file meta
+      (insert "200\n5\n0.050\n"))
+    (should-error
+     (courier-parse-response header body meta "" 0 '(:path "/tmp/test.http" :tests nil))
+     :type 'user-error)))
+
+(ert-deftest courier-apply-response-fallbacks-uses-body-size-and-elapsed-time ()
+  (courier-test--with-temp-files ((body ".body"))
+    (with-temp-file body
+      (insert "hello"))
+    (let* ((start-time (- (float-time) 1.2))
+           (response (courier--apply-response-fallbacks
+                      `(:status-code 200
+                        :reason "OK"
+                        :headers nil
+                        :body-file ,body
+                        :size 0
+                        :duration-ms 0)
+                      start-time)))
+      (should (= (plist-get response :size) 5))
+      (should (> (plist-get response :duration-ms) 1000)))))
 
 ;; Environment tests.
 
@@ -550,28 +600,6 @@
       (let ((config (courier--collection-config root)))
         (should (equal (plist-get config :env-dir) "config/envs"))
         (should (equal (plist-get config :default-env) "staging"))))))
-
-(ert-deftest courier-scan-env-files-finds-current-and-parent ()
-  (courier-test--with-temp-dir (root)
-    (let* ((child (expand-file-name "api/request" root))
-           (outer-env (expand-file-name ".env" root))
-           (inner-env (expand-file-name "local.env" child)))
-      (make-directory child t)
-      (with-temp-file outer-env (insert "base_url=https://outer.example.com\n"))
-      (with-temp-file inner-env (insert "base_url=https://inner.example.com\n"))
-      (let ((entries (courier-scan-env-files child)))
-        (should (member (cons "default" outer-env) entries))
-        (should (member (cons "local" inner-env) entries))))))
-
-(ert-deftest courier-scan-env-files-extracts-names ()
-  (courier-test--with-temp-dir (root)
-    (let ((default-env (expand-file-name ".env" root))
-          (prod-env (expand-file-name "prod.env" root)))
-      (with-temp-file default-env (insert "foo=1\n"))
-      (with-temp-file prod-env (insert "foo=2\n"))
-      (should (equal (courier-scan-env-files root)
-                     `(("default" . ,default-env)
-                       ("prod" . ,prod-env)))))))
 
 (ert-deftest courier-merge-vars-request-overrides-env ()
   (should (equal (courier-merge-vars '(("token" . "env-token")
@@ -660,7 +688,26 @@
      courier-test--request)
     (courier-response-set-view 'raw)
     (should (eq courier--body-view 'raw))
-    (should (string-match-p "raw" (format "%s" header-line-format)))))
+    (should (eq courier--response-tab 'response))
+    (should (string-match-p "Response.*200 OK  •  42ms  •  5B"
+                            (substring-no-properties header-line-format)))))
+
+(ert-deftest courier-response-header-line-uses-clutch-style-separator ()
+  (let ((line (substring-no-properties
+               (courier--response-header-line (courier-test--make-response 200)))))
+    (should (string-match-p "200 OK  •  42ms  •  5B" line))
+    (should-not (string-match-p " | " line))))
+
+(ert-deftest courier-response-header-line-falls-back-to-standard-reason ()
+  (let ((line (substring-no-properties
+               (courier--response-header-line
+                '(:status-code 403
+                  :reason ""
+                  :headers nil
+                  :duration-ms 42
+                  :size 5
+                  :content-type "text/plain")))))
+    (should (string-match-p "403 Forbidden" line))))
 
 (ert-deftest courier-response-open-body-opens-viewer-buffer ()
   (with-temp-buffer
@@ -685,28 +732,57 @@
       (with-current-buffer viewer-buffer
         (should (string-match-p "\"foo\"" (buffer-string)))))))
 
-(ert-deftest courier-test-response-next-section ()
+(ert-deftest courier-response-body-section-fontifies-html-view ()
   (with-temp-buffer
     (courier--render-response
-     (courier-test--make-response 200)
+     '(:status-code 200
+       :reason "OK"
+       :headers (("content-type" . "text/html; charset=utf-8"))
+       :duration-ms 10
+       :size 44
+       :body-text "<html><body><div class=\"x\">hi</div></body></html>"
+       :content-type "text/html"
+       :tests nil
+       :stderr ""
+       :exit-code 0)
      courier-test--request)
-    (courier-response-next-section)
-    (should (string= (get-text-property (point) 'courier-section) "Headers"))
-    (courier-response-next-section)
-    (should (string= (get-text-property (point) 'courier-section) "Body"))))
+    (let ((pos (point-min))
+          found-face)
+      (while (and (< pos (point-max))
+                  (not found-face))
+        (setq found-face (get-text-property pos 'face))
+        (setq pos (1+ pos)))
+      (should found-face))))
 
-(ert-deftest courier-test-response-prev-section ()
+(ert-deftest courier-response-show-tests-switches-tab ()
+  (with-temp-buffer
+    (courier--render-response
+     '(:status-code 200
+       :reason "OK"
+       :headers (("content-type" . "text/plain"))
+       :duration-ms 10
+       :size 12
+       :body-text "hello"
+       :content-type "text/plain"
+       :tests ((:expr "status == 200" :passed t :message "ok"))
+       :stderr ""
+       :exit-code 0)
+     courier-test--request)
+    (courier-response-show-tests)
+    (should (eq courier--response-tab 'tests))
+    (should (string-match-p "Tests 1"
+                            (substring-no-properties header-line-format)))
+    (should (string-match-p "status == 200" (buffer-string)))))
+
+(ert-deftest courier-response-next-tab-cycles ()
   (with-temp-buffer
     (courier--render-response
      (courier-test--make-response 200)
      courier-test--request)
-    (courier-response-next-section)
-    (courier-response-next-section)
-    (should (string= (get-text-property (point) 'courier-section) "Body"))
-    (courier-response-prev-section)
-    (should (string= (get-text-property (point) 'courier-section) "Headers"))
-    (courier-response-prev-section)
-    (should (string= (get-text-property (point) 'courier-section) "Summary"))))
+    (courier-response-next-tab)
+    (should (eq courier--response-tab 'headers))
+    (courier-response-prev-tab)
+    (should (eq courier--response-tab 'response))))
 
 (ert-deftest courier-test-history-push-stores-responses ()
   (with-temp-buffer
@@ -719,7 +795,7 @@
     (should (= (length courier--history) 2))
     (should (= (plist-get (cdr (car courier--history)) :status-code) 404))))
 
-(ert-deftest courier-test-history-prev-shows-older ()
+(ert-deftest courier-response-timeline-activate-selects-history-entry ()
   (with-temp-buffer
     (courier--render-response
      (courier-test--make-response 200)
@@ -727,10 +803,164 @@
     (courier--render-response
      (courier-test--make-response 404)
      courier-test--request)
-    (courier-response-history-prev)
+    (courier-response-show-timeline)
+    (goto-char (point-min))
+    (search-forward "200 OK")
+    (courier-response-activate)
     (should (= courier--history-index 1))
-    (should (string-match-p "2/2" (format "%s" header-line-format)))
-    (should (= (plist-get courier--response :status-code) 200))))
+    (should (string-match-p "2/2"
+                            (substring-no-properties header-line-format)))
+    (should (= (plist-get courier--response :status-code) 404))
+    (should (eq courier--response-tab 'timeline))
+    (should (string-match-p "GET https://example.com" (buffer-string)))))
+
+(ert-deftest courier-response-header-line-renders-current-tab-first ()
+  (with-temp-buffer
+    (courier--render-response
+     (courier-test--make-response 200)
+     courier-test--request)
+    (let ((line (substring-no-properties header-line-format)))
+      (should (string-match-p
+               "\\` Response  •  200 OK  •  42ms  •  5B"
+               line))
+      (courier-response-show-headers)
+      (should (string-match-p
+               "\\` Headers 1  •  200 OK  •  42ms  •  5B"
+               (substring-no-properties header-line-format))))))
+
+(ert-deftest courier-response-timeline-network-logs-switches-section ()
+  (with-temp-buffer
+    (courier--render-response
+     (courier-test--make-response 403)
+     '(:method "POST"
+       :url "https://example.com/users"
+       :headers (("content-type" . "application/json"))
+       :body "{\"name\":\"Lucy\"}"
+       :path "/tmp/test.http"))
+    (courier-response-show-timeline)
+    (courier--select-history-index 0)
+    (courier--toggle-timeline-section 'network-logs)
+    (should (eq courier--response-tab 'timeline))
+    (should (memq 'network-logs courier--timeline-expanded-sections))
+    (should (string-match-p "Exit code:" (buffer-string)))))
+
+(ert-deftest courier-response-timeline-defaults-to-collapsed-history ()
+  (with-temp-buffer
+    (courier--render-response
+     (courier-test--make-response 200)
+     courier-test--request)
+    (courier--render-response
+     (courier-test--make-response 404)
+     courier-test--request)
+    (courier-response-show-timeline)
+    (should (null courier--history-index))
+    (should-not (string-match-p "Request\\|Network Logs" (buffer-string)))
+    (should (string-match-p "404 OK" (buffer-string)))
+    (should (string-match-p "200 OK" (buffer-string)))))
+
+(ert-deftest courier-response-timeline-expanded-entry-is-removed-from-list ()
+  (with-temp-buffer
+    (courier--render-response
+     (courier-test--make-response 200)
+     courier-test--request)
+    (courier--render-response
+     (courier-test--make-response 404)
+     courier-test--request)
+    (courier-response-show-timeline)
+    (courier--select-history-index 0)
+    (should (= 1 (courier-test--count-matches "404 OK" (buffer-string))))
+    (should (= 1 (courier-test--count-matches "200 OK" (buffer-string))))))
+
+(ert-deftest courier-response-timeline-selection-keeps-point-on-entry ()
+  (with-temp-buffer
+    (courier--render-response
+     (courier-test--make-response 200)
+     courier-test--request)
+    (courier--render-response
+     (courier-test--make-response 404)
+     courier-test--request)
+    (courier-response-show-timeline)
+    (courier--select-history-index 1)
+    (let ((button (button-at (point))))
+      (should button)
+      (should (= 1 (button-get button 'courier-history-index))))))
+
+(ert-deftest courier-response-timeline-section-toggle-keeps-point-on-section ()
+  (with-temp-buffer
+    (courier--render-response
+     (courier-test--make-response 200)
+     courier-test--request)
+    (courier-response-show-timeline)
+    (courier--select-history-index 0)
+    (courier--toggle-timeline-section 'network-logs)
+    (let ((button (button-at (point))))
+      (should button)
+      (should (eq 'network-logs (button-get button 'courier-timeline-tab))))))
+
+(ert-deftest courier-response-timeline-entry-is-a-button ()
+  (with-temp-buffer
+    (courier--render-response
+     (courier-test--make-response 200)
+     courier-test--request)
+    (courier-response-show-timeline)
+    (goto-char (point-min))
+    (search-forward "200 OK")
+    (let ((button (button-at (point))))
+      (should button)
+      (should (= (button-get button 'courier-history-index) 0)))))
+
+(ert-deftest courier-response-context-tab-activates-timeline-button ()
+  (with-temp-buffer
+    (courier--render-response
+     (courier-test--make-response 200)
+     courier-test--request)
+    (courier-response-show-timeline)
+    (goto-char (point-min))
+    (search-forward "200 OK")
+    (courier-response-context-tab)
+    (should (= courier--history-index 0))))
+
+(ert-deftest courier-response-context-tab-expands-lower-entry-inline ()
+  (with-temp-buffer
+    (courier--render-response
+     (courier-test--make-response 200)
+     courier-test--request)
+    (courier--render-response
+     (courier-test--make-response 404)
+     courier-test--request)
+    (courier-response-show-timeline)
+    (goto-char (point-min))
+    (search-forward "200 OK")
+    (end-of-line)
+    (courier-response-context-tab)
+    (should (= courier--history-index 1))
+    (let ((button (button-at (point))))
+      (should button)
+      (should (= 1 (button-get button 'courier-history-index))))
+    (let ((buffer (buffer-string)))
+      (should (string-match-p "\\`404 OK" buffer))
+      (should (string-match-p "200 OK" buffer))
+      (should (> (or (string-match "\\[[-+]\\] Request" buffer) -1)
+                 (or (string-match "200 OK" buffer) -1))))))
+
+(ert-deftest courier-response-context-tab-collapses-current-entry-inline ()
+  (with-temp-buffer
+    (courier--render-response
+     (courier-test--make-response 200)
+     courier-test--request)
+    (courier--render-response
+     (courier-test--make-response 404)
+     courier-test--request)
+    (courier-response-show-timeline)
+    (goto-char (point-min))
+    (search-forward "200 OK")
+    (courier-response-context-tab)
+    (should (= courier--history-index 1))
+    (courier-response-context-tab)
+    (should (null courier--history-index))
+    (let ((button (button-at (point))))
+      (should button)
+      (should (= 1 (button-get button 'courier-history-index))))))
 
 (ert-deftest courier-test-history-respects-max ()
   (let ((courier-history-max 3))
@@ -742,19 +972,6 @@
       (should (= (length courier--history) 3))
       (should (= (plist-get (cdr (nth 0 courier--history)) :status-code) 204))
       (should (= (plist-get (cdr (nth 2 courier--history)) :status-code) 202)))))
-
-(ert-deftest courier-request-search-root-prefers-git-root ()
-  (courier-test--with-temp-dir (root)
-    (let* ((api-dir (expand-file-name "api/users" root))
-           (request-file (expand-file-name "get-user.http" api-dir)))
-      (make-directory (expand-file-name ".git" root))
-      (make-directory api-dir t)
-      (with-temp-file request-file
-        (insert "GET https://example.com/users/42\n"))
-      (with-temp-buffer
-        (setq-local buffer-file-name request-file)
-        (should (equal (file-name-as-directory root)
-                       (courier--request-search-root)))))))
 
 (ert-deftest courier-request-search-root-prefers-collection-root ()
   (courier-test--with-temp-dir (root)
@@ -789,26 +1006,15 @@
         (should (equal (file-name-as-directory requests-root)
                        (courier--request-search-root)))))))
 
-(ert-deftest courier-scan-env-files-stops-at-collection-root ()
+(ert-deftest courier-request-search-root-requires-collection ()
   (courier-test--with-temp-dir (root)
-    (let* ((collection-root (expand-file-name "api-collection" root))
-           (child (expand-file-name "requests/users" collection-root))
-           (outer-env (expand-file-name ".env" root))
-           (collection-env (expand-file-name ".env" collection-root))
-           (local-env (expand-file-name "local.env" child)))
-      (make-directory child t)
-      (with-temp-file outer-env
-        (insert "base_url=https://outer.example.com\n"))
-      (with-temp-file (expand-file-name "courier.json" collection-root)
-        (insert "{}\n"))
-      (with-temp-file collection-env
-        (insert "base_url=https://collection.example.com\n"))
-      (with-temp-file local-env
-        (insert "token=local\n"))
-      (let ((entries (courier-scan-env-files child collection-root)))
-        (should (member (cons "default" collection-env) entries))
-        (should (member (cons "local" local-env) entries))
-        (should-not (member (cons "default" outer-env) entries))))))
+    (let ((request-file (expand-file-name "api/users/get-user.http" root)))
+      (make-directory (file-name-directory request-file) t)
+      (with-temp-file request-file
+        (insert "GET https://example.com/users/42\n"))
+      (with-temp-buffer
+        (setq-local buffer-file-name request-file)
+        (should-not (courier--request-search-root))))))
 
 (ert-deftest courier-available-env-entries-use-collection-env-dir ()
   (courier-test--with-temp-dir (root)
@@ -838,7 +1044,7 @@
                        `(("default" . ,collection-default)
                          ("prod" . ,collection-prod))))))))
 
-(ert-deftest courier-available-env-entries-fall-back-without-collection ()
+(ert-deftest courier-available-env-entries-require-collection ()
   (courier-test--with-temp-dir (root)
     (let* ((request-dir (expand-file-name "api/users" root))
            (request-file (expand-file-name "get-user.http" request-dir))
@@ -854,9 +1060,7 @@
       (with-temp-buffer
         (setq-local buffer-file-name request-file)
         (setq-local courier--request-path request-file)
-        (should (equal (courier--available-env-entries)
-                       `(("default" . ,outer-env)
-                         ("local" . ,inner-env))))))))
+        (should-not (courier--available-env-entries))))))
 
 (ert-deftest courier-selected-env-name-prefers-collection-default ()
   (courier-test--with-temp-dir (root)
@@ -917,13 +1121,39 @@
         (should (string-match-p "^GET\\s-+Get User" (car candidate)))
         (should (string-match-p "users/get-user\\.http$" (car candidate)))))))
 
-(ert-deftest courier-find-request-opens-selected-file ()
+(ert-deftest courier-open-errors-on-malformed-request-file ()
   (courier-test--with-temp-dir (root)
-    (let* ((first-file (expand-file-name "users/get-user.http" root))
-           (second-file (expand-file-name "users/create-user.http" root))
+    (let ((request-file (expand-file-name "users/broken.http" root)))
+      (make-directory (file-name-directory request-file) t)
+      (with-temp-file request-file
+        (insert "# @name Broken\nGET \n"))
+      (let ((default-directory root))
+        (should-error (courier-open) :type 'user-error)))))
+
+(ert-deftest courier-overview-errors-on-malformed-request-file ()
+  (courier-test--with-temp-dir (root)
+    (let* ((collection-root (expand-file-name "api-collection" root))
+           (request-dir (expand-file-name "requests/users" collection-root))
+           (request-file (expand-file-name "broken.http" request-dir)))
+      (make-directory request-dir t)
+      (with-temp-file (expand-file-name "courier.json" collection-root)
+        (insert "{}\n"))
+      (with-temp-file request-file
+        (insert "# @name Broken\nGET \n"))
+      (let ((default-directory collection-root))
+        (should-error (courier-overview) :type 'user-error)))))
+
+(ert-deftest courier-open-opens-selected-request-file ()
+  (courier-test--with-temp-dir (root)
+    (let* ((collection-root (expand-file-name "api-collection" root))
+           (request-root (expand-file-name "requests/users" collection-root))
+           (first-file (expand-file-name "get-user.http" request-root))
+           (second-file (expand-file-name "create-user.http" request-root))
            opened-file
            expected-file)
-      (make-directory (expand-file-name ".git" root))
+      (make-directory request-root t)
+      (with-temp-file (expand-file-name "courier.json" collection-root)
+        (insert "{}\n"))
       (make-directory (file-name-directory first-file) t)
       (with-temp-file first-file
         (insert "# @name Get User\nGET https://example.com/users/42\n"))
@@ -936,9 +1166,14 @@
                 ((symbol-function 'find-file)
                  (lambda (path)
                    (setq opened-file path))))
-        (let ((default-directory root))
-          (courier-find-request)))
+        (let ((default-directory collection-root))
+          (courier-open)))
       (should (equal opened-file expected-file)))))
+
+(ert-deftest courier-open-requires-collection ()
+  (with-temp-buffer
+    (setq default-directory temporary-file-directory)
+    (should-error (courier-open) :type 'user-error)))
 
 (ert-deftest courier-request-set-method-rewrites-request-line ()
   (courier-test--with-request
@@ -949,6 +1184,41 @@
     (courier-request-set-method "POST")
     (goto-char (point-min))
     (should (search-forward "POST https://example.com/users/42" nil t))))
+
+(ert-deftest courier-request-mode-adds-method-overlay ()
+  (courier-test--with-request
+      (concat "# @name Demo\n"
+              "GET https://example.com/users/42\n"
+              "Accept: application/json\n")
+    (courier-request-mode)
+    (should (overlayp courier--method-overlay))
+    (should (equal (buffer-substring-no-properties
+                    (overlay-start courier--method-overlay)
+                    (overlay-end courier--method-overlay))
+                   "GET"))))
+
+(ert-deftest courier-request-set-method-works-on-incomplete-request-line ()
+  (courier-test--with-request
+      (concat "# @name Demo\n"
+              "GET \n"
+              "Accept: application/json\n")
+    (courier-request-mode)
+    (courier-request-set-method "POST")
+    (goto-char (point-min))
+    (should (search-forward "POST " nil t))))
+
+(ert-deftest courier-request-set-method-refreshes-overlay ()
+  (courier-test--with-request
+      (concat "# @name Demo\n"
+              "GET \n"
+              "Accept: application/json\n")
+    (courier-request-mode)
+    (courier-request-set-method "POST")
+    (should (overlayp courier--method-overlay))
+    (should (equal (buffer-substring-no-properties
+                    (overlay-start courier--method-overlay)
+                    (overlay-end courier--method-overlay))
+                   "POST"))))
 
 (ert-deftest courier-request-set-method-rejects-missing-request-line ()
   (courier-test--with-request "# @name Demo\n"
@@ -1071,28 +1341,86 @@
           (courier-overview-open)))
       (should (equal opened-file request-file)))))
 
-(ert-deftest courier-new-request-uses-configured-requests-dir ()
+(ert-deftest courier-new-request-creates-untitled-draft ()
+  (let ((courier--untitled-request-counter 0)
+        created-buffer)
+    (save-window-excursion
+      (let ((default-directory temporary-file-directory))
+        (courier-new-request)
+        (setq created-buffer (current-buffer))
+        (should (derived-mode-p 'courier-request-mode))
+        (should-not buffer-file-name)
+        (should (equal (buffer-string)
+                       "# @name Untitled 1\nGET \nAccept: application/json\n"))))
+    (when (buffer-live-p created-buffer)
+      (kill-buffer created-buffer))))
+
+(ert-deftest courier-new-request-uses-configured-default-method ()
+  (let ((courier--untitled-request-counter 0)
+        (courier-default-request-method "POST")
+        created-buffer)
+    (save-window-excursion
+      (let ((default-directory temporary-file-directory))
+        (courier-new-request)
+        (setq created-buffer (current-buffer))
+        (should (derived-mode-p 'courier-request-mode))
+        (should-not buffer-file-name)
+        (should (equal (buffer-string)
+                       "# @name Untitled 1\nPOST \nAccept: application/json\n"))))
+    (when (buffer-live-p created-buffer)
+      (kill-buffer created-buffer))))
+
+(ert-deftest courier-draft-and-response-buffers-use-distinct-names ()
+  (should (equal (courier--draft-buffer-name "Untitled 1")
+                 "*courier-request: Untitled 1*"))
+  (should (equal (courier--response-buffer-name '(:name "Untitled 1"))
+                 "*courier-response: Untitled 1*")))
+
+(ert-deftest courier-request-save-buffer-uses-configured-requests-dir ()
   (courier-test--with-temp-dir (root)
     (let* ((collection-root (expand-file-name "api-collection" root))
            (requests-root (expand-file-name "api-requests" collection-root))
-           created-buffer)
+           draft-buffer)
       (make-directory collection-root t)
       (with-temp-file (expand-file-name "courier.json" collection-root)
         (insert "{\n  \"requestsDir\": \"api-requests\"\n}\n"))
-      (cl-letf (((symbol-function 'find-file)
-                 (lambda (path)
-                   (setq created-buffer (find-file-noselect path))
-                   (set-buffer created-buffer)
-                   created-buffer)))
-        (let ((default-directory collection-root))
-          (courier-new-request "Create User")))
+      (setq draft-buffer (generate-new-buffer "*courier-save-test*"))
       (unwind-protect
-          (progn
-            (should (file-exists-p (expand-file-name "create-user.http" requests-root)))
-            (with-current-buffer created-buffer
-              (should (string-match-p "# @name Create User" (buffer-string)))))
-        (when (buffer-live-p created-buffer)
-          (kill-buffer created-buffer))))))
+          (with-current-buffer draft-buffer
+            (insert "# @name Create User\nGET \nAccept: application/json\n")
+            (setq default-directory root)
+            (courier-request-mode)
+            (cl-letf (((symbol-function 'read-directory-name)
+                       (lambda (&rest _args)
+                         collection-root)))
+              (courier-request-save-buffer))
+            (should (equal (expand-file-name buffer-file-name)
+                           (expand-file-name "create-user.http" requests-root)))
+            (should (file-exists-p (expand-file-name "create-user.http" requests-root))))
+        (when (buffer-live-p draft-buffer)
+          (kill-buffer draft-buffer))))))
+
+(ert-deftest courier-request-save-buffer-creates-collection-when-needed ()
+  (courier-test--with-temp-dir (root)
+    (let* ((collection-root (expand-file-name "api-collection" root))
+           (draft-buffer (generate-new-buffer "*courier-create-collection*")))
+      (unwind-protect
+          (with-current-buffer draft-buffer
+            (insert "# @name Untitled 1\nGET \nAccept: application/json\n")
+            (setq default-directory root)
+            (courier-request-mode)
+            (cl-letf (((symbol-function 'read-directory-name)
+                       (lambda (&rest _args)
+                         collection-root))
+                      ((symbol-function 'y-or-n-p)
+                       (lambda (&rest _args)
+                         t)))
+              (courier-request-save-buffer))
+            (should (file-exists-p (expand-file-name "courier.json" collection-root)))
+            (should (file-exists-p (expand-file-name "requests/untitled-1.http"
+                                                     collection-root))))
+        (when (buffer-live-p draft-buffer)
+          (kill-buffer draft-buffer))))))
 
 (ert-deftest courier-new-folder-creates-under-request-root ()
   (courier-test--with-temp-dir (root)

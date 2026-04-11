@@ -196,11 +196,21 @@ manager. It is a source of variable values for request resolution.
 ### 4. Send and inspect response
 
 - user sends request
-- response buffer shows summary, headers, body, tests, trace
+- response buffer centers on one response at a time, with a header-line view
+  control for Response, Headers, Timeline, and Tests
 - user changes response view as needed
 - response history remains available for the same request
 
-### 5. Work from overview
+### 5. Create a new request
+
+- user creates a new request draft without choosing a path first
+- Courier gives it an `Untitled N` name and opens it as an unsaved buffer
+- the draft request line uses a configurable default method, with `GET` as the default
+- on first save, Courier asks which collection should own the request
+- if the target directory is not a collection, Courier offers to create one
+- the request is then saved into that collection's `requestsDir`
+
+### 6. Work from overview
 
 - user opens collection overview
 - overview lists requests in an Emacs-native format
@@ -212,19 +222,21 @@ The current baseline already includes:
 
 - single-file implementation in `courier.el`
 - plain `.http` request parsing
+- collection root marker support via `courier.json`
+- collection-bounded env discovery with `envDir` and `defaultEnv`
 - per-buffer env switching based on `.env` files
 - response history for repeated sends of the same request
-- basic response rendering
-- request switching across `.http` files via `courier-find-request`
+- grouped request and environment picker
+- unsaved request drafts with first-save collection placement
+- collection overview
+- response view system with dedicated body viewer
+- basic response rendering, including image-aware views
 
 The current baseline does not yet include:
 
-- collection root marker support
-- collection-bounded env discovery
-- unified grouped picker for requests and envs
-- overview buffer
-- response view system
-- image-aware response rendering
+- polished response presentation
+- broader collection management flows beyond requests and folders
+- stronger cleanup against compatibility shims and hidden parse fallbacks
 
 ## Roadmap
 
@@ -235,7 +247,6 @@ Deliver:
 - collection root discovery via `courier.json`
 - bounded request discovery
 - bounded env discovery
-- fallback behavior for non-collection directories only as compatibility
 
 Acceptance:
 
@@ -323,7 +334,9 @@ Acceptance:
 Deliver:
 
 - cleaner header line
-- better section presentation
+- a clickable header-line current-view control for Response, Headers, Timeline, and Tests
+- a collapsed-by-default Timeline history list
+- expandable Timeline detail sections for Request, Response, and Network Logs
 - syntax highlighting through suitable major modes
 - image rendering support
 - better body viewer behavior
@@ -331,6 +344,8 @@ Deliver:
 Acceptance:
 
 - response buffers are pleasant enough for repeated daily use
+- timeline inspection is useful without leaving the response buffer
+- timeline defaults to history browsing instead of forcing an always-expanded inspector
 
 ### Phase 8: Collection Management
 

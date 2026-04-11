@@ -9,12 +9,13 @@ buffers.
 
 - Edit HTTP requests as plain text in =.http= files
 - Send requests with =C-c C-c= without blocking Emacs
-- View responses in a single buffer with collapsible sections
+- View responses in a single buffer with a clickable header-line view control and an Emacs-native timeline inspector
 - Variable interpolation with ={{name}}= syntax
 - Built-in test assertions for status, headers, body, timing, and size
 - Preview resolved requests before sending
 - Select per-buffer environments from collection =env/*.env= files with =C-c C-e=
 - Pretty-print JSON responses, with =v= to toggle raw view
+- Start unsaved request drafts and place them into a collection on first save
 - Browse the current collection in an overview buffer with =C-c C-b=
 - Jump between requests and environments with =C-c C-o=
 
@@ -105,9 +106,6 @@ prompts with =completing-read= when multiple environments are available. The
 choice remains buffer-local. Variables from =# @var= directives override values
 from environment files.
 
-Outside a collection, Courier falls back to the older upward scan from the
-current request directory so ad-hoc =.http= files still work.
-
 Example =env/local.env=:
 
 #+begin_example
@@ -136,14 +134,24 @@ token=abc123
 | =C-c C-b= | =courier-overview=             | Open collection view   |
 | =C-c C-e= | =courier-request-switch-env=   | Switch environment     |
 | =C-c C-m= | =courier-request-set-method=   | Change HTTP method     |
-| =C-c C-n= | =courier-new-request=          | Create new request     |
+| =C-c C-n= | =courier-new-request=          | Create request draft   |
 | =C-c C-p= | =courier-request-preview=      | Preview resolved form  |
 | =C-c C-l= | =courier-request-validate=     | Validate syntax        |
 | =C-c C-o= | =courier-open=                 | Open request or env    |
 | =C-c C-r= | =courier-rename-request=       | Rename current request |
+| =C-x C-s= | =courier-request-save-buffer=  | Save draft or file     |
 
-Use =M-x courier-new-request= to scaffold a new =.http= request file in the
-current directory. Use =C-c C-o= to open another =.http= file or switch the
+Use =M-x courier-new-request= or =C-c C-n= to open an unsaved draft buffer. The
+draft starts with =# @name Untitled N= and a request line using
+=courier-default-request-method=, which defaults to =GET=. On the first
+=C-x C-s=, Courier asks which collection should own the request. If the chosen
+directory is not already a Courier collection, Courier offers to create one
+there before saving the request into that collection's =requests/= directory.
+The request-line method token is highlighted with a lightweight overlay so
+=GET=/=POST=/etc. remain visually obvious while editing.
+
+Use =M-x courier-create-collection= to create a collection explicitly. Use
+=C-c C-o= inside a collection to open another =.http= file or switch the
 current buffer to a different environment from the same minibuffer picker.
 
 Use =C-c C-b= to open the current collection overview. The overview buffer
@@ -167,38 +175,53 @@ Request and folder management stay file-based. Courier renames and moves normal
 
 | Key       | Command                            | Description               |
 |-----------+------------------------------------+---------------------------|
-| =RET=     | =courier-response-open-body=       | Open body viewer          |
-| =TAB=     | =courier-response-toggle-section=  | Fold or unfold section    |
-| =n=       | =courier-response-next-section=    | Next section heading      |
+| =TAB=     | =courier-response-context-tab=     | Expand entry or move to next button |
+| =RET=     | =courier-response-activate=        | Activate timeline item or open body |
+| =h=       | =courier-response-show-headers=    | Show Headers tab          |
+| =l=       | =courier-response-show-timeline=   | Show Timeline tab         |
 | =o=       | =courier-response-open-body=       | Open body viewer          |
-| =p=       | =courier-response-prev-section=    | Previous section heading  |
 | =g=       | =courier-response-retry=           | Resend request            |
+| =n=       | =courier-response-next-tab=        | Next response tab         |
+| =p=       | =courier-response-prev-tab=        | Previous response tab     |
+| =r=       | =courier-response-show-response=   | Show Response tab         |
+| =t=       | =courier-response-show-tests=      | Show Tests tab            |
 | =v=       | =courier-response-set-view=        | Select body view          |
 | =V=       | =courier-response-toggle-pretty=   | Toggle raw/auto body view |
-| =[=       | =courier-response-history-prev=    | Show older response       |
-| =]=       | =courier-response-history-next=    | Show newer response       |
 | =C-c C-k= | =courier-response-cancel=          | Cancel request            |
 
 Body views currently include =auto=, =json=, =html=, =xml=, =javascript=,
 =raw=, =hex=, =base64=, and =image=. Use =RET= or =o= to open the current body
 in a dedicated viewer buffer; text-like views use an appropriate major mode,
-and image views display the image when Emacs can render it.
-| =q=       | quit                               | Close buffer              |
+and image views display the image when Emacs can render it. The main response
+buffer also applies syntax highlighting to =json=, =html=, =xml=, and
+=javascript= body views. The current top-level view lives at the front of the
+header line, switches the main buffer contents, supports the normal keyboard
+commands above, and can also be clicked with the mouse to choose another view.
 
 * Response Buffer
 
-The response buffer has five collapsible sections:
+The response buffer has four top-level views:
 
-- *Summary* shows status, duration, size, and content type.
-- *Headers* shows response headers.
-- *Body* shows the response body. JSON is pretty-printed by default when
-  possible, and =v= toggles back to the raw body.
-- *Tests* shows pass/fail indicators for all =# @test= directives. It expands
-  automatically when any test fails.
-- *Trace* shows the curl command, stderr, and exit code.
+- *Response* shows the current response body. JSON is pretty-printed by default
+  when possible, and =v= changes the body view while =V= toggles raw/auto.
+- *Headers* shows response headers in a two-column layout.
+- *Timeline* shows previous responses for the same request. It also has its own
+  collapsed history list by default. Press =RET= on a history entry to expand
+  it. The expanded entry is removed from the collapsed list below it. When
+  expanded, Timeline behaves like a small section view:
+  - *Request* shows the request URL, headers, and body snapshot that produced
+    the selected history entry.
+  - *Response* shows the selected historical response headers and body.
+  - *Network Logs* shows curl-level diagnostics such as argv, stderr, and exit
+    code.
+  Those section headings are buttons: use =RET= or mouse-1 on them to toggle
+  sections open and closed. Use =Clear Timeline= in the header line, or press
+  =RET= on the same history entry again, to collapse the expanded view.
+- *Tests* shows pass/fail indicators for all =# @test= directives.
 
-Press =[= and =]= to browse response history. The header line shows the
-timestamp and position (for example =2/5=) when viewing a past response.
+The header line shows the current view first, then status, duration, size, and
+when visiting an older timeline entry it also shows the history position (for
+example =2/5=).
 
 * Customization
 
@@ -206,5 +229,6 @@ timestamp and position (for example =2/5=) when viewing a past response.
 |-------------------------------+-----------+----------------------------------|
 | =courier-curl-executable=     | ="curl"=  | Path to curl                     |
 | =courier-body-text-max-size=  | =524288=  | Max body size decoded as text    |
+| =courier-default-request-method= | ="GET"= | Default method for new drafts    |
 | =courier-default-timeout=     | =30=      | Default timeout in seconds       |
 | =courier-history-max=         | =20=      | Max history entries per request  |
