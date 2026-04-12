@@ -37,7 +37,7 @@ Query params remain part of the URL. Courier may offer a structured params
 editor, but saving must still write back into the URL rather than creating a
 second stored params section.
 
-The normative format definition lives in [HTTP-FORMAT-V1.md](../HTTP-FORMAT-V1.md).
+The normative format definition lives in [docs/http-format-v1.md](../docs/http-format-v1.md).
 
 ## Rationale
 
@@ -77,9 +77,12 @@ easier for request content and request metadata to drift apart.
 
 ## Known Limitations
 
-- The current implementation still uses directive syntax. This postmortem sets
-  direction; it does not mean the migration already exists.
-- Courier will need a dual-parser migration period if existing collections are
-  to keep working without manual rewrites.
-- The exact migration UX still needs a dedicated plan: one-shot rewrite,
-  on-save conversion, or explicit command.
+- Existing directive-based request files are no longer supported; collections
+  that still use the old syntax must be rewritten before Courier can edit or
+  send them.
+- Query params intentionally remain attached to the URL, so structured params
+  editing must keep writing back into the request line rather than becoming a
+  second stored representation.
+- The request UI still exposes only a subset of structured metadata directly;
+  more advanced metadata editing remains constrained by the current text-first
+  model.

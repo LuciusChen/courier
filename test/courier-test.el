@@ -96,6 +96,18 @@
             start (match-end 0)))
     count))
 
+(defun courier-test--local-map-binding (map key)
+  "Return MAP's local binding for KEY without inherited parent bindings."
+  (let ((copy (copy-keymap map)))
+    (set-keymap-parent copy nil)
+    (lookup-key copy (kbd key))))
+
+(defun courier-test--face-includes-p (face expected)
+  "Return non-nil when FACE includes EXPECTED."
+  (if (listp face)
+      (memq expected face)
+    (eq face expected)))
+
 ;; Parser tests.
 
 (ert-deftest courier-parse-minimal-get ()
@@ -179,6 +191,44 @@
             "GET https://example.com\n"))
    :type 'user-error))
 
+(ert-deftest courier-parse-api-key-auth-from-front-matter ()
+  (let ((request
+         (courier-test--parsed
+          (concat "+++\n"
+                  "[auth]\n"
+                  "type = \"api_key\"\n"
+                  "in = \"header\"\n"
+                  "name = \"x-api-key\"\n"
+                  "value = \"{{api_key}}\"\n"
+                  "+++\n\n"
+                  "GET https://example.com\n"))))
+    (should (equal (plist-get request :auth)
+                   '(:type api_key
+                     :in "header"
+                     :name "x-api-key"
+                     :value "{{api_key}}")))))
+
+(ert-deftest courier-parse-oauth2-auth-from-front-matter ()
+  (let ((request
+         (courier-test--parsed
+          (concat "+++\n"
+                  "[auth]\n"
+                  "type = \"oauth2\"\n"
+                  "grant_type = \"client_credentials\"\n"
+                  "token_url = \"https://example.com/oauth/token\"\n"
+                  "client_id = \"client-id\"\n"
+                  "client_secret = \"client-secret\"\n"
+                  "scopes = [\"read\", \"write\"]\n"
+                  "+++\n\n"
+                  "GET https://example.com\n"))))
+    (should (equal (plist-get request :auth)
+                   '(:type oauth2
+                     :grant-type "client_credentials"
+                     :token-url "https://example.com/oauth/token"
+                     :client-id "client-id"
+                     :client-secret "client-secret"
+                     :scopes ("read" "write"))))))
+
 (ert-deftest courier-parse-body-type-from-front-matter ()
   (let ((request
          (courier-test--parsed
@@ -190,6 +240,137 @@
                   "\n"
                   "<ok/>\n"))))
     (should (eq (plist-get request :body-type) 'xml))))
+
+(ert-deftest courier-parse-binary-body-from-front-matter ()
+  (let ((request
+         (courier-test--parsed
+          (concat "+++\n"
+                  "[body]\n"
+                  "type = \"binary\"\n"
+                  "path = \"./payload.bin\"\n"
+                  "content_type = \"application/octet-stream\"\n"
+                  "+++\n\n"
+                  "POST https://example.com/upload\n"))))
+    (should (eq (plist-get request :body-type) 'binary))
+    (should (equal (plist-get request :body-file-path) "./payload.bin"))
+    (should (equal (plist-get request :body-file-content-type)
+                   "application/octet-stream"))))
+
+(ert-deftest courier-parse-multipart-body-from-front-matter ()
+  (let ((request
+         (courier-test--parsed
+          (concat "+++\n"
+                  "[body]\n"
+                  "type = \"multipart\"\n"
+                  "\n"
+                  "[[body.parts]]\n"
+                  "name = \"avatar\"\n"
+                  "kind = \"file\"\n"
+                  "path = \"./avatar.png\"\n"
+                  "content_type = \"image/png\"\n"
+                  "\n"
+                  "[[body.parts]]\n"
+                  "name = \"display_name\"\n"
+                  "kind = \"text\"\n"
+                  "value = \"Lucy\"\n"
+                  "+++\n\n"
+                  "POST https://example.com/upload\n"))))
+    (should (eq (plist-get request :body-type) 'multipart))
+    (should (equal (plist-get request :body-parts)
+                   '((:name "avatar"
+                      :kind file
+                      :path "./avatar.png"
+                      :content-type "image/png")
+                     (:name "display_name"
+                      :kind text
+                      :value "Lucy"))))))
+
+(ert-deftest courier-serialize-binary-body-round-trips ()
+  (let* ((request (list :path "/tmp/test.http"
+                        :method "POST"
+                        :url "https://example.com/upload"
+                        :headers nil
+                        :body ""
+                        :body-type 'binary
+                        :body-file-path "./payload.bin"
+                        :body-file-content-type "application/octet-stream"
+                        :auth nil
+                        :vars nil
+                        :tests nil
+                        :settings nil))
+         (parsed (courier-test--parsed (courier--serialize-request request))))
+    (should (eq (plist-get parsed :body-type) 'binary))
+    (should (equal (plist-get parsed :body-file-path) "./payload.bin"))
+    (should (equal (plist-get parsed :body-file-content-type)
+                   "application/octet-stream"))))
+
+(ert-deftest courier-serialize-oauth2-auth-round-trips ()
+  (let* ((request (list :path "/tmp/test.http"
+                        :method "GET"
+                        :url "https://example.com/data"
+                        :headers nil
+                        :body ""
+                        :body-type 'json
+                        :auth '(:type oauth2
+                                :grant-type "client_credentials"
+                                :token-url "https://example.com/oauth/token"
+                                :client-id "client-id"
+                                :client-secret "client-secret"
+                                :scopes ("read" "write"))
+                        :vars nil
+                        :tests nil
+                        :settings nil))
+         (parsed (courier-test--parsed (courier--serialize-request request))))
+    (should (equal (plist-get parsed :auth)
+                   '(:type oauth2
+                     :grant-type "client_credentials"
+                     :token-url "https://example.com/oauth/token"
+                     :client-id "client-id"
+                     :client-secret "client-secret"
+                     :scopes ("read" "write"))))))
+
+(ert-deftest courier-oauth2-token-request-client-credentials ()
+  (let* ((request (list :path "/tmp/test.http"
+                        :name "Demo"
+                        :method "GET"
+                        :url "https://example.com/data"
+                        :headers nil
+                        :body ""
+                        :body-type 'json
+                        :auth '(:type oauth2
+                                :grant-type "client_credentials"
+                                :token-url "https://example.com/oauth/token"
+                                :client-id "{{client_id}}"
+                                :client-secret "{{client_secret}}"
+                                :scopes ("read" "{{scope}}"))
+                        :resolved-vars '(("client_id" . "courier-client")
+                                         ("client_secret" . "courier-secret")
+                                         ("scope" . "write"))
+                        :settings '(:timeout 12)))
+         (token-request (courier--oauth2-token-request request)))
+    (should (equal (plist-get token-request :method) "POST"))
+    (should (equal (plist-get token-request :url)
+                   "https://example.com/oauth/token"))
+    (should (eq (plist-get token-request :body-type) 'form-urlencoded))
+    (should (equal (plist-get token-request :body)
+                   (string-join
+                    '("grant_type=client_credentials"
+                      "client_id=courier-client"
+                      "client_secret=courier-secret"
+                      "scope=read%20write")
+                    "&")))
+    (should (equal (plist-get token-request :headers)
+                   '(("accept" . "application/json")
+                     ("content-type" . "application/x-www-form-urlencoded"))))
+    (should (equal (plist-get token-request :settings) '(:timeout 12)))))
+
+(ert-deftest courier-oauth2-access-token-parses-json-response ()
+  (should (equal
+           (courier--oauth2-access-token
+            '(:status-code 200
+              :content-type "application/json"
+              :body-text "{\"access_token\":\"abc123\"}"))
+           "abc123")))
 
 (ert-deftest courier-parse-rejects-invalid-body-type ()
   (should-error
@@ -278,6 +459,17 @@
            :vars '(("one" . "1") ("two" . "2"))))))
     (should (equal (plist-get request :vars)
                    '(("one" . "1") ("two" . "2"))))))
+
+(ert-deftest courier-parse-phased-vars-from-front-matter ()
+  (let ((request
+         (courier-test--parsed
+          "+++\n[vars]\ntoken = \"root\"\n\n[vars.pre_request]\nrequest_id = \"42\"\n\n[[vars.post_response]]\nname = \"token\"\nfrom = \"json\"\nexpr = \"$.token\"\n+++\n\nGET https://example.com\n")))
+    (should (equal (plist-get request :vars)
+                   '(("token" . "root"))))
+    (should (equal (plist-get request :pre-request-vars)
+                   '(("request_id" . "42"))))
+    (should (equal (plist-get request :post-response-vars)
+                   '((:name "token" :from json :expr "$.token"))))))
 
 (ert-deftest courier-parse-multiple-params ()
   (let ((request
@@ -407,6 +599,44 @@
     (should (equal (plist-get resolved :headers)
                    '(("authorization" . "Basic bHVjeTpzZWNyZXQ="))))))
 
+(ert-deftest courier-resolve-request-adds-api-key-header ()
+  (let* ((request (list :path "/tmp/demo.http"
+                        :name "Demo"
+                        :method "GET"
+                        :url "https://example.com/data"
+                        :headers nil
+                        :body ""
+                        :params nil
+                        :vars '(("token" . "abc123"))
+                        :auth '(:type api_key
+                                :in "header"
+                                :name "x-api-key"
+                                :value "{{token}}")
+                        :tests nil
+                        :settings nil))
+         (resolved (courier-resolve-request request)))
+    (should (equal (plist-get resolved :headers)
+                   '(("x-api-key" . "abc123"))))))
+
+(ert-deftest courier-resolve-request-appends-api-key-query-param ()
+  (let* ((request (list :path "/tmp/demo.http"
+                        :name "Demo"
+                        :method "GET"
+                        :url "https://example.com/data"
+                        :headers nil
+                        :body ""
+                        :params '(("page" . "1"))
+                        :vars '(("token" . "abc123"))
+                        :auth '(:type api_key
+                                :in "query"
+                                :name "api_key"
+                                :value "{{token}}")
+                        :tests nil
+                        :settings nil))
+         (resolved (courier-resolve-request request)))
+    (should (equal (plist-get resolved :url)
+                   "https://example.com/data?page=1&api_key=abc123"))))
+
 (ert-deftest courier-resolve-request-appends-query-params ()
   (let* ((request (list :path "/tmp/demo.http"
                         :name "Demo"
@@ -523,6 +753,56 @@
                         :settings nil))
          (resolved (courier-resolve-request request)))
     (should (equal (plist-get resolved :body) ""))
+    (should (equal (plist-get resolved :headers) nil))))
+
+(ert-deftest courier-resolve-request-expands-binary-body-metadata ()
+  (let* ((request (list :path "/tmp/demo.http"
+                        :name "Demo"
+                        :method "POST"
+                        :url "https://example.com/upload"
+                        :headers nil
+                        :body ""
+                        :body-type 'binary
+                        :body-file-path "./{{file_name}}"
+                        :body-file-content-type "application/pdf"
+                        :params nil
+                        :vars '(("file_name" . "payload.pdf"))
+                        :tests nil
+                        :settings nil))
+         (resolved (courier-resolve-request request)))
+    (should (equal (plist-get resolved :body-file-path) "./payload.pdf"))
+    (should (equal (plist-get resolved :headers)
+                   '(("content-type" . "application/pdf"))))))
+
+(ert-deftest courier-resolve-request-expands-multipart-body-parts ()
+  (let* ((request (list :path "/tmp/demo.http"
+                        :name "Demo"
+                        :method "POST"
+                        :url "https://example.com/upload"
+                        :headers nil
+                        :body ""
+                        :body-type 'multipart
+                        :body-parts '((:name "avatar"
+                                        :kind file
+                                        :path "./{{file_name}}"
+                                        :content-type "image/png")
+                                       (:name "display_name"
+                                        :kind text
+                                        :value "{{name}}"))
+                        :params nil
+                        :vars '(("file_name" . "avatar.png")
+                                ("name" . "Lucy Chen"))
+                        :tests nil
+                        :settings nil))
+         (resolved (courier-resolve-request request)))
+    (should (equal (plist-get resolved :body-parts)
+                   '((:name "avatar"
+                      :kind file
+                      :path "./avatar.png"
+                      :content-type "image/png")
+                     (:name "display_name"
+                      :kind text
+                      :value "Lucy Chen"))))
     (should (equal (plist-get resolved :headers) nil))))
 
 (ert-deftest courier-validate-request-rejects-body-for-none-type ()
@@ -740,6 +1020,160 @@
         (should (equal header-values
                        '("accept: application/json" "x-id: 42")))))))
 
+(ert-deftest courier-build-curl-command-binary-uses-source-file ()
+  (courier-test--with-temp-files ((header ".headers") (body ".body") (meta ".meta"))
+    (let ((argv (courier-build-curl-command
+                 '(:method "POST"
+                   :url "https://example.com/upload"
+                   :headers (("content-type" . "application/pdf"))
+                   :body ""
+                   :body-type binary
+                   :body-file-path "./payload.pdf"
+                   :settings nil)
+                 header body meta)))
+      (should (string= (courier-test--argv-flag-value argv "--data-binary")
+                       "@./payload.pdf"))
+      (should-not (member "-F" argv)))))
+
+(ert-deftest courier-build-curl-command-multipart-uses-form-parts ()
+  (courier-test--with-temp-files ((header ".headers") (body ".body") (meta ".meta"))
+    (let ((argv (courier-build-curl-command
+                 '(:method "POST"
+                   :url "https://example.com/upload"
+                   :headers nil
+                   :body ""
+                   :body-type multipart
+                   :body-parts ((:name "avatar"
+                                 :kind file
+                                 :path "./avatar.png"
+                                 :content-type "image/png")
+                                (:name "display_name"
+                                 :kind text
+                                 :value "Lucy"))
+                   :settings nil)
+                 header body meta)))
+      (let ((form-values nil)
+            (start 0)
+            position)
+        (while (setq position (cl-position "-F" argv :test #'string= :start start))
+          (push (nth (1+ position) argv) form-values)
+          (setq start (1+ position)))
+        (setq form-values (nreverse form-values))
+        (should (equal form-values
+                       '("avatar=@./avatar.png;type=image/png"
+                         "display_name=Lucy"))))
+      (should-not (courier-test--argv-flag-value argv "--data-binary")))))
+
+(ert-deftest courier-send-request-oauth2-fetches-token-before-main-request ()
+  (let (calls final-response processes)
+    (cl-letf (((symbol-function 'courier--send-resolved-request)
+               (lambda (request callback)
+                 (let ((process (make-pipe-process
+                                 :name (format "courier-test-oauth-%d" (length calls))
+                                 :buffer nil
+                                 :noquery t)))
+                   (push process processes)
+                   (push request calls)
+                   (if (string= (plist-get request :url)
+                                "https://example.com/oauth/token")
+                       (funcall callback
+                                '(:status-code 200
+                                  :reason "OK"
+                                  :headers (("content-type" . "application/json"))
+                                  :content-type "application/json"
+                                  :body-text "{\"access_token\":\"abc123\"}"
+                                  :body-file nil
+                                  :stderr ""
+                                  :exit-code 0
+                                  :duration-ms 10
+                                  :size 27))
+                     (funcall callback
+                              '(:status-code 200
+                                :reason "OK"
+                                :headers nil
+                                :content-type "application/json"
+                                :body-text "{}"
+                                :body-file nil
+                                :stderr ""
+                                :exit-code 0
+                                :duration-ms 20
+                                :size 2)))
+                   process))))
+      (unwind-protect
+          (let ((request (list :path "/tmp/test.http"
+                               :name "Demo"
+                               :method "GET"
+                               :url "https://example.com/data"
+                               :headers nil
+                               :body ""
+                               :body-type 'json
+                               :auth '(:type oauth2
+                                       :grant-type "client_credentials"
+                                       :token-url "https://example.com/oauth/token"
+                                       :client-id "client-id"
+                                       :client-secret "client-secret"
+                                       :scopes ("read"))
+                               :resolved-vars nil
+                               :settings nil)))
+            (courier-send-request request
+                                  (lambda (response)
+                                    (setq final-response response)))
+            (setq calls (nreverse calls))
+            (should (= (length calls) 2))
+            (should (equal (plist-get (car calls) :url)
+                           "https://example.com/oauth/token"))
+            (should (equal (plist-get (cadr calls) :headers)
+                           '(("authorization" . "Bearer abc123"))))
+            (should (= (plist-get final-response :status-code) 200)))
+        (dolist (process processes)
+          (when (process-live-p process)
+            (delete-process process)))))))
+
+(ert-deftest courier-send-request-oauth2-surfaces-token-errors ()
+  (let (final-response processes)
+    (cl-letf (((symbol-function 'courier--send-resolved-request)
+               (lambda (_request callback)
+                 (let ((process (make-pipe-process
+                                 :name "courier-test-oauth-fail"
+                                 :buffer nil
+                                 :noquery t)))
+                   (push process processes)
+                   (funcall callback
+                            '(:status-code 200
+                              :reason "OK"
+                              :headers (("content-type" . "application/json"))
+                              :content-type "application/json"
+                              :body-text "{\"token_type\":\"bearer\"}"
+                              :body-file nil
+                              :stderr ""
+                              :exit-code 0
+                              :duration-ms 10
+                              :size 25))
+                   process))))
+      (unwind-protect
+          (let ((request (list :path "/tmp/test.http"
+                               :name "Demo"
+                               :method "GET"
+                               :url "https://example.com/data"
+                               :headers nil
+                               :body ""
+                               :body-type 'json
+                               :auth '(:type oauth2
+                                       :grant-type "client_credentials"
+                                       :token-url "https://example.com/oauth/token"
+                                       :client-id "client-id"
+                                       :client-secret "client-secret")
+                               :resolved-vars nil
+                               :settings nil)))
+            (courier-send-request request
+                                  (lambda (response)
+                                    (setq final-response response)))
+            (should (equal (plist-get final-response :reason) "OAuth2 Token Error"))
+            (should (string-match-p "access_token" (or (plist-get final-response :stderr) ""))))
+        (dolist (process processes)
+          (when (process-live-p process)
+            (delete-process process)))))))
+
 ;; Response parser tests.
 
 (ert-deftest courier-parse-response-simple-200 ()
@@ -896,7 +1330,8 @@
                        :name "Demo"
                        :requests-dir "requests"
                        :env-dir "env"
-                       :default-env nil))))))
+                       :default-env nil
+                       :defaults nil))))))
 
 (ert-deftest courier-collection-config-reads-env-settings ()
   (courier-test--with-temp-dir (root)
@@ -936,11 +1371,66 @@
          (resolved (courier-resolve-request
                     request
                     '(("base_url" . "https://env")
-                      ("user_id" . "42")
-                      ("token" . "env-token")))))
+                     ("user_id" . "42")
+                     ("token" . "env-token")))))
     (should (equal (plist-get resolved :url) "https://env/users/42"))
     (should (equal (plist-get resolved :headers)
                    '(("authorization" . "Bearer request-token"))))))
+
+(ert-deftest courier-resolved-current-request-uses-runtime-and-pre-request-vars ()
+  (courier-test--with-temp-dir (root)
+    (let* ((courier-home-directory root)
+           (collection-root (expand-file-name "collections/api-collection" root))
+           (request-dir (expand-file-name "requests" collection-root))
+           (request-file (expand-file-name "get-user.http" request-dir)))
+      (make-directory request-dir t)
+      (with-temp-file (expand-file-name "courier.json" collection-root)
+        (insert "{\n  \"name\": \"API Collection\"\n}\n"))
+      (with-temp-file request-file
+        (insert "+++\n"
+                "[vars.pre_request]\n"
+                "request_id = \"42\"\n"
+                "+++\n\n"
+                "GET https://example.com/users/{{token}}/{{request_id}}\n"))
+      (courier--write-runtime-vars collection-root nil '(("token" . "runtime-token")))
+      (with-current-buffer (find-file-noselect request-file)
+        (unwind-protect
+            (let ((resolved (courier--resolved-current-request)))
+              (should (equal (plist-get resolved :url)
+                             "https://example.com/users/runtime-token/42")))
+          (kill-buffer (current-buffer)))))))
+
+(ert-deftest courier-post-response-vars-persist-runtime-values ()
+  (courier-test--with-temp-dir (root)
+    (let* ((courier-home-directory root)
+           (collection-root (expand-file-name "collections/api-collection" root))
+           (request-dir (expand-file-name "requests" collection-root))
+           (request-file (expand-file-name "login.http" request-dir))
+           request
+           response
+           result)
+      (make-directory request-dir t)
+      (with-temp-file (expand-file-name "courier.json" collection-root)
+        (insert "{\n  \"name\": \"API Collection\"\n}\n"))
+      (with-temp-file request-file
+        (insert "+++\n"
+                "[[vars.post_response]]\n"
+                "name = \"token\"\n"
+                "from = \"json\"\n"
+                "expr = \"$.token\"\n"
+                "+++\n\n"
+                "POST https://example.com/login\n"))
+      (setq request (courier-parse-file request-file))
+      (setq request (plist-put request :path request-file))
+      (setq response (courier-test--response
+                      :status-code 200
+                      :content-type "application/json"
+                      :body-text "{\"token\":\"abc123\"}"))
+      (setq result (courier--apply-post-response-vars request response nil))
+      (should (equal (plist-get result :post-response-vars)
+                     '(("token" . "abc123"))))
+      (should (equal (courier--read-runtime-vars collection-root nil)
+                     '(("token" . "abc123")))))))
 
 ;; Response formatting tests.
 
@@ -988,6 +1478,11 @@
                '(:content-type "image/png" :body-file "/tmp/demo.png"))
               'image)))
 
+(ert-deftest courier-auto-body-view-detects-document ()
+  (should (eq (courier--auto-body-view
+               '(:content-type "application/pdf" :body-file "/tmp/demo.pdf"))
+              'document)))
+
 (ert-deftest courier-format-body-base64-view ()
   (with-temp-buffer
     (setq-local courier--body-view 'base64)
@@ -1012,7 +1507,7 @@
     (courier-response-set-view 'raw)
     (should (eq courier--body-view 'raw))
     (should (eq courier--response-tab 'response))
-    (should (string-match-p "\\` Response  >>  •  200 OK  •  42ms  •  5B"
+    (should (string-match-p "\\` Response  >>  200 OK  •  42ms  •  5B"
                             (substring-no-properties header-line-format)))))
 
 (ert-deftest courier-response-header-line-uses-clutch-style-separator ()
@@ -1084,6 +1579,44 @@
                                 (buffer-string)))
         (should (string-match-p "/tmp/demo.png" (buffer-string)))))))
 
+(ert-deftest courier-response-open-body-opens-document-file ()
+  (let ((response '(:status-code 200
+                    :reason "OK"
+                    :headers (("content-type" . "application/pdf"))
+                    :duration-ms 10
+                    :size 12
+                    :body-file "/tmp/demo.pdf"
+                    :content-type "application/pdf"
+                    :tests nil
+                    :stderr ""
+                    :exit-code 0))
+        (opened nil)
+        (displayed nil)
+        (doc-view-called nil)
+        (viewer-buffer (generate-new-buffer " *courier-pdf-view*")))
+    (cl-letf (((symbol-function 'find-file-noselect)
+               (lambda (path &optional _nowarn _rawfile _wildcards)
+                 (setq opened path)
+                 viewer-buffer))
+              ((symbol-function 'display-buffer)
+               (lambda (buffer &rest _args)
+                 (setq displayed buffer)
+                 buffer))
+              ((symbol-function 'doc-view-mode)
+               (lambda (&optional _arg)
+                 (setq doc-view-called t)
+                 (setq major-mode 'doc-view-mode))))
+      (with-temp-buffer
+        (setq-local courier--response response)
+        (setq-local courier--request courier-test--request)
+        (courier-response-open-body))
+      (should (equal opened "/tmp/demo.pdf"))
+      (should (eq displayed viewer-buffer))
+      (should doc-view-called)
+      (should (eq (buffer-local-value 'major-mode viewer-buffer)
+                  'doc-view-mode)))
+    (kill-buffer viewer-buffer)))
+
 (ert-deftest courier-response-body-section-fontifies-html-view ()
   (with-temp-buffer
     (courier--render-response
@@ -1122,19 +1655,9 @@
      courier-test--request)
     (courier-response-set-tab 'tests)
     (should (eq courier--response-tab 'tests))
-    (should (string-match-p "\\` Tests(1)  >>  •  200 OK  •  10ms  •  12B"
+    (should (string-match-p "\\` Response  Tests(1)  >>  200 OK  •  10ms  •  12B"
                             (substring-no-properties header-line-format)))
     (should (string-match-p "status == 200" (buffer-string)))))
-
-(ert-deftest courier-response-next-tab-cycles ()
-  (with-temp-buffer
-    (courier--render-response
-     (courier-test--make-response 200)
-     courier-test--request)
-    (courier-response-next-tab)
-    (should (eq courier--response-tab 'headers))
-    (courier-response-prev-tab)
-    (should (eq courier--response-tab 'response))))
 
 (ert-deftest courier-response-tab-switch-resets-point-to-top ()
   (with-temp-buffer
@@ -1194,11 +1717,11 @@
      courier-test--request)
     (let ((line (substring-no-properties header-line-format)))
       (should (string-match-p
-               "\\` Response  >>  •  200 OK  •  42ms  •  5B"
+               "\\` Response  >>  200 OK  •  42ms  •  5B"
                line))
       (courier-response-set-tab 'headers)
       (should (string-match-p
-               "\\` Headers(1)  >>  •  200 OK  •  42ms  •  5B"
+               "\\` Response  Headers(1)  >>  200 OK  •  42ms  •  5B"
                (substring-no-properties header-line-format))))))
 
 (ert-deftest courier-response-buffer-does-not-render-top-navigation-row ()
@@ -1217,7 +1740,7 @@
      courier-test--request)
     (goto-char (point-min))
     (should-not (search-forward "Headers(1)" (line-end-position) t))
-    (should (string-match-p "\\` Response  >>  •  200 OK  •  10ms  •  12B"
+    (should (string-match-p "\\` Response  >>  200 OK  •  10ms  •  12B"
                             (substring-no-properties header-line-format)))))
 
 (ert-deftest courier-response-timeline-network-logs-switches-section ()
@@ -1297,7 +1820,7 @@
     (courier-response-set-tab 'timeline)
     (courier--select-history-index 0)
     (courier--toggle-timeline-section 'network-logs)
-    (should (string-match-p "\\` Timeline  >>  •  200 OK  •  42ms  •  5B"
+    (should (string-match-p "\\` Response  Timeline  >>  200 OK  •  42ms  •  5B"
                             (substring-no-properties header-line-format)))))
 
 (ert-deftest courier-response-timeline-response-view-shows-header-count ()
@@ -1737,7 +2260,8 @@
     (courier-request-jump-section 'auth)
     (let ((line (substring-no-properties
                  (courier--request-header-line-format))))
-      (should (string-match-p "Auth(Bearer)" line)))))
+      (should (string-match-p "Auth(Bearer)" line))
+      (should (string-match-p "Auth(Bearer)  >>" line)))))
 
 (ert-deftest courier-request-header-line-shows-none-auth-label ()
   (courier-test--with-request
@@ -1793,20 +2317,18 @@
 (ert-deftest courier-request-mode-binds-section-navigation ()
   (should (eq (lookup-key courier-request-mode-map (kbd "C-c C-j"))
               #'courier-request-jump-section))
-  (should (eq (lookup-key courier-request-mode-map (kbd "C-c ["))
-              #'courier-request-prev-section))
-  (should (eq (lookup-key courier-request-mode-map (kbd "C-c ]"))
-              #'courier-request-next-section)))
-
-(ert-deftest courier-response-mode-uses-bracket-view-navigation ()
-  (should (eq (lookup-key courier--response-mode-map (kbd "]"))
-              #'courier-response-next-tab))
-  (should (eq (lookup-key courier--response-mode-map (kbd "["))
-              #'courier-response-prev-tab)))
+  (should-not (lookup-key courier-request-mode-map (kbd "C-c [")))
+  (should-not (lookup-key courier-request-mode-map (kbd "C-c ]"))))
 
 (ert-deftest courier-response-mode-binds-jump-navigation ()
   (should (eq (lookup-key courier--response-mode-map (kbd "C-c C-j"))
-              #'courier-response-jump-tab)))
+              #'courier-response-jump-tab))
+  (should-not (courier-test--local-map-binding courier--response-mode-map "["))
+  (should-not (courier-test--local-map-binding courier--response-mode-map "]"))
+  (should-not (courier-test--local-map-binding courier--response-mode-map "r"))
+  (should-not (courier-test--local-map-binding courier--response-mode-map "h"))
+  (should-not (courier-test--local-map-binding courier--response-mode-map "l"))
+  (should-not (courier-test--local-map-binding courier--response-mode-map "t")))
 
 (ert-deftest courier-response-jump-tab-switches-view ()
   (with-temp-buffer
@@ -1816,27 +2338,19 @@
     (courier-response-jump-tab 'tests)
     (should (eq courier--response-tab 'tests))))
 
-(ert-deftest courier-request-jump-section-shows-post-response-script ()
+(ert-deftest courier-request-jump-section-shows-script-section ()
   (courier-test--with-request
       (courier-test--http-content
        :url "https://example.com/users"
+       :pre-request-script "courier-script-request"
        :post-response-script "courier-script-response")
     (courier-request-mode)
-    (courier-request-jump-section 'post-response)
-    (should (eq courier--request-tab 'post-response))
+    (courier-request-jump-section 'script)
+    (should (eq courier--request-tab 'script))
+    (should (string-match-p "pre_request = \\\"\\\"\\\"" (buffer-string)))
+    (should (string-match-p "courier-script-request" (buffer-string)))
+    (should (string-match-p "post_response = \\\"\\\"\\\"" (buffer-string)))
     (should (string-match-p "courier-script-response" (buffer-string)))))
-
-(ert-deftest courier-request-next-section-cycles-primary-sections ()
-  (courier-test--with-request
-      (concat "GET https://example.com/users\n"
-              "Accept: application/json\n"
-              "\n"
-              "{\"name\":\"Lucy\"}\n")
-    (courier-request-mode)
-    (should (eq courier--request-tab 'body))
-    (courier-request-next-section)
-    (should (eq courier--request-tab 'headers))
-    (should (string-match-p "^accept: application/json$" (downcase (buffer-string))))))
 
 (ert-deftest courier-request-jump-section-shows-request-section ()
   (courier-test--with-request
@@ -1845,6 +2359,55 @@
     (courier-request-jump-section 'params)
     (should (eq courier--request-tab 'params))
     (should (string-match-p "^page = 1$" (buffer-string)))))
+
+(ert-deftest courier-request-empty-sections-show-usable-placeholders ()
+  (courier-test--with-request
+      "GET https://example.com/users\n"
+    (courier-request-mode)
+    (courier-request-jump-section 'params)
+    (should (string-match-p "^# Query params$" (buffer-string)))
+    (should (string-match-p "^# include = profile,roles$" (buffer-string)))
+    (courier-request-jump-section 'vars)
+    (should (string-match-p "^# token = \"courier-pigeon-token\"$" (buffer-string)))
+    (should (string-match-p "^# name = \"session_token\"$" (buffer-string)))
+    (should (string-match-p "^# expr = \"\\$\\.data\\.token\"$" (buffer-string)))))
+
+(ert-deftest courier-request-render-establishes-content-start-marker ()
+  (courier-test--with-request
+      (courier-test--http-content
+       :url "https://example.com/users/42"
+       :headers '(("accept" . "application/json"))
+       :body-type 'json
+       :body "{\"name\":\"Lucy\"}\n")
+    (courier-request-mode)
+    (should (markerp courier--request-content-start))
+    (should (= (marker-position courier--request-content-start)
+               (save-excursion
+                 (goto-char (point-min))
+                 (forward-line 3)
+                 (point))))
+    (should (string-prefix-p "{\"name\":\"Lucy\"}"
+                             (buffer-substring-no-properties
+                              (marker-position courier--request-content-start)
+                              (point-max))))
+    (courier-request-jump-section 'headers)
+    (should (markerp courier--request-content-start))
+    (should (string-prefix-p "accept: application/json"
+                             (downcase
+                              (buffer-substring-no-properties
+                               (marker-position courier--request-content-start)
+                               (point-max)))))))
+
+(ert-deftest courier-request-vars-comments-use-comment-face ()
+  (courier-test--with-request
+      "GET https://example.com/users\n"
+    (courier-request-mode)
+    (courier-request-jump-section 'vars)
+    (font-lock-ensure)
+    (goto-char (point-min))
+    (search-forward "# [vars]" nil t)
+    (let ((face (get-text-property (line-beginning-position) 'face)))
+      (should (courier-test--face-includes-p face 'font-lock-comment-face)))))
 
 (ert-deftest courier-request-edit-params-loads-query-into-editor ()
   (courier-test--with-request
@@ -1932,6 +2495,70 @@
     (let ((line (substring-no-properties
                  (courier--request-header-line-format))))
       (should (string-match-p "Body(Form)" line)))))
+
+(ert-deftest courier-request-body-section-round-trips-binary-metadata ()
+  (courier-test--with-request
+      (courier-test--http-content
+       :method "POST"
+       :url "https://example.com/upload"
+       :body-type 'binary
+       :body-file-path "./payload.bin"
+       :body-file-content-type "application/octet-stream")
+    (courier-request-mode)
+    (courier-request-jump-section 'body)
+    (should (string-match-p "^path = \\./payload\\.bin$" (buffer-string)))
+    (should (string-match-p "^content_type = application/octet-stream$"
+                            (buffer-string)))
+    (courier--sync-request-model)
+    (should (eq (plist-get courier--request-model :body-type) 'binary))
+    (should (equal (plist-get courier--request-model :body-file-path)
+                   "./payload.bin"))
+    (should (equal (plist-get courier--request-model :body-file-content-type)
+                   "application/octet-stream"))))
+
+(ert-deftest courier-request-body-section-round-trips-multipart-parts ()
+  (courier-test--with-request
+      (courier-test--http-content
+       :method "POST"
+       :url "https://example.com/upload"
+       :body-type 'multipart
+       :body-parts '((:name "avatar"
+                             :kind file
+                             :path "./avatar.png"
+                             :content-type "image/png")
+                     (:name "display_name"
+                             :kind text
+                             :value "{{name}}")))
+    (courier-request-mode)
+    (courier-request-jump-section 'body)
+    (should (string-match-p "^name = avatar$" (buffer-string)))
+    (should (string-match-p "^kind = file$" (buffer-string)))
+    (should (string-match-p "^path = \\./avatar\\.png$" (buffer-string)))
+    (courier--sync-request-model)
+    (should (eq (plist-get courier--request-model :body-type) 'multipart))
+    (should (equal (plist-get courier--request-model :body-parts)
+                   '((:name "avatar"
+                            :kind file
+                            :path "./avatar.png"
+                            :content-type "image/png")
+                     (:name "display_name"
+                            :kind text
+                            :value "{{name}}"))))))
+
+(ert-deftest courier-request-script-section-round-trips-both-phases ()
+  (courier-test--with-request
+      (courier-test--http-content
+       :method "GET"
+       :url "https://example.com/users"
+       :pre-request-script "(message \"before\")"
+       :post-response-script "(message \"after\")")
+    (courier-request-mode)
+    (courier-request-jump-section 'script)
+    (courier--sync-request-model)
+    (should (equal (plist-get courier--request-model :pre-request-script)
+                   "(message \"before\")"))
+    (should (equal (plist-get courier--request-model :post-response-script)
+                   "(message \"after\")"))))
 
 (ert-deftest courier-request-set-auth-type-updates-request-model ()
   (courier-test--with-request
@@ -2208,7 +2835,327 @@
         (insert "{\n  \"name\": \"Wrong Home\"\n}\n"))
       (with-temp-buffer
         (setq default-directory root)
-        (should-not (courier--collection-root)))))) 
+        (should-not (courier--collection-root))))))
+
+(ert-deftest courier-import-openapi-json-creates-collection-and-copies-spec ()
+  (courier-test--with-temp-dir (root)
+    (let* ((courier-home-directory root)
+           (spec-file (expand-file-name "demo-openapi.json" root))
+           result)
+      (with-temp-file spec-file
+        (insert "{\n"
+                "  \"openapi\": \"3.0.0\",\n"
+                "  \"info\": {\"title\": \"Demo API\"},\n"
+                "  \"servers\": [{\"url\": \"https://api.example.com\"}],\n"
+                "  \"paths\": {}\n"
+                "}\n"))
+      (setq result (courier--import-openapi-file spec-file "demo-api"))
+      (should (file-directory-p (plist-get result :collection-root)))
+      (should (file-exists-p (plist-get result :spec-path)))
+      (should (equal (plist-get (courier--collection-config
+                                 (plist-get result :collection-root))
+                                :name)
+                     "Demo API"))
+      (should (equal (cdr (assoc-string "base_url"
+                                        (plist-get (plist-get (courier--collection-config
+                                                               (plist-get result :collection-root))
+                                                              :defaults)
+                                                   :vars)
+                                        nil))
+                     "https://api.example.com")))))
+
+(ert-deftest courier-import-openapi-json-generates-basic-request-file ()
+  (courier-test--with-temp-dir (root)
+    (let* ((courier-home-directory root)
+           (spec-file (expand-file-name "demo-openapi.json" root))
+           result
+           request-file
+           request)
+      (with-temp-file spec-file
+        (insert "{\n"
+                "  \"openapi\": \"3.0.0\",\n"
+                "  \"info\": {\"title\": \"Demo API\"},\n"
+                "  \"servers\": [{\"url\": \"https://api.example.com\"}],\n"
+                "  \"paths\": {\n"
+                "    \"/users/{userId}\": {\n"
+                "      \"get\": {\n"
+                "        \"summary\": \"Get User\"\n"
+                "      }\n"
+                "    }\n"
+                "  }\n"
+                "}\n"))
+      (setq result (courier--import-openapi-file spec-file "demo-api"))
+      (setq request-file
+            (expand-file-name "requests/users/get-user.http"
+                              (plist-get result :collection-root)))
+      (should (file-exists-p request-file))
+      (setq request (courier-parse-file request-file))
+      (should (equal (plist-get request :name) "Get User"))
+      (should (equal (plist-get request :method) "GET"))
+      (should (equal (plist-get request :url) "{{base_url}}/users/{{userId}}")))))
+
+(ert-deftest courier-import-openapi-json-maps-api-key-and-json-body ()
+  (courier-test--with-temp-dir (root)
+    (let* ((courier-home-directory root)
+           (spec-file (expand-file-name "demo-openapi.json" root))
+           result
+           request-file
+           request)
+      (with-temp-file spec-file
+        (insert "{\n"
+                "  \"openapi\": \"3.0.0\",\n"
+                "  \"info\": {\"title\": \"Demo API\"},\n"
+                "  \"servers\": [{\"url\": \"https://api.example.com\"}],\n"
+                "  \"components\": {\n"
+                "    \"securitySchemes\": {\n"
+                "      \"ApiKeyAuth\": {\n"
+                "        \"type\": \"apiKey\",\n"
+                "        \"in\": \"header\",\n"
+                "        \"name\": \"X-API-Key\"\n"
+                "      }\n"
+                "    }\n"
+                "  },\n"
+                "  \"paths\": {\n"
+                "    \"/users\": {\n"
+                "      \"post\": {\n"
+                "        \"summary\": \"Create User\",\n"
+                "        \"security\": [{\"ApiKeyAuth\": []}],\n"
+                "        \"requestBody\": {\n"
+                "          \"content\": {\n"
+                "            \"application/json\": {}\n"
+                "          }\n"
+                "        }\n"
+                "      }\n"
+                "    }\n"
+                "  }\n"
+                "}\n"))
+      (setq result (courier--import-openapi-file spec-file "demo-api"))
+      (setq request-file
+            (expand-file-name "requests/users/create-user.http"
+                              (plist-get result :collection-root)))
+      (should (file-exists-p request-file))
+      (setq request (courier-parse-file request-file))
+      (should (eq (plist-get request :body-type) 'json))
+      (should (equal (plist-get request :auth)
+                     '(:type api_key
+                       :in "header"
+                       :name "X-API-Key"
+                       :value "{{x_api_key}}"))))))
+
+(ert-deftest courier-import-openapi-json-writes-report-for-unsupported-auth ()
+  (courier-test--with-temp-dir (root)
+    (let* ((courier-home-directory root)
+           (spec-file (expand-file-name "demo-openapi.json" root))
+           result
+           report-path)
+      (with-temp-file spec-file
+        (insert "{\n"
+                "  \"openapi\": \"3.0.0\",\n"
+                "  \"info\": {\"title\": \"Demo API\"},\n"
+                "  \"servers\": [{\"url\": \"https://api.example.com\"}],\n"
+                "  \"components\": {\n"
+                "    \"securitySchemes\": {\n"
+                "      \"DigestAuth\": {\n"
+                "        \"type\": \"http\",\n"
+                "        \"scheme\": \"digest\"\n"
+                "      }\n"
+                "    }\n"
+                "  },\n"
+                "  \"paths\": {\n"
+                "    \"/users\": {\n"
+                "      \"get\": {\n"
+                "        \"summary\": \"List Users\",\n"
+                "        \"security\": [{\"DigestAuth\": []}]\n"
+                "      }\n"
+                "    }\n"
+                "  }\n"
+                "}\n"))
+      (setq result (courier--import-openapi-file spec-file "demo-api"))
+      (setq report-path (plist-get result :report-path))
+      (should (file-exists-p report-path))
+      (with-temp-buffer
+        (insert-file-contents report-path)
+        (should (string-match-p "Unsupported auth scheme" (buffer-string)))
+        (should (string-match-p "GET /users" (buffer-string)))))))
+
+(ert-deftest courier-import-openapi-yaml-creates-collection-and-preserves-extension ()
+  (skip-unless (executable-find "ruby"))
+  (courier-test--with-temp-dir (root)
+    (let* ((courier-home-directory root)
+           (spec-file (expand-file-name "demo-openapi.yaml" root))
+           result
+           request-file
+           request)
+      (with-temp-file spec-file
+        (insert "openapi: 3.0.0\n"
+                "info:\n"
+                "  title: Demo YAML API\n"
+                "servers:\n"
+                "  - url: https://api.example.com\n"
+                "paths:\n"
+                "  /users/{userId}:\n"
+                "    get:\n"
+                "      summary: Get User\n"))
+      (setq result (courier--import-openapi-file spec-file "demo-yaml-api"))
+      (should (string-suffix-p "openapi.yaml" (plist-get result :spec-path)))
+      (setq request-file
+            (expand-file-name "requests/users/get-user.http"
+                              (plist-get result :collection-root)))
+      (should (file-exists-p request-file))
+      (setq request (courier-parse-file request-file))
+      (should (equal (plist-get request :name) "Get User"))
+      (should (equal (plist-get request :url) "{{base_url}}/users/{{userId}}")))))
+
+(ert-deftest courier-collection-root-prefers-top-level-home-collection ()
+  (courier-test--with-temp-dir (root)
+    (let* ((courier-home-directory root)
+           (collection-root (expand-file-name "collections/api-collection" root))
+           (nested-dir (expand-file-name "requests/admin" collection-root))
+           (request-file (expand-file-name "get-user.http" nested-dir)))
+      (make-directory nested-dir t)
+      (with-temp-file (expand-file-name "courier.json" collection-root)
+        (insert "{\n  \"name\": \"API Collection\"\n}\n"))
+      (with-temp-file (expand-file-name "courier.json" nested-dir)
+        (insert "{\n  \"defaults\": {\n    \"timeout\": 12\n  }\n}\n"))
+      (with-temp-file request-file
+        (insert "GET https://example.com/users/42\n"))
+      (with-temp-buffer
+        (setq-local buffer-file-name request-file)
+        (setq-local default-directory nested-dir)
+        (should (equal (file-name-as-directory collection-root)
+                       (courier--collection-root)))))))
+
+(ert-deftest courier-prepared-current-request-inherits-collection-defaults ()
+  (courier-test--with-temp-dir (root)
+    (let* ((courier-home-directory root)
+           (collection-root (expand-file-name "collections/api-collection" root))
+           (request-dir (expand-file-name "requests/users" collection-root))
+           (request-file (expand-file-name "get-user.http" request-dir))
+           buffer)
+      (make-directory request-dir t)
+      (with-temp-file (expand-file-name "courier.json" collection-root)
+        (insert "{\n"
+                "  \"name\": \"API Collection\",\n"
+                "  \"defaults\": {\n"
+                "    \"vars\": {\"base_url\": \"https://api.example.com\", \"token\": \"root-token\"},\n"
+                "    \"headers\": {\"accept\": \"application/json\"},\n"
+                "    \"auth\": {\"type\": \"bearer\", \"token\": \"{{token}}\"},\n"
+                "    \"timeout\": 15,\n"
+                "    \"follow_redirects\": true\n"
+                "  }\n"
+                "}\n"))
+      (with-temp-file request-file
+        (insert "GET {{base_url}}/users/42\n"))
+      (setq buffer (find-file-noselect request-file))
+      (unwind-protect
+          (with-current-buffer buffer
+            (courier-request-mode)
+            (let ((request (courier--prepared-current-request)))
+              (should (equal (plist-get request :vars)
+                             '(("base_url" . "https://api.example.com")
+                               ("token" . "root-token"))))
+              (should (equal (plist-get request :headers)
+                             '(("accept" . "application/json"))))
+              (should (equal (plist-get request :auth)
+                             '(:type bearer :token "{{token}}")))
+              (should (equal (plist-get request :settings)
+                             '(:timeout 15 :follow-redirects t)))))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
+
+(ert-deftest courier-prepared-current-request-folder-defaults-override-collection ()
+  (courier-test--with-temp-dir (root)
+    (let* ((courier-home-directory root)
+           (collection-root (expand-file-name "collections/api-collection" root))
+           (request-dir (expand-file-name "requests/admin/tools" collection-root))
+           (request-file (expand-file-name "get-user.http" request-dir))
+           (folder-config (expand-file-name "courier.json"
+                                            (expand-file-name "requests/admin" collection-root)))
+           buffer)
+      (make-directory request-dir t)
+      (with-temp-file (expand-file-name "courier.json" collection-root)
+        (insert "{\n"
+                "  \"defaults\": {\n"
+                "    \"vars\": {\"token\": \"root-token\", \"base_url\": \"https://api.example.com\"},\n"
+                "    \"headers\": {\"accept\": \"application/json\", \"x-root\": \"1\"},\n"
+                "    \"auth\": {\"type\": \"bearer\", \"token\": \"{{token}}\"},\n"
+                "    \"timeout\": 15\n"
+                "  }\n"
+                "}\n"))
+      (with-temp-file folder-config
+        (insert "{\n"
+                "  \"defaults\": {\n"
+                "    \"vars\": {\"token\": \"folder-token\"},\n"
+                "    \"headers\": {\"accept\": \"application/xml\", \"x-folder\": \"1\"},\n"
+                "    \"auth\": {\"type\": \"header\", \"header\": \"X-Admin-Key\", \"value\": \"{{token}}\"},\n"
+                "    \"timeout\": 20,\n"
+                "    \"follow_redirects\": true\n"
+                "  }\n"
+                "}\n"))
+      (with-temp-file request-file
+        (insert "+++\n"
+                "timeout = 25\n"
+                "[vars]\n"
+                "token = \"request-token\"\n"
+                "+++\n\n"
+                "GET {{base_url}}/users/42\n"
+                "Accept: text/plain\n"))
+      (setq buffer (find-file-noselect request-file))
+      (unwind-protect
+          (with-current-buffer buffer
+            (courier-request-mode)
+            (let ((request (courier--prepared-current-request)))
+              (should (equal (cdr (assoc-string "base_url"
+                                                (plist-get request :vars)
+                                                nil))
+                             "https://api.example.com"))
+              (should (equal (cdr (assoc-string "token"
+                                                (plist-get request :vars)
+                                                nil))
+                             "request-token"))
+              (should (equal (plist-get request :headers)
+                             '(("accept" . "text/plain")
+                               ("x-root" . "1")
+                               ("x-folder" . "1"))))
+              (should (equal (plist-get request :auth)
+                             '(:type header :header "X-Admin-Key" :value "{{token}}")))
+              (should (equal (plist-get request :settings)
+                             '(:timeout 25 :follow-redirects t)))))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
+
+(ert-deftest courier-prepared-current-request-explicit-none-auth-beats-defaults ()
+  (courier-test--with-temp-dir (root)
+    (let* ((courier-home-directory root)
+           (collection-root (expand-file-name "collections/api-collection" root))
+           (request-dir (expand-file-name "requests/users" collection-root))
+           (request-file (expand-file-name "get-user.http" request-dir))
+           buffer)
+      (make-directory request-dir t)
+      (with-temp-file (expand-file-name "courier.json" collection-root)
+        (insert "{\n"
+                "  \"defaults\": {\n"
+                "    \"auth\": {\"type\": \"bearer\", \"token\": \"{{token}}\"}\n"
+                "  }\n"
+                "}\n"))
+      (with-temp-file request-file
+        (insert "+++\n"
+                "[auth]\n"
+                "type = \"none\"\n"
+                "+++\n\n"
+                "GET https://example.com/users/42\n"))
+      (setq buffer (find-file-noselect request-file))
+      (unwind-protect
+          (with-current-buffer buffer
+            (courier-request-mode)
+            (let* ((request (courier--prepared-current-request))
+                   (resolved (courier-resolve-request request nil)))
+              (should (equal (plist-get request :auth) '(:type none)))
+              (should-not (assoc-string "authorization"
+                                        (plist-get resolved :headers)
+                                        nil))))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
 
 (ert-deftest courier-new-request-creates-untitled-draft ()
   (let ((courier--untitled-request-counter 0)

@@ -1,7 +1,6 @@
 # Courier `.http` Format v1
 
-This document defines the proposed next-generation Courier request-file format.
-It is a design target, not a description of the current implementation.
+This document defines the current Courier request-file format.
 
 ## Goals
 
@@ -143,7 +142,7 @@ name = "Create User"
 ```
 
 - Optional string
-- Used for display, overview, and file creation defaults
+- Used for display and file creation defaults
 
 ### `timeout`
 
@@ -178,6 +177,8 @@ Allowed values in v1:
 - `xml`
 - `text`
 - `form-urlencoded`
+- `multipart`
+- `binary`
 
 Rules:
 
@@ -187,12 +188,55 @@ Rules:
 - `form-urlencoded` still stores its source of truth in the HTTP body block;
   Courier may offer a structured editor, but saving must write back to the same
   body block
+- `multipart` stores its source of truth in repeated `[[body.parts]]` tables
+- `binary` stores its source of truth in `[body].path` and optional
+  `[body].content_type`
 - Courier may add a default `Content-Type` at send time when the request does
   not declare one explicitly:
   - `json` -> `application/json`
   - `xml` -> `application/xml`
   - `text` -> `text/plain; charset=utf-8`
   - `form-urlencoded` -> `application/x-www-form-urlencoded`
+
+Multipart body:
+
+```toml
+[body]
+type = "multipart"
+
+[[body.parts]]
+name = "avatar"
+kind = "file"
+path = "./avatar.png"
+content_type = "image/png"
+
+[[body.parts]]
+name = "display_name"
+kind = "text"
+value = "Lucy"
+```
+
+Rules:
+
+- every part requires `name`
+- `kind` must be `text` or `file`
+- `text` parts require `value`
+- `file` parts require `path`
+- `content_type` is optional
+
+Binary body:
+
+```toml
+[body]
+type = "binary"
+path = "./payload.bin"
+content_type = "application/octet-stream"
+```
+
+Rules:
+
+- `path` is required
+- `content_type` is optional
 
 ### `[auth]`
 
@@ -222,11 +266,51 @@ header = "X-API-Key"
 value = "{{token}}"
 ```
 
+API key auth:
+
+```toml
+[auth]
+type = "api_key"
+in = "header"
+name = "x-api-key"
+value = "{{api_key}}"
+```
+
+OAuth2 auth:
+
+```toml
+[auth]
+type = "oauth2"
+grant_type = "client_credentials"
+token_url = "https://example.com/oauth/token"
+client_id = "{{client_id}}"
+client_secret = "{{client_secret}}"
+scopes = ["read", "write"]
+```
+
 Rules:
 
 - `type` is required when `[auth]` exists
-- allowed values: `bearer`, `basic`, `header`
+- allowed values: `none`, `bearer`, `basic`, `header`, `api_key`, `oauth2`
 - invalid auth tables are parse errors
+- `api_key` requires:
+  - `in = "header"` or `in = "query"`
+  - `name`
+  - `value`
+- `oauth2` currently supports only:
+  - `grant_type = "client_credentials"`
+  - `token_url`
+  - `client_id`
+  - `client_secret`
+  - optional `scopes`
+- `oauth2 client_credentials` has real send-time semantics:
+  - Courier first sends a token request to `token_url`
+  - the token request uses `POST` and `application/x-www-form-urlencoded`
+  - `grant_type`, `client_id`, `client_secret`, and optional `scope` are
+    encoded in the token request body
+  - Courier extracts `access_token` from the JSON response body
+  - Courier injects `Authorization: Bearer <access_token>` into the main
+    request unless that header was already set explicitly
 
 ### `[vars]`
 
@@ -321,9 +405,8 @@ This format is designed so request-side views map directly to one source block:
 - `Params` view -> parsed URL query, saved back into URL
 - `Auth` view -> `[auth]`
 - `Vars` view -> `[vars]`
+- `Script` view -> `[scripts]`
 - `Tests` view -> `tests`
-- `Pre-request` view -> `[scripts].pre_request`
-- `Post-response` view -> `[scripts].post_response`
 
 Missing sections are empty states, not errors.
 

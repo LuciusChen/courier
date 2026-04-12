@@ -18,6 +18,7 @@ buffers.
 - Start unsaved request drafts and place them into a collection on first save
 - Jump between requests and environments with =C-c C-o= from one annotated
   minibuffer picker, even outside an active Courier buffer
+- Import OpenAPI JSON or YAML into Courier collections with =M-x courier-import-openapi=
 - Open a context-aware action menu with =C-c ?=
 
 * Requirements
@@ -86,10 +87,65 @@ Minimal =courier.json= example:
 #+begin_src json
 {
   "name": "My API",
+  "requestsDir": "requests",
   "envDir": "env",
-  "defaultEnv": "local"
+  "defaultEnv": "local",
+  "defaults": {
+    "vars": {
+      "base_url": "https://api.example.com"
+    },
+    "headers": {
+      "accept": "application/json"
+    },
+    "auth": {
+      "type": "bearer",
+      "token": "{{token}}"
+    },
+    "timeout": 30,
+    "follow_redirects": true
+  }
 }
 #+end_src
+
+Collection defaults are merged at request preparation time. Requests may also
+declare nested =courier.json= files under =requests/= to provide folder-level
+defaults. Merge order is:
+
+- collection root defaults
+- nested folder defaults
+- request front matter
+
+Within that merge:
+
+- request vars override folder and collection vars
+- explicit request headers override inherited headers
+- explicit request auth overrides inherited auth
+- request settings such as =timeout= override inherited settings
+
+* OpenAPI Import
+
+Courier can import OpenAPI JSON or YAML into its own collection format:
+
+- copied specs are stored under =courier-home-directory/specs/<collection>/=
+- generated requests are stored under =courier-home-directory/collections/<collection>/requests/=
+- the first server URL becomes collection default =base_url=
+- path and method become Courier request files
+- supported auth and body metadata are mapped into Courier front matter
+
+Current scope:
+
+- input: JSON and YAML
+- auth mapping: =http bearer=, =http basic=, =apiKey=, and basic
+  =oauth2 clientCredentials=
+- body mapping: =application/json=, =application/xml=, =text/*=,
+  =application/x-www-form-urlencoded=, =multipart/form-data=, and
+  =application/octet-stream=
+
+YAML import uses system Ruby with stdlib =psych= to normalize the spec into the
+existing JSON import path.
+
+Unsupported auth/body mappings are written to an import report under
+=courier-home-directory/specs/<collection>/import-report.org=.
 
 * File Format
 
@@ -171,6 +227,8 @@ Supported types:
 - =xml=
 - =text=
 - =form-urlencoded=
+- =multipart=
+- =binary=
 - =none=
 
 Example:
@@ -194,6 +252,9 @@ Send-time behavior:
 - =text= adds =Content-Type: text/plain; charset=utf-8= when missing
 - =form-urlencoded= URL-encodes the body and adds
   =Content-Type: application/x-www-form-urlencoded= when missing
+- =multipart= sends repeated =curl -F= parts derived from =[[body.parts]]=
+- =binary= sends =--data-binary @path= and uses =[body].content_type= as the
+  default content type when present and no explicit =Content-Type= header exists
 - =none= requires an empty body and sends no request body
 
 Use =M-x courier-request-set-body-type= or =C-c ?= in a request buffer to set
@@ -202,21 +263,31 @@ the header line as =Body(JSON)=, =Body(XML)=, and so on.
 
 ** Auth
 
-=[auth]= currently supports three forms:
+=[auth]= currently supports these runtime forms:
 
 - bearer
 - basic
 - header
+- api_key
+- oauth2
 
 Courier resolves auth values through the same variable expansion path as the
 rest of the request. If an explicit header with the same name already exists in
 the request, that explicit header wins.
 
 Use =M-x courier-request-set-auth-type= or =C-c ?= in a request buffer to set
-the auth type. Courier supports =none=, =bearer=, =basic=, and =header= in the
-editor. In the request section view, the active auth type is shown in the
-header line as =Auth(None)=, =Auth(Bearer)=, =Auth(Basic)=, or
-=Auth(Header)=.
+the auth type. The editor currently recognizes =none=, =bearer=, =basic=,
+=header=, =api_key=, and =oauth2=. In the request section view, the active
+auth type is shown in the header line as =Auth(None)=, =Auth(Bearer)=,
+=Auth(Basic)=, =Auth(Header)=, =Auth(API Key)=, or =Auth(OAuth2)=.
+
+=api_key= already works at send time in both =header= and =query= modes.
+=oauth2= now works at send time for =grant_type = "client_credentials"=. Courier
+first requests an access token from =token_url= using
+=application/x-www-form-urlencoded=, then injects
+=Authorization: Bearer <access_token>= into the main request. Missing tokens or
+token endpoint failures surface as =OAuth2 Token Error= responses rather than
+falling back silently.
 
 ** Scripts
 
@@ -293,8 +364,6 @@ token=abc123
 | =C-c C-c= | =courier-request-send=         | Send request           |
 | =C-c C-e= | =courier-request-switch-env=   | Switch environment     |
 | =C-c C-j= | =courier-request-jump-section= | Jump to request section |
-| =C-c [=   | =courier-request-prev-section= | Previous main section  |
-| =C-c ]=   | =courier-request-next-section= | Next main section      |
 | =C-c C-m= | =courier-request-set-method=   | Change HTTP method     |
 | =C-c C-n= | =courier-new-request=          | Create request draft   |
 | =C-c C-p= | =courier-request-preview=      | Preview resolved form  |
@@ -322,9 +391,8 @@ The request buffer uses a section view model with a navigation header line:
 Params  Body  Headers  >>
 #+end_example
 
-Use =C-c [= and =C-c ]= to switch the main request sections rendered below the
-divider, or =C-c C-j= to jump to any section, including =Auth=, =Vars=,
-=Tests=, =Pre-request=, and =Post-response=. The request line stays fixed as
+Use =C-c C-j= to jump to any section, including =Params=, =Body=, =Headers=,
+=Auth=, =Vars=, =Script=, and =Tests=. The request line stays fixed as
 the request identity block; the area below it is the active section view, not a
 jump target into raw source text, and the current section is indicated in the
 =header-line= rather than repeated as a second in-buffer title.
@@ -359,27 +427,23 @@ Request and folder management stay file-based. Courier renames and moves normal
 | =TAB=     | =courier-response-context-tab=     | Expand entry or move to next button |
 | =RET=     | =courier-response-activate=        | Activate timeline item or open body |
 | =C-c ?=   | =courier-dispatch=                 | Show response actions      |
-| =h=       | inline view switch                 | Show Headers tab          |
-| =l=       | inline view switch                 | Show Timeline tab         |
 | =o=       | =courier-response-open-body=       | Open body viewer          |
 | =g=       | =courier-response-retry=           | Resend request            |
-| =]=       | =courier-response-next-tab=        | Next response tab         |
-| =[=       | =courier-response-prev-tab=        | Previous response tab     |
-| =r=       | inline view switch                 | Show Response tab         |
-| =t=       | inline view switch                 | Show Tests tab            |
+| =C-c C-j= | =courier-response-jump-tab=        | Jump to response view     |
 | =v=       | =courier-response-set-view=        | Select body view          |
 | =V=       | =courier-response-toggle-pretty=   | Toggle raw/auto body view |
 | =C-c C-k= | =courier-response-cancel=          | Cancel request            |
 
 Body views currently include =auto=, =json=, =html=, =xml=, =javascript=,
-=raw=, =hex=, =base64=, and =image=. Use =RET= or =o= to open the current body
-in a dedicated viewer buffer; text-like views use an appropriate major mode,
-and image views display the image when Emacs can render it. The main response
-buffer also applies syntax highlighting to =json=, =html=, =xml=, and
-=javascript= body views. The active top-level response view is shown in the
-=header-line= as =Response >>=, =Headers >>=, =Timeline >>=, or =Tests >>=;
-use =[= and =]= to cycle views, =C-c C-j= to jump directly to a response view,
-or the direct keys =r=, =h=, =l=, and =t=.
+=raw=, =hex=, =base64=, =image=, and =document=. Use =RET= or =o= to open the
+current body in a dedicated viewer buffer; text-like views use an appropriate
+major mode, image views display the image when Emacs can render it, and PDF
+documents open as file-backed viewers with =doc-view-mode= when available. The
+main response buffer also applies syntax highlighting to =json=, =html=,
+=xml=, and =javascript= body views. The =header-line= keeps =Response= as the
+anchor view label; when =Headers=, =Timeline=, or =Tests= is active, that view
+is inserted before =>>=, followed by the status summary. Use =C-c C-j= to jump
+directly to a response view.
 Use =C-c ?= in request and response buffers to open a transient menu for the
 actions that make sense in the current Courier context.
 
@@ -406,9 +470,9 @@ The response buffer has four top-level views:
   expanded view.
 - *Tests* shows pass/fail indicators for all request =tests=.
 
-The header line shows the current response view first, then status, duration,
-and size; when visiting an older timeline entry it also shows the history
-position (for example =2/5=).
+The header line shows =Response= first, then the current secondary response
+view when applicable, then status, duration, and size; when visiting an older
+timeline entry it also shows the history position (for example =2/5=).
 
 * Customization
 

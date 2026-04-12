@@ -81,6 +81,9 @@ live under a dedicated `collections/` directory inside that home:
   state/
 ```
 
+`specs/` stores imported API specifications. The current importer target is
+OpenAPI JSON or YAML; imported specs are copied into `specs/<collection>/`.
+
 ### Required Rules
 
 - Courier home is not itself a collection.
@@ -91,17 +94,55 @@ live under a dedicated `collections/` directory inside that home:
 - Directories under `requests/` are just directories.
 - Requests are still plain `.http` files with the existing Courier syntax.
 
-### `courier.json` v0.1
+### `courier.json`
 
-The first version of `courier.json` stays intentionally small:
+`courier.json` still marks the collection root, but it also carries shared
+defaults:
 
 - `name`
 - `requestsDir`
 - `envDir`
 - `defaultEnv`
+- `defaults.vars`
+- `defaults.headers`
+- `defaults.auth`
+- `defaults.timeout`
+- `defaults.follow_redirects`
 
-This file defines collection boundaries and a few defaults. It is not the main
-data store for requests.
+Collection roots may also contain nested `courier.json` files under
+`requests/`. Those nested files are folder defaults, not new collection roots.
+
+Merge order:
+
+- collection root defaults
+- nested folder defaults
+- request front matter
+
+This keeps requests as the primary data store while still allowing shared
+configuration without Org-style inheritance.
+
+## Import Scope
+
+Current importer targets:
+
+- OpenAPI JSON
+- OpenAPI YAML
+
+OpenAPI import rules:
+
+- copy the source spec into `~/courier/specs/<collection>/openapi.<ext>`
+- generate Courier requests under the target collection
+- map `servers[0].url` to collection default `base_url`
+- map path + method to request files and URLs
+- map supported auth schemes: bearer, basic, apiKey, and basic oauth2
+  client-credentials
+- map supported body types: json, xml, text, form-urlencoded, multipart, and
+  binary
+- write unsupported mappings to `specs/<collection>/import-report.org`
+- YAML import is normalized through system Ruby/Psych and then handled by the
+  same internal OpenAPI importer
+
+Tool-specific importers remain intentionally deferred.
 
 ## Request Model
 
@@ -125,7 +166,7 @@ request file; Courier should not invent hidden UI-only state for scripts.
 
 ### Request Format
 
-The request-file format is defined in [HTTP-FORMAT-V1.md](./HTTP-FORMAT-V1.md):
+The request-file format is defined in [docs/http-format-v1.md](./docs/http-format-v1.md):
 
 - keep `.http` as the extension
 - move Courier metadata into TOML front matter
@@ -228,11 +269,10 @@ manager. It is a source of variable values for request resolution.
 ### 4. Send and inspect response
 
 - user sends request
-- response buffer centers on one response at a time, with the active view shown
-  in the header line as `Response >>`, `Headers >>`, `Timeline >>`, or `Tests >>`
-  before the status summary
-- user changes response view as needed, either linearly with `[` / `]` or
-  directly through a jump command
+- response buffer centers on one response at a time, with `Response` kept as
+  the anchor label in the header line; when `Headers`, `Timeline`, or `Tests`
+  is active, that view is shown before `>>`, followed by the status summary
+- user changes response view as needed through a jump command
 - response history remains available for the same request
 - `C-c ?` opens a context-aware action menu in request and response buffers
 
@@ -251,7 +291,9 @@ manager. It is a source of variable values for request resolution.
   automatically unless the user already typed it
 - the request is then saved into that collection's `requestsDir`
 - request editing stays text-first; the buffer shows
-  `Params  Body  Headers  >>` as the current request view indicator, while
+  `Params  Body  Headers  >>` as the current request view indicator; when a
+  secondary section such as `Auth`, `Vars`, `Script`, or `Tests` is active, it
+  is shown before `>>`, while
   `C-c C-j` switches to any request section
 - transient remains for actions such as send, preview, save, and env
   switching, not for primary content editing
@@ -259,13 +301,17 @@ manager. It is a source of variable values for request resolution.
   key/value editor; once edited structurally, Courier normalizes them into
   request params instead of keeping a duplicated URL-query truth
 - request body handling is type-aware rather than implicit:
-  - `json`, `xml`, `text`, `form-urlencoded`, and `none` are first-class
+  - `json`, `xml`, `text`, `form-urlencoded`, `multipart`, `binary`, and
+    `none` are first-class runtime types
   - the body type is stored in front matter and applied during request
     resolution
   - missing body-type-specific `Content-Type` headers are filled in only when
     the request did not already declare one
 - request auth handling is also type-aware:
-  - `none`, `bearer`, `basic`, and `header` are first-class
+  - `none`, `bearer`, `basic`, `header`, `api_key`, and `oauth2` are already first-class
+    runtime types
+  - `oauth2` currently means `client_credentials` and performs a token fetch
+    before the main request
   - the auth type remains stored in front matter
   - the request editor exposes auth type as an explicit setting instead of
     making users infer it from free-form text
@@ -363,6 +409,7 @@ Deliver:
   - `hex`
   - `base64`
   - `image`
+  - `document`
 
 Acceptance:
 
@@ -375,11 +422,12 @@ Deliver:
 
 - cleaner header line
 - a header-line current-view indicator for Response, Headers, Timeline, and Tests,
-  switched with `[` and `]`
+  switched through a jump command
 - a collapsed-by-default Timeline history list
 - expandable Timeline detail sections for Request, Response, and Network Logs
 - syntax highlighting through suitable major modes
 - image rendering support
+- PDF/document body support
 - better body viewer behavior
 
 Acceptance:
