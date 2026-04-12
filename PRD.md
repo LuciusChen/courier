@@ -30,7 +30,6 @@ live inside a Git repository, but the Courier concept itself is `collection`.
 
 - Keep requests as normal files that Git can diff, move, rename, and review.
 - Make switching between requests and environments fast from the keyboard.
-- Provide an Emacs-native collection overview rather than a web-style sidebar.
 - Make response inspection significantly better than the current raw/pretty
   split by adding proper response views and richer rendering.
 - Keep the architecture light enough that the codebase stays understandable and
@@ -60,25 +59,32 @@ live inside a Git repository, but the Courier concept itself is `collection`.
 
 ## Collection Model
 
-A collection is a root directory with a root marker file:
+Courier has a home directory for package-managed persisted content. Collections
+live under a dedicated `collections/` directory inside that home:
 
 ```text
-my-api/
-  courier.json
-  requests/
-    users/
-      get-user.http
-      create-user.http
-    admin/
-      delete-user.http
-  env/
-    local.env
-    staging.env
-    prod.env
+~/courier/
+  collections/
+    my-api/
+      courier.json
+      requests/
+        users/
+          get-user.http
+          create-user.http
+        admin/
+          delete-user.http
+      env/
+        local.env
+        staging.env
+        prod.env
+  specs/
+  state/
 ```
 
 ### Required Rules
 
+- Courier home is not itself a collection.
+- `collections/` stores collection roots.
 - `courier.json` marks the collection root.
 - `requests/` contains `.http` files.
 - `env/` contains environment files.
@@ -158,9 +164,9 @@ manager. It is a source of variable values for request resolution.
 
 - Use `completing-read` for selection flows.
 - Use normal editing buffers for request files.
-- Use `special-mode` for read-only overviews and inspectors.
+- Use `special-mode` for read-only inspectors.
 - Use one-command keyboard flows rather than UI panels.
-- Prefer overview buffers and pickers over popup widget systems.
+- Prefer minibuffer pickers over popup widget systems.
 - Use text properties and standard Emacs affordances before inventing custom UI
   layers.
 
@@ -205,8 +211,13 @@ manager. It is a source of variable values for request resolution.
 
 - user invokes one jump command
 - minibuffer shows grouped candidates
+- request candidates keep the file-derived label as the primary text and carry
+  collection names as annotations
 - request candidates open files
-- environment candidates switch env
+- environment candidates switch env, but only when invoked from a request buffer
+- environment candidates keep the env name as the primary text and move
+  collection/path context into annotations
+- request candidates are derived from filesystem paths, not parsed request contents
 
 ### 3. Edit method quickly
 
@@ -220,9 +231,10 @@ manager. It is a source of variable values for request resolution.
 - response buffer centers on one response at a time, with the active view shown
   in the header line as `Response >>`, `Headers >>`, `Timeline >>`, or `Tests >>`
   before the status summary
-- user changes response view as needed
+- user changes response view as needed, either linearly with `[` / `]` or
+  directly through a jump command
 - response history remains available for the same request
-- `C-c ?` opens a context-aware action menu in request, response, and overview buffers
+- `C-c ?` opens a context-aware action menu in request and response buffers
 
 ### 5. Create a new request
 
@@ -231,23 +243,25 @@ manager. It is a source of variable values for request resolution.
 - the draft request line uses a configurable default method, with `GET` as the default
 - the draft name remains metadata and buffer identity; the editor body starts
   at the request line instead of showing the name as editable first-line content
-- on first save, Courier asks which collection should own the request, defaulting
-  to a `courier/` directory under the current user's home directory unless the
-  user customizes the default collection directory
-- if the target directory is not a collection, Courier offers to create one
+- on first save, Courier asks which collection should own the request
+- Courier stores and discovers collections under `courier-home-directory/collections/`
+- if the chosen collection name does not exist yet, Courier creates it under
+  that home-managed collections directory
+- Courier then asks for the request filename explicitly and appends `.http`
+  automatically unless the user already typed it
 - the request is then saved into that collection's `requestsDir`
 - request editing stays text-first; the buffer shows
   `Params  Body  Headers  >>` as the current request view indicator, while
   `C-c C-j` switches to any request section
-- transient remains for actions such as send, preview, save, env switching, and
-  export, not for primary content editing
+- transient remains for actions such as send, preview, save, and env
+  switching, not for primary content editing
 - query params may be edited either directly in the URL or through a dedicated
   key/value editor; once edited structurally, Courier normalizes them into
   request params instead of keeping a duplicated URL-query truth
 - request body handling is type-aware rather than implicit:
   - `json`, `xml`, `text`, `form-urlencoded`, and `none` are first-class
   - the body type is stored in front matter and applied during request
-    resolution and export
+    resolution
   - missing body-type-specific `Content-Type` headers are filled in only when
     the request did not already declare one
 - request auth handling is also type-aware:
@@ -255,12 +269,6 @@ manager. It is a source of variable values for request resolution.
   - the auth type remains stored in front matter
   - the request editor exposes auth type as an explicit setting instead of
     making users infer it from free-form text
-
-### 6. Work from overview
-
-- user opens collection overview
-- overview lists requests in an Emacs-native format
-- user opens, previews, sends, filters, and switches env from there
 
 ## Current Baseline
 
@@ -274,7 +282,6 @@ The current baseline already includes:
 - response history for repeated sends of the same request
 - grouped request and environment picker
 - unsaved request drafts with first-save collection placement
-- collection overview
 - response view system with dedicated body viewer
 - basic response rendering, including image-aware views
 
@@ -341,20 +348,7 @@ Acceptance:
 
 - changing method no longer requires manually editing the first line
 
-### Phase 5: Collection Overview
-
-Deliver:
-
-- overview buffer for one collection
-- request listing
-- filtering and search
-- open, send, preview, env actions
-
-Acceptance:
-
-- overview becomes the main entry point for collection-scale work
-
-### Phase 6: Response Views
+### Phase 5: Response Views
 
 Deliver:
 
@@ -424,5 +418,4 @@ The next implementation work should follow this order:
 
 1. continue polishing response presentation and body viewers
 2. add lightweight collection management commands
-3. refine overview interactions and filtering as usage feedback arrives
-4. revisit image-heavy and large-body workflows after real usage
+3. revisit image-heavy and large-body workflows after real usage

@@ -77,13 +77,13 @@ not declare an explicit `[body].type` in its front matter."
                  (const form-urlencoded))
   :group 'courier)
 
-(defcustom courier-default-collection-directory
+(defcustom courier-home-directory
   (file-name-as-directory (expand-file-name "courier" "~"))
-  "Default directory used when creating or saving Courier collections.
+  "Root directory used for Courier-managed persistent content.
 
-This directory is used as the initial prompt location when saving a new
-request draft or creating a collection outside an existing Courier
-collection."
+Courier stores collections under a dedicated `collections/' subdirectory of
+this home. Other persisted Courier-managed content may also live under this
+root."
   :type 'directory
   :group 'courier)
 
@@ -100,19 +100,15 @@ collection."
 (defconst courier--collection-marker-file "courier.json"
   "Filename that marks the root of a Courier collection.")
 
+(defconst courier--collections-directory-name "collections"
+  "Directory name under `courier-home-directory' that stores collections.")
+
 (defvar courier--untitled-request-counter 0
   "Running counter used for untitled Courier request drafts.")
-
-(defvar courier--request-metadata (make-hash-table :test 'equal)
-  "Hash table of request metadata keyed by absolute request path.")
 
 (defconst courier--body-views
   '(auto json html xml javascript raw hex base64 image)
   "Supported Courier response body views.")
-
-(defconst courier--export-formats
-  '(curl httpie wget)
-  "Supported Courier export formats.")
 
 (defconst courier--allowed-body-types
   '(none json xml text form-urlencoded)
@@ -1019,12 +1015,6 @@ When RELAXED is non-nil, allow incomplete draft request lines."
 (defvar courier-script-phase nil
   "Current Courier script phase symbol.")
 
-(defvar-local courier--export-format 'curl
-  "Current export format for the active Courier request buffer.")
-
-(defvar-local courier--export-interpolate t
-  "Whether current Courier exports should interpolate variables.")
-
 (defun courier--plist-like-p (value)
   "Return non-nil when VALUE looks like a plist."
   (and (listp value)
@@ -1453,261 +1443,15 @@ Use HEADER-FILE, BODY-FILE, and META-FILE for curl output."
       (with-current-buffer buffer
         (courier--response-mark-cancelled)))))
 
-;;;; Overview mode
-
-(defvar-local courier--overview-root nil
-  "Request root rendered by the current Courier overview buffer.")
-
-(defvar-local courier--overview-collection-root nil
-  "Collection root rendered by the current Courier overview buffer.")
-
-(defvar-local courier--overview-filter nil
-  "Current filter string for the Courier overview buffer.")
-
-(defun courier--refresh-overview-buffers ()
-  "Refresh all live Courier overview buffers."
-  (dolist (buffer (buffer-list))
-    (when (buffer-live-p buffer)
-      (with-current-buffer buffer
-        (when (derived-mode-p 'courier-overview-mode)
-          (when (and courier--overview-root
-                     courier--overview-collection-root)
-            (courier-overview-refresh)))))))
-
-(defun courier--request-metadata (path)
-  "Return metadata plist stored for PATH, or nil."
-  (gethash path courier--request-metadata))
-
-(defun courier--record-request-metadata (request response)
-  "Store REQUEST and RESPONSE metadata for overview displays."
-  (when-let* ((path (plist-get request :path)))
-    (puthash path
-             (list :status-code (plist-get response :status-code)
-                   :reason (plist-get response :reason)
-                   :duration-ms (plist-get response :duration-ms)
-                   :timestamp (current-time)
-                   :env-name (plist-get request :env-name))
-             courier--request-metadata)
-    (courier--refresh-overview-buffers)))
-
 (defun courier--collection-name (&optional start)
   "Return a display name for the current collection around START."
   (if-let* ((config (courier--collection-config start))
             (name (plist-get config :name)))
       name
-    (if-let* ((root (or (courier--collection-root start)
-                        (courier--request-search-root))))
+    (if-let* ((root (courier--collection-root start)))
         (file-name-nondirectory
          (directory-file-name root))
       "Courier")))
-
-(defun courier--request-display-env (path)
-  "Return the most relevant environment name for request PATH."
-  (or (when-let* ((buffer (courier--request-buffer-for-path path)))
-        (with-current-buffer buffer
-          courier--active-env))
-      (plist-get (courier--request-metadata path) :env-name)
-      (plist-get (courier--collection-config (file-name-directory path)) :default-env)
-      ""))
-
-(defun courier--request-status-string (path)
-  "Return a short status string for request PATH."
-  (if-let* ((status (plist-get (courier--request-metadata path) :status-code)))
-      (number-to-string status)
-    ""))
-
-(defun courier--request-updated-at-string (path)
-  "Return a short timestamp string for request PATH."
-  (if-let* ((timestamp (plist-get (courier--request-metadata path) :timestamp)))
-      (format-time-string "%m-%d %H:%M" timestamp)
-    ""))
-
-(defun courier--overview-entry (path root)
-  "Return an overview entry for request PATH under ROOT."
-  (let* ((request (courier-parse-file path))
-         (method (or (plist-get request :method) ""))
-         (name (or (plist-get request :name)
-                   (file-name-base path)))
-         (relative-path (file-relative-name path root)))
-    (list :path path
-          :method method
-          :name name
-          :relative-path relative-path
-          :status (courier--request-status-string path)
-          :env (courier--request-display-env path)
-          :updated-at (courier--request-updated-at-string path))))
-
-(defun courier--overview-matches-filter-p (entry)
-  "Return non-nil when ENTRY matches `courier--overview-filter'."
-  (let ((filter (string-trim (or courier--overview-filter ""))))
-    (or (string-empty-p filter)
-        (let ((haystack
-               (downcase
-                (mapconcat
-                 #'identity
-                 (delq nil
-                       (list (plist-get entry :method)
-                             (plist-get entry :name)
-                             (plist-get entry :relative-path)
-                             (plist-get entry :status)
-                             (plist-get entry :env)))
-                 " "))))
-          (string-match-p (regexp-quote (downcase filter)) haystack)))))
-
-(defun courier--overview-entries ()
-  "Return rendered overview entries for `courier--overview-root'."
-  (seq-filter
-   #'courier--overview-matches-filter-p
-   (mapcar (lambda (path)
-             (courier--overview-entry path courier--overview-root))
-           (courier--request-files courier--overview-root))))
-
-(defun courier--overview-request-path-at-point ()
-  "Return the Courier request path at point, or nil."
-  (get-text-property (point) 'courier-request-path))
-
-(defun courier--overview-open-request-buffer (path)
-  "Return a Courier request buffer for PATH."
-  (let ((buffer (find-file-noselect path)))
-    (with-current-buffer buffer
-      (unless (derived-mode-p 'courier-request-mode)
-        (courier-request-mode)))
-    buffer))
-
-(defun courier--overview-header-line ()
-  "Return the header line string for the current overview buffer."
-  (format " %s | %s | filter: %s "
-          (courier--collection-name courier--overview-collection-root)
-          (abbreviate-file-name courier--overview-root)
-          (if (string-empty-p (or courier--overview-filter ""))
-              "(none)"
-            courier--overview-filter)))
-
-(defun courier--overview-line (entry)
-  "Insert one overview line for ENTRY."
-  (let* ((start (point))
-         (status (or (plist-get entry :status) ""))
-         (env (or (plist-get entry :env) ""))
-         (updated-at (or (plist-get entry :updated-at) ""))
-         (line
-          (format "%-7s %-24s %-38s %-6s %-10s %s"
-                  (plist-get entry :method)
-                  (truncate-string-to-width (plist-get entry :name) 24 nil nil t)
-                  (truncate-string-to-width (plist-get entry :relative-path) 38 nil nil t)
-                  status
-                  env
-                  updated-at)))
-    (insert line "\n")
-    (add-text-properties
-     start (point)
-     `(courier-request-path ,(plist-get entry :path)
-                            mouse-face highlight
-                            help-echo ,(plist-get entry :path)))))
-
-(define-derived-mode courier-overview-mode special-mode "Courier-Overview"
-  "Major mode used for Courier collection overview buffers."
-  (setq-local truncate-lines t))
-
-;;;###autoload
-(defun courier-overview-refresh ()
-  "Refresh the current Courier overview buffer."
-  (interactive)
-  (unless courier--overview-root
-    (user-error "No Courier overview is active in this buffer"))
-  (let ((inhibit-read-only t)
-        (entries (courier--overview-entries)))
-    (erase-buffer)
-    (setq header-line-format (courier--overview-header-line))
-    (insert (format "Collection: %s\n"
-                    (courier--collection-name courier--overview-collection-root)))
-    (insert (format "Root:       %s\n\n"
-                    (abbreviate-file-name courier--overview-root)))
-    (insert (format "%-7s %-24s %-38s %-6s %-10s %s\n"
-                    "Method" "Name" "Path" "Last" "Env" "Updated"))
-    (insert (make-string 104 ?-))
-    (insert "\n")
-    (if entries
-        (dolist (entry entries)
-          (courier--overview-line entry))
-      (insert "(no requests)\n"))
-    (goto-char (point-min))
-    (forward-line 4)))
-
-;;;###autoload
-(defun courier-overview-set-filter (filter)
-  "Set the current Courier overview FILTER."
-  (interactive
-   (list (read-string "Courier filter: "
-                      nil nil courier--overview-filter)))
-  (setq courier--overview-filter (unless (string-empty-p filter) filter))
-  (courier-overview-refresh))
-
-;;;###autoload
-(defun courier-overview-open ()
-  "Open the Courier request at point."
-  (interactive)
-  (if-let* ((path (courier--overview-request-path-at-point)))
-      (find-file path)
-    (user-error "No Courier request on this line")))
-
-;;;###autoload
-(defun courier-overview-preview ()
-  "Preview the Courier request at point."
-  (interactive)
-  (if-let* ((path (courier--overview-request-path-at-point)))
-      (with-current-buffer (courier--overview-open-request-buffer path)
-        (call-interactively #'courier-request-preview))
-    (user-error "No Courier request on this line")))
-
-;;;###autoload
-(defun courier-overview-send ()
-  "Send the Courier request at point."
-  (interactive)
-  (if-let* ((path (courier--overview-request-path-at-point)))
-      (with-current-buffer (courier--overview-open-request-buffer path)
-        (call-interactively #'courier-request-send))
-    (user-error "No Courier request on this line")))
-
-;;;###autoload
-(defun courier-overview-switch-env ()
-  "Switch the environment of the Courier request at point."
-  (interactive)
-  (if-let* ((path (courier--overview-request-path-at-point)))
-      (with-current-buffer (courier--overview-open-request-buffer path)
-        (call-interactively #'courier-request-switch-env))
-    (user-error "No Courier request on this line")))
-
-;;;###autoload
-(defun courier-overview ()
-  "Open the Courier overview for the current collection."
-  (interactive)
-  (let* ((collection-root (courier--collection-root))
-         (request-root (courier--request-search-root)))
-    (unless collection-root
-      (user-error "No Courier collection found"))
-    (let ((buffer (get-buffer-create
-                   (format "*courier-overview: %s*"
-                           (courier--collection-name collection-root)))))
-      (with-current-buffer buffer
-        (courier-overview-mode)
-        (setq-local courier--overview-root request-root)
-        (setq-local courier--overview-collection-root collection-root)
-        (unless (local-variable-p 'courier--overview-filter buffer)
-          (setq-local courier--overview-filter nil))
-        (courier-overview-refresh))
-      (display-buffer buffer))))
-
-(define-key courier-overview-mode-map (kbd "RET") #'courier-overview-open)
-(define-key courier-overview-mode-map (kbd "f") #'courier-new-folder)
-(define-key courier-overview-mode-map (kbd "C-c ?") #'courier-dispatch)
-(define-key courier-overview-mode-map (kbd "e") #'courier-overview-switch-env)
-(define-key courier-overview-mode-map (kbd "g") #'courier-overview-refresh)
-(define-key courier-overview-mode-map (kbd "m") #'courier-move-request)
-(define-key courier-overview-mode-map (kbd "n") #'courier-new-request)
-(define-key courier-overview-mode-map (kbd "p") #'courier-overview-preview)
-(define-key courier-overview-mode-map (kbd "r") #'courier-rename-request)
-(define-key courier-overview-mode-map (kbd "s") #'courier-overview-send)
-(define-key courier-overview-mode-map (kbd "/") #'courier-overview-set-filter)
 
 ;;;; Response mode
 
@@ -2676,7 +2420,6 @@ Each entry is a cons cell of the form `(TIMESTAMP . RESPONSE)'.")
           courier--history prev-history
           courier--history-index nil)
     (courier--history-push response)
-    (courier--record-request-metadata request response)
     (courier--refresh-response-display)))
 
 ;;;###autoload
@@ -2765,30 +2508,6 @@ Each entry is a cons cell of the form `(TIMESTAMP . RESPONSE)'.")
   (courier--set-response-tab tab))
 
 ;;;###autoload
-(defun courier-response-show-response ()
-  "Show the response tab in the current Courier response buffer."
-  (interactive)
-  (courier--set-response-tab 'response))
-
-;;;###autoload
-(defun courier-response-show-headers ()
-  "Show the headers tab in the current Courier response buffer."
-  (interactive)
-  (courier--set-response-tab 'headers))
-
-;;;###autoload
-(defun courier-response-show-timeline ()
-  "Show the timeline tab in the current Courier response buffer."
-  (interactive)
-  (courier--set-response-tab 'timeline))
-
-;;;###autoload
-(defun courier-response-show-tests ()
-  "Show the tests tab in the current Courier response buffer."
-  (interactive)
-  (courier--set-response-tab 'tests))
-
-;;;###autoload
 (defun courier-response-next-tab ()
   "Move to the next Courier response tab."
   (interactive)
@@ -2811,6 +2530,25 @@ Each entry is a cons cell of the form `(TIMESTAMP . RESPONSE)'.")
          (position (or (cl-position current tabs) 0))
          (prev (nth (mod (1- position) (length tabs)) tabs)))
     (courier--set-response-tab prev)))
+
+(defun courier--response-jump-choices ()
+  "Return completion choices for response tabs."
+  (mapcar (lambda (tab)
+            (cons (capitalize (symbol-name tab)) tab))
+          courier--response-tabs))
+
+;;;###autoload
+(defun courier-response-jump-tab (tab)
+  "Jump directly to response TAB."
+  (interactive
+   (let* ((choices (courier--response-jump-choices))
+          (current (capitalize (symbol-name (or courier--response-tab 'response))))
+          (selection (completing-read "Jump to response view: "
+                                      choices nil t nil nil current)))
+     (list (cdr (assoc selection choices)))))
+  (unless courier--response
+    (user-error "No Courier response is available"))
+  (courier--set-response-tab tab))
 
 (defun courier--timeline-index-at-point ()
   "Return the timeline history index stored at point, or nil."
@@ -2984,14 +2722,31 @@ The return value is one of:
 (define-key courier--response-mode-map (kbd "TAB") #'courier-response-context-tab)
 (define-key courier--response-mode-map (kbd "<tab>") #'courier-response-context-tab)
 (define-key courier--response-mode-map (kbd "C-c ?") #'courier-dispatch)
-(define-key courier--response-mode-map (kbd "h") #'courier-response-show-headers)
-(define-key courier--response-mode-map (kbd "l") #'courier-response-show-timeline)
+(define-key courier--response-mode-map
+            (kbd "h")
+            (lambda ()
+              (interactive)
+              (courier--set-response-tab 'headers)))
+(define-key courier--response-mode-map
+            (kbd "l")
+            (lambda ()
+              (interactive)
+              (courier--set-response-tab 'timeline)))
 (define-key courier--response-mode-map (kbd "o") #'courier-response-open-body)
 (define-key courier--response-mode-map (kbd "]") #'courier-response-next-tab)
 (define-key courier--response-mode-map (kbd "[") #'courier-response-prev-tab)
-(define-key courier--response-mode-map (kbd "r") #'courier-response-show-response)
+(define-key courier--response-mode-map (kbd "C-c C-j") #'courier-response-jump-tab)
+(define-key courier--response-mode-map
+            (kbd "r")
+            (lambda ()
+              (interactive)
+              (courier--set-response-tab 'response)))
 (define-key courier--response-mode-map (kbd "g") #'courier-response-retry)
-(define-key courier--response-mode-map (kbd "t") #'courier-response-show-tests)
+(define-key courier--response-mode-map
+            (kbd "t")
+            (lambda ()
+              (interactive)
+              (courier--set-response-tab 'tests)))
 (define-key courier--response-mode-map (kbd "v") #'courier-response-set-view)
 (define-key courier--response-mode-map (kbd "V") #'courier-response-toggle-pretty)
 (define-key courier--response-mode-map (kbd "C-c C-k") #'courier-response-cancel)
@@ -3559,13 +3314,23 @@ START defaults to the current buffer directory."
   (let ((directory (file-name-as-directory
                     (expand-file-name (or start
                                           (courier--buffer-start-directory))))))
-    (locate-dominating-file directory courier--collection-marker-file)))
+    (when-let* ((root (locate-dominating-file directory courier--collection-marker-file)))
+      (let ((normalized-root (file-name-as-directory (expand-file-name root))))
+        (unless (file-equal-p normalized-root (courier--home-directory))
+          normalized-root)))))
+
+(defun courier--home-directory ()
+  "Return the normalized Courier home directory."
+  (file-name-as-directory (expand-file-name courier-home-directory)))
+
+(defun courier--collections-directory ()
+  "Return the directory under Courier home that stores collections."
+  (expand-file-name courier--collections-directory-name
+                    (courier--home-directory)))
 
 (defun courier--active-collection-root ()
   "Return the active Courier collection root for the current context, or nil."
-  (or (and (derived-mode-p 'courier-overview-mode)
-           courier--overview-collection-root)
-      courier--collection-root-hint
+  (or courier--collection-root-hint
       (courier--collection-root)))
 
 (defun courier--collection-config-path (&optional start)
@@ -3633,8 +3398,6 @@ directory even when it does not exist yet."
 (defun courier--context-request-path ()
   "Return the Courier request path for the current context, or nil."
   (cond
-   ((derived-mode-p 'courier-overview-mode)
-    (courier--overview-request-path-at-point))
    ((and (derived-mode-p 'courier-request-mode)
          courier--request-path)
     courier--request-path)
@@ -3644,8 +3407,6 @@ directory even when it does not exist yet."
 (defun courier--management-root ()
   "Return the root directory used for Courier management commands."
   (cond
-   ((derived-mode-p 'courier-overview-mode)
-    courier--overview-root)
    ((courier--collection-root)
     (courier--preferred-requests-root))
    (t
@@ -3714,19 +3475,25 @@ directory even when it does not exist yet."
           (file-exists-p candidate)))
     candidate))
 
-(defun courier--collection-template (root)
-  "Return JSON text for a new Courier collection rooted at ROOT."
+(defun courier--collection-template (root &optional name)
+  "Return JSON text for a new Courier collection rooted at ROOT.
+
+When NAME is non-nil, use it as the collection display name."
   (let ((json-encoding-pretty-print t))
     (concat
      (json-serialize
-      `((name . ,(file-name-nondirectory
-                  (directory-file-name (file-name-as-directory root))))
+      `((name . ,(or name
+                     (file-name-nondirectory
+                      (directory-file-name (file-name-as-directory root)))))
         (requestsDir . "requests")
         (envDir . "env")))
      "\n")))
 
-(defun courier--create-collection (root)
-  "Create a new Courier collection rooted at ROOT and return it."
+(defun courier--create-collection (root &optional name)
+  "Create a new Courier collection rooted at ROOT and return it.
+
+When NAME is non-nil, store it in `courier.json' as the collection display
+name."
   (let* ((collection-root (file-name-as-directory (expand-file-name root)))
          (existing-root (courier--collection-root collection-root))
          (config-path (expand-file-name courier--collection-marker-file collection-root)))
@@ -3740,29 +3507,40 @@ directory even when it does not exist yet."
     (make-directory (expand-file-name "requests" collection-root) t)
     (make-directory (expand-file-name "env" collection-root) t)
     (with-temp-file config-path
-      (insert (courier--collection-template collection-root)))
+      (insert (courier--collection-template collection-root name)))
     collection-root))
 
-(defun courier--save-collection-prompt-directory ()
-  "Return the initial directory used for Courier collection prompts."
-  (or courier--collection-root-hint
-      (courier--collection-root)
-      courier-default-collection-directory
-      default-directory))
+(defun courier--read-collection-name ()
+  "Read a Courier collection name from the minibuffer."
+  (let* ((candidates (courier--collection-candidates))
+         (table (courier--completion-table
+                 candidates
+                 '(category . courier-collection)
+                 '(group-function . courier--completion-group)
+                 '(affixation-function . courier--completion-affixation))))
+    (string-trim
+     (completing-read "Collection: " table nil nil))))
+
+(defun courier--collection-root-for-name (name)
+  "Return the collection root path for collection NAME under Courier home."
+  (when (string-empty-p name)
+    (user-error "Collection name cannot be empty"))
+  (when (string-match-p "[/\\]" name)
+    (user-error "Collection name cannot contain path separators"))
+  (expand-file-name name (courier--collections-directory)))
 
 (defun courier--read-save-collection-root ()
-  "Prompt for the collection used to save the current request buffer."
-  (let* ((initial (courier--save-collection-prompt-directory))
-         (selected (file-name-as-directory
-                    (expand-file-name
-                     (read-directory-name "Save request to collection: "
-                                          initial nil nil)))))
-    (or (courier--collection-root selected)
-        (when (y-or-n-p
-               (format "No Courier collection at %s. Create one? "
-                       (abbreviate-file-name selected)))
-          (courier--create-collection selected))
-        (user-error "No Courier collection selected"))))
+  "Return the collection root used to save the current request buffer."
+  (or courier--collection-root-hint
+      (courier--collection-root)
+      (let* ((name (courier--read-collection-name))
+             (selected-root
+              (or (when-let* ((candidate
+                               (assoc name (courier--collection-candidates))))
+                    (plist-get (cdr candidate) :root))
+                  (let ((root (courier--collection-root-for-name name)))
+                    (courier--create-collection root name)))))
+        (file-name-as-directory (expand-file-name selected-root)))))
 
 (defun courier--ensure-directory-under-root (directory root)
   "Validate DIRECTORY against ROOT and create it when missing."
@@ -3774,6 +3552,20 @@ directory even when it does not exist yet."
                   expanded-directory expanded-root))
     (make-directory expanded-directory t)
     expanded-directory))
+
+(defun courier--read-save-request-path (request-root request-name)
+  "Read the request path under REQUEST-ROOT for REQUEST-NAME."
+  (let* ((default-name (file-name-base (courier--request-file-name request-name)))
+         (typed-name (string-trim
+                      (read-string "Request file name: " default-name)))
+         (file-name (if (string-suffix-p ".http" typed-name)
+                        typed-name
+                      (concat typed-name ".http"))))
+    (when (string-empty-p typed-name)
+      (user-error "Request file name cannot be empty"))
+    (when (string-match-p "[/\\]" file-name)
+      (user-error "Request file name cannot contain path separators"))
+    (expand-file-name file-name request-root)))
 
 (defun courier--write-request-name (buffer name)
   "Ensure BUFFER contains Courier request NAME in its active model."
@@ -3788,9 +3580,6 @@ directory even when it does not exist yet."
 (defun courier--migrate-request-artifacts (old-path new-path &optional new-name)
   "Move Courier state from OLD-PATH to NEW-PATH.
 When NEW-NAME is non-nil, also update any live response buffer name metadata."
-  (when-let* ((metadata (courier--request-metadata old-path)))
-    (remhash old-path courier--request-metadata)
-    (puthash new-path metadata courier--request-metadata))
   (when-let* ((response-buffer (courier--response-buffer-for-path old-path)))
     (when (buffer-live-p response-buffer)
       (with-current-buffer response-buffer
@@ -3799,23 +3588,33 @@ When NEW-NAME is non-nil, also update any live response buffer name metadata."
           (plist-put courier--request :name new-name))
         (rename-buffer (courier--response-buffer-name courier--request) t)))))
 
-(defun courier--request-candidate (path root)
-  "Return a completion candidate for request PATH under ROOT."
-  (let* ((request (courier-parse-file path))
-         (method (or (plist-get request :method) ""))
-         (name (or (plist-get request :name)
-                   (file-name-base path)))
-         (relative-path (file-relative-name path root))
-         (label (format "%-7s %-24s %s" method name relative-path)))
-    (cons (propertize label 'courier-group "Requests")
-          (list :kind 'request
-                :path path))))
+(defun courier--open-collection-label (collection-root)
+  "Return the display label for COLLECTION-ROOT in open pickers."
+  (courier--collection-name collection-root))
 
-(defun courier--request-candidates (root)
-  "Return completion candidates for Courier request files under ROOT."
+(defun courier--open-request-display-path (path collection-root)
+  "Return the display path for request PATH in COLLECTION-ROOT."
+  (let* ((request-root (or (courier--collection-requests-root collection-root)
+                           collection-root))
+         (relative-path (file-relative-name path request-root)))
+    (file-name-sans-extension relative-path)))
+
+(defun courier--request-candidate (path collection-root)
+  "Return a completion candidate for request PATH in COLLECTION-ROOT."
+  (let* ((label (courier--open-request-display-path path collection-root))
+         (collection-name (courier--open-collection-label collection-root)))
+    (cons (propertize label
+                      'courier-group "Requests"
+                      'courier-annotation collection-name)
+          (list :kind 'request
+                :path path
+                :collection-root collection-root))))
+
+(defun courier--request-candidates (collection-root)
+  "Return completion candidates for Courier request files in COLLECTION-ROOT."
   (mapcar (lambda (path)
-            (courier--request-candidate path root))
-          (courier--request-files root)))
+            (courier--request-candidate path collection-root))
+          (courier--request-files collection-root)))
 
 (defun courier--env-sort-rank (name)
   "Return a stable sort rank for environment NAME."
@@ -3829,23 +3628,28 @@ When NEW-NAME is non-nil, also update any live response buffer name metadata."
    ((string= name "default") 3)
    (t 10)))
 
-(defun courier--env-candidate (entry root)
-  "Return a completion candidate for env ENTRY under ROOT."
+(defun courier--env-candidate (entry collection-root)
+  "Return a completion candidate for env ENTRY in COLLECTION-ROOT."
   (let* ((name (car entry))
          (path (cdr entry))
          (marker (if (and courier--active-env
                           (string= name courier--active-env))
                      "*"
                    " "))
-         (relative-path (file-relative-name path root))
-         (label (format "ENV     %s %-22s %s" marker name relative-path)))
-    (cons (propertize label 'courier-group "Environments")
+         (relative-path (file-relative-name path collection-root))
+         (collection-name (courier--open-collection-label collection-root))
+         (label (format "%s %s" marker name))
+         (annotation (format "%s • %s" collection-name relative-path)))
+    (cons (propertize label
+                      'courier-group "Environments"
+                      'courier-annotation annotation)
           (list :kind 'env
                 :name name
-                :path path))))
+                :path path
+                :collection-root collection-root))))
 
-(defun courier--env-candidates (entries root)
-  "Return completion candidates for environment ENTRIES under ROOT."
+(defun courier--env-candidates (entries collection-root)
+  "Return completion candidates for environment ENTRIES in COLLECTION-ROOT."
   (let ((sorted-entries
          (sort (copy-sequence entries)
                (lambda (left right)
@@ -3855,19 +3659,67 @@ When NEW-NAME is non-nil, also update any live response buffer name metadata."
                        (string< (car left) (car right))
                      (< left-rank right-rank)))))))
     (mapcar (lambda (entry)
-              (courier--env-candidate entry root))
+              (courier--env-candidate entry collection-root))
             sorted-entries)))
 
+(defun courier--discover-collection-roots (&optional base-directory)
+  "Return Courier collection roots discoverable under BASE-DIRECTORY.
+
+When BASE-DIRECTORY is nil, discover collections directly under the Courier
+home `collections/' directory."
+  (let* ((base (file-name-as-directory
+                (expand-file-name
+                 (or base-directory
+                     (courier--collections-directory)))))
+         roots)
+    (when (file-directory-p base)
+      (dolist (entry (directory-files base t directory-files-no-dot-files-regexp t))
+        (when (and (file-directory-p entry)
+                   (file-exists-p
+                    (expand-file-name courier--collection-marker-file entry)))
+          (push (file-name-as-directory entry) roots))))
+    (sort roots #'string<)))
+
+(defun courier--open-collection-roots ()
+  "Return Courier collections available to `courier-open'."
+  (let* ((active (courier--active-collection-root))
+         (discovered (courier--discover-collection-roots))
+         roots)
+    (when active
+      (push (file-name-as-directory (expand-file-name active)) roots))
+    (dolist (root discovered)
+      (push root roots))
+    (delete-dups
+     (nreverse roots))))
+
+(defun courier--open-env-entries (collection-root)
+  "Return environment entries discoverable in COLLECTION-ROOT for `courier-open'."
+  (let (entries)
+    (dolist (path (directory-files-recursively collection-root "\\.env\\'"))
+      (let ((file-name (file-name-nondirectory path)))
+        (when (courier--env-file-name-p file-name)
+          (push (cons (courier--env-name-for-file file-name) path) entries))))
+    (sort entries
+          (lambda (left right)
+            (string< (format "%s:%s" (car left) (cdr left))
+                     (format "%s:%s" (car right) (cdr right)))))))
+
 (defun courier--open-candidates ()
-  "Return grouped completion candidates for requests and environments."
-  (let* ((request-root (courier--request-search-root))
-         (env-root (or (courier--collection-root)
-                       request-root))
-         (request-candidates (courier--request-candidates request-root))
-         (env-candidates (courier--env-candidates
-                          (or (courier--available-env-entries) nil)
-                          env-root)))
-    (append request-candidates env-candidates)))
+  "Return grouped completion candidates for `courier-open'."
+  (let ((active-root (and (derived-mode-p 'courier-request-mode)
+                          (courier--active-collection-root)))
+        candidates)
+    (dolist (collection-root (courier--open-collection-roots))
+      (setq candidates
+            (append candidates
+                    (courier--request-candidates collection-root)
+                    (if (and active-root
+                             (equal collection-root active-root))
+                        (courier--env-candidates
+                         (courier--open-env-entries collection-root)
+                         collection-root)
+                      nil))))
+    candidates))
 
 (defun courier--completion-group (candidate transform)
   "Return the completion group title for CANDIDATE.
@@ -3877,11 +3729,62 @@ TRANSFORM is ignored; it is part of the completion metadata protocol."
     (or (get-text-property 0 'courier-group candidate)
         "Other")))
 
+(defun courier--completion-affixation (candidates)
+  "Return affixation metadata for completion CANDIDATES."
+  (mapcar
+   (lambda (candidate)
+     (list candidate
+           ""
+           (if-let* ((annotation (get-text-property 0 'courier-annotation candidate)))
+               (propertize (format "  %s" annotation) 'face 'shadow)
+             "")))
+   candidates))
+
+(defun courier--completion-table (candidates &rest metadata)
+  "Return a completion table for CANDIDATES carrying METADATA.
+
+CANDIDATES is an alist whose car values are the strings presented to the user.
+METADATA entries follow `completion-metadata'."
+  (let ((labels (mapcar #'car candidates)))
+    (lambda (string pred action)
+      (if (eq action 'metadata)
+          (cons 'metadata metadata)
+        (complete-with-action action labels string pred)))))
+
+(defun courier--collection-candidate (root)
+  "Return a completion candidate for Courier collection ROOT."
+  (let ((label (courier--collection-name root)))
+    (cons (propertize label
+                      'courier-group "Collections"
+                      'courier-annotation (abbreviate-file-name root))
+          (list :kind 'collection
+                :root root))))
+
+(defun courier--collection-candidates ()
+  "Return completion candidates for discoverable Courier collections."
+  (mapcar #'courier--collection-candidate
+          (courier--open-collection-roots)))
+
+(defun courier--select-collection-root ()
+  "Return the active or selected Courier collection root."
+  (or (courier--active-collection-root)
+      (let ((candidates (courier--collection-candidates)))
+        (unless candidates
+          (user-error "No Courier collections found"))
+        (if (= (length candidates) 1)
+            (plist-get (cdar candidates) :root)
+          (let* ((table (courier--completion-table
+                         candidates
+                         '(category . courier-collection)
+                         '(group-function . courier--completion-group)
+                         '(affixation-function . courier--completion-affixation)))
+                 (selection (completing-read "Courier collection: " table nil t)))
+            (plist-get (cdr (assoc selection candidates)) :root))))))
+
 (defun courier--set-active-env (name)
   "Set the current request buffer environment to NAME."
   (setq courier--active-env name)
   (force-mode-line-update)
-  (courier--refresh-overview-buffers)
   (message "Courier environment set to %s." courier--active-env))
 
 (defun courier--handle-open-selection (selection candidates)
@@ -4016,142 +3919,6 @@ Entries are read from the configured env directory only."
          (resolved (courier-resolve-request request env-vars)))
     (plist-put resolved :env-name env-name)
     (plist-put resolved :env-vars env-vars)))
-
-(defun courier--export-source-url (request)
-  "Return REQUEST URL with raw query params appended for export."
-  (let ((base-url (plist-get request :url))
-        (params (plist-get request :params)))
-    (if params
-        (let* ((fragment-pos (string-match "#" base-url))
-               (fragment (and fragment-pos (substring base-url fragment-pos)))
-               (url-no-fragment (if fragment-pos
-                                    (substring base-url 0 fragment-pos)
-                                  base-url))
-               (separator (if (string-match-p "\\?" url-no-fragment) "&" "?"))
-               (query (mapconcat (lambda (param)
-                                   (format "%s=%s" (car param) (cdr param)))
-                                 params "&")))
-          (concat url-no-fragment separator query fragment))
-      base-url)))
-
-(defun courier--export-source-auth-header (auth)
-  "Return a raw auth header cons cell for AUTH, or nil."
-  (when auth
-    (pcase (plist-get auth :type)
-      ('bearer
-       (cons "authorization"
-             (format "Bearer %s" (plist-get auth :token))))
-      ('basic
-       (cons "authorization"
-             (format "Basic %s:%s"
-                     (plist-get auth :username)
-                     (plist-get auth :password))))
-      ('header
-       (cons (downcase (plist-get auth :header))
-             (plist-get auth :value))))))
-
-(defun courier--request-for-export (request)
-  "Return the current REQUEST prepared for export."
-  (courier-validate-request request)
-  (if courier--export-interpolate
-      (courier-resolve-request request (plist-get request :env-vars))
-    (let ((export (copy-tree request t)))
-      (plist-put export :body-type (courier--request-body-type request))
-      (plist-put export :url (courier--export-source-url request))
-      (when-let* ((auth-header
-                   (courier--export-source-auth-header (plist-get request :auth))))
-        (unless (assoc-string (car auth-header) (plist-get export :headers) nil)
-          (plist-put export :headers
-                     (append (plist-get export :headers)
-                             (list auth-header)))))
-      (when (eq (courier--request-body-type export) 'none)
-        (plist-put export :body ""))
-      (courier--maybe-add-default-body-header export)
-      export)))
-
-(defun courier--shell-quote (string)
-  "Return STRING quoted for shell output."
-  (shell-quote-argument (or string "")))
-
-(defun courier--export-curl-command (request)
-  "Return a curl command string for REQUEST."
-  (let ((lines (list (format "curl --request %s" (plist-get request :method))
-                     (format "  --url %s"
-                             (courier--shell-quote (plist-get request :url))))))
-    (dolist (header (plist-get request :headers))
-      (setq lines
-            (append lines
-                    (list (format "  --header %s"
-                                  (courier--shell-quote
-                                   (format "%s: %s" (car header) (cdr header))))))))
-    (unless (string-empty-p (or (plist-get request :body) ""))
-      (setq lines
-            (append lines
-                    (list (format "  --data-raw %s"
-                                  (courier--shell-quote
-                                   (plist-get request :body)))))))
-    (mapconcat #'identity lines " \\\n")))
-
-(defun courier--export-httpie-command (request)
-  "Return an httpie command string for REQUEST."
-  (let ((lines (list (format "http %s %s"
-                             (plist-get request :method)
-                             (courier--shell-quote (plist-get request :url))))))
-    (dolist (header (plist-get request :headers))
-      (setq lines
-            (append lines
-                    (list (format "  %s"
-                                  (courier--shell-quote
-                                   (format "%s:%s" (car header) (cdr header))))))))
-    (unless (string-empty-p (or (plist-get request :body) ""))
-      (setq lines
-            (append lines
-                    (list (format "  <<< %s"
-                                  (courier--shell-quote
-                                   (plist-get request :body)))))))
-    (mapconcat #'identity lines " \\\n")))
-
-(defun courier--export-wget-command (request)
-  "Return a wget command string for REQUEST."
-  (let ((lines (list "wget -O -"
-                     (format "  --method=%s" (plist-get request :method)))))
-    (dolist (header (plist-get request :headers))
-      (setq lines
-            (append lines
-                    (list (format "  --header=%s"
-                                  (courier--shell-quote
-                                   (format "%s: %s" (car header) (cdr header))))))))
-    (unless (string-empty-p (or (plist-get request :body) ""))
-      (setq lines
-            (append lines
-                    (list (format "  --body-data=%s"
-                                  (courier--shell-quote
-                                   (plist-get request :body)))))))
-    (setq lines
-          (append lines
-                  (list (courier--shell-quote (plist-get request :url)))))
-    (mapconcat #'identity lines " \\\n")))
-
-(defun courier--export-command-string (request)
-  "Return an export command string for REQUEST using current export settings."
-  (pcase courier--export-format
-    ('curl (courier--export-curl-command request))
-    ('httpie (courier--export-httpie-command request))
-    ('wget (courier--export-wget-command request))
-    (_ (user-error "Unsupported export format: %s" courier--export-format))))
-
-(defun courier--current-export-command ()
-  "Return the current request export command string."
-  (courier--export-command-string
-   (courier--request-for-export (courier--prepared-current-request))))
-
-(defun courier--export-state-label ()
-  "Return a short label for current export settings."
-  (format "%s • %s"
-          (upcase (symbol-name courier--export-format))
-          (if courier--export-interpolate
-              "interpolate"
-            "source")))
 
 (defun courier--response-buffer-for-path (path)
   "Return the Courier response buffer currently associated with PATH."
@@ -4553,7 +4320,6 @@ Signal `user-error' when the current request line has no URL."
   (courier--sync-request-model)
   (plist-put courier--request-model :method method)
   (courier--render-request-buffer)
-  (courier--refresh-overview-buffers)
   (message "Courier method set to %s." method))
 
 ;;;###autoload
@@ -4617,39 +4383,6 @@ Signal `user-error' when the current request line has no URL."
   (set-buffer-modified-p t)
   (message "Courier auth type set to %s." (courier--auth-type-label auth-type)))
 
-;;;###autoload
-(defun courier-request-export-set-format (format)
-  "Set the current request export FORMAT."
-  (interactive
-   (list
-    (intern
-     (completing-read "Export format: "
-                      (mapcar #'symbol-name courier--export-formats)
-                      nil t nil nil
-                      (symbol-name courier--export-format)))))
-  (unless (memq format courier--export-formats)
-    (user-error "Unsupported export format: %s" format))
-  (setq courier--export-format format)
-  (message "Courier export format: %s" (symbol-name format)))
-
-;;;###autoload
-(defun courier-request-export-toggle-interpolation ()
-  "Toggle variable interpolation for Courier export."
-  (interactive)
-  (setq courier--export-interpolate (not courier--export-interpolate))
-  (message "Courier export interpolation %s"
-           (if courier--export-interpolate
-               "enabled"
-             "disabled")))
-
-;;;###autoload
-(defun courier-request-export-copy ()
-  "Copy the current request export command to the kill ring."
-  (interactive)
-  (let ((command (courier--current-export-command)))
-    (kill-new command)
-    (message "Copied Courier export: %s" (courier--export-state-label))))
-
 (defun courier--request-jump-section (section)
   "Show request SECTION in the current Courier buffer."
   (unless (memq section (courier--request-all-sections))
@@ -4707,15 +4440,21 @@ Unsaved request buffers choose a collection on first save."
     (let* ((collection-root (courier--read-save-collection-root))
            (request-root (courier--preferred-requests-root collection-root))
            (request-name (courier--buffer-request-name))
-           (path (courier--unique-request-path request-root request-name)))
+           (path (courier--read-save-request-path request-root request-name)))
       (make-directory request-root t)
+      (when (and (file-exists-p path)
+                 (not (equal (expand-file-name path)
+                             (and buffer-file-name (expand-file-name buffer-file-name))))
+                 (not (y-or-n-p
+                       (format "Overwrite existing request %s? "
+                               (abbreviate-file-name path)))))
+        (user-error "Courier save aborted"))
       (set-visited-file-name path)
       (setq-local default-directory (file-name-directory path))
       (setq-local courier--request-path path)
       (setq-local courier--collection-root-hint collection-root)
       (write-region (courier--serialize-request courier--request-model) nil path nil 'silent)
       (set-buffer-modified-p nil)
-      (courier--refresh-overview-buffers)
       (message "Courier request saved to %s" path))))
 
 ;;;###autoload
@@ -4750,18 +4489,18 @@ Unsaved request buffers choose a collection on first save."
 (defun courier-open ()
   "Open another Courier request or switch environments."
   (interactive)
-  (let ((request-root (or (courier--request-search-root)
-                          (user-error "No Courier collection in current context")))
-        (candidates (courier--open-candidates)))
+  (let ((candidates (courier--open-candidates)))
     (unless candidates
       (user-error "No Courier requests or environments found"))
-    (let ((completion-extra-properties
-           '(:group-function courier--completion-group))
-          (selection
-           (completing-read
-            (format "Courier open (%s): "
-                    (abbreviate-file-name request-root))
-            candidates nil t)))
+    (let* ((table (courier--completion-table
+                   candidates
+                   '(category . courier-open)
+                   '(group-function . courier--completion-group)
+                   '(affixation-function . courier--completion-affixation)))
+           (selection
+            (completing-read
+             "Courier open: "
+             table nil t)))
       (courier--handle-open-selection selection candidates))))
 
 ;;;###autoload
@@ -4769,9 +4508,7 @@ Unsaved request buffers choose a collection on first save."
   "Create a new unsaved Courier request draft."
   (interactive)
   (let* ((name (courier--next-untitled-request-name))
-         (origin-root (or (and (derived-mode-p 'courier-overview-mode)
-                               courier--overview-collection-root)
-                          (courier--collection-root)))
+         (origin-root (courier--collection-root))
          (buffer (generate-new-buffer (courier--draft-buffer-name name))))
     (with-current-buffer buffer
       (setq-local default-directory (or origin-root default-directory))
@@ -4784,15 +4521,15 @@ Unsaved request buffers choose a collection on first save."
     (message "Courier draft created. Save it into a collection with C-x C-s.")))
 
 ;;;###autoload
-(defun courier-create-collection (directory)
-  "Create a Courier collection rooted at DIRECTORY."
+(defun courier-create-collection (name)
+  "Create a Courier collection named NAME under Courier home."
   (interactive
-   (list (read-directory-name "Create Courier collection in: "
-                              (courier--save-collection-prompt-directory)
-                              nil nil)))
-  (let ((root (courier--create-collection directory)))
-    (message "Courier collection created at %s" root)
-    root))
+   (list (string-trim (read-string "Create Courier collection: "))))
+  (make-directory (courier--collections-directory) t)
+  (let* ((root (courier--collection-root-for-name name))
+         (collection-root (courier--create-collection root name)))
+    (message "Courier collection created at %s" collection-root)
+    collection-root))
 
 ;;;###autoload
 (defun courier-new-folder (name)
@@ -4804,7 +4541,6 @@ Unsaved request buffers choose a collection on first save."
          (directory (courier--ensure-directory-under-root
                      (expand-file-name name base-directory)
                      root)))
-    (courier--refresh-overview-buffers)
     (message "Courier folder created at %s" directory)))
 
 ;;;###autoload
@@ -4842,7 +4578,6 @@ This renames the request file and updates its front matter name."
         (courier--migrate-request-artifacts old-path new-path name))
       (when (and created-buffer-p (buffer-live-p buffer))
         (kill-buffer buffer))
-      (courier--refresh-overview-buffers)
       (message "Courier request renamed to %s" name))))
 
 ;;;###autoload
@@ -4879,17 +4614,7 @@ This renames the request file and updates its front matter name."
       (courier--migrate-request-artifacts old-path new-path)
       (when (and created-buffer-p (buffer-live-p buffer))
         (kill-buffer buffer))
-      (courier--refresh-overview-buffers)
       (message "Courier request moved to %s" new-path))))
-
-;;;###autoload
-(transient-define-prefix courier-request-export-menu ()
-  "Show export actions for the current Courier request buffer."
-  [["State"
-    ("f" "Set format" courier-request-export-set-format)
-    ("i" "Toggle interpolate" courier-request-export-toggle-interpolation)]
-   ["Action"
-    ("y" "Copy command" courier-request-export-copy)]])
 
 ;;;###autoload
 (transient-define-prefix courier-request-menu ()
@@ -4906,24 +4631,22 @@ This renames the request file and updates its front matter name."
     ("e" "Environment" courier-request-switch-env)
     ("s" "Save" courier-request-save-buffer)]
    ["Navigate"
-    ("o" "Open" courier-open)
-    ("b" "Overview" courier-overview)]
+    ("o" "Open" courier-open)]
    ["Manage"
     ("n" "New request" courier-new-request)
     ("r" "Rename" courier-rename-request)
     ("F" "New folder" courier-new-folder)
-    ("C" "New collection" courier-create-collection)]
-   ["Share"
-    ("x" "Export..." courier-request-export-menu)]])
+    ("C" "New collection" courier-create-collection)]])
 
 ;;;###autoload
 (transient-define-prefix courier-response-menu ()
   "Show response actions for the current Courier buffer."
   [["View"
-    ("r" "Response" courier-response-show-response)
-    ("h" "Headers" courier-response-show-headers)
-    ("t" "Timeline" courier-response-show-timeline)
-    ("T" "Tests" courier-response-show-tests)]
+    ("r" "Response" (lambda () (interactive) (courier--set-response-tab 'response)))
+    ("h" "Headers" (lambda () (interactive) (courier--set-response-tab 'headers)))
+    ("t" "Timeline" (lambda () (interactive) (courier--set-response-tab 'timeline)))
+    ("T" "Tests" (lambda () (interactive) (courier--set-response-tab 'tests)))
+    ("j" "Jump view" courier-response-jump-tab)]
    ["Body"
     ("v" "Body view" courier-response-set-view)
     ("V" "Raw/auto" courier-response-toggle-pretty)
@@ -4932,28 +4655,7 @@ This renames the request file and updates its front matter name."
     ("g" "Retry" courier-response-retry)
     ("k" "Cancel" courier-response-cancel)]
    ["Timeline"
-    ("c" "Clear timeline" courier-response-clear-timeline)]
-   ["Navigate"
-    ("]" "Next view" courier-response-next-tab)
-    ("[" "Prev view" courier-response-prev-tab)]])
-
-;;;###autoload
-(transient-define-prefix courier-overview-menu ()
-  "Show overview actions for the current Courier buffer."
-  [["Request"
-    ("o" "Open" courier-overview-open)
-    ("s" "Send" courier-overview-send)
-    ("p" "Preview" courier-overview-preview)
-    ("e" "Environment" courier-overview-switch-env)]
-   ["List"
-    ("/" "Filter" courier-overview-set-filter)
-    ("g" "Refresh" courier-overview-refresh)
-    ("j" "Jump/Open" courier-open)]
-   ["Manage"
-    ("n" "New request" courier-new-request)
-    ("F" "New folder" courier-new-folder)
-    ("r" "Rename" courier-rename-request)
-    ("m" "Move" courier-move-request)]])
+    ("c" "Clear timeline" courier-response-clear-timeline)]])
 
 ;;;###autoload
 (defun courier-dispatch ()
@@ -4964,13 +4666,10 @@ This renames the request file and updates its front matter name."
     (transient-setup 'courier-request-menu))
    ((derived-mode-p 'courier--response-mode)
     (transient-setup 'courier-response-menu))
-   ((derived-mode-p 'courier-overview-mode)
-    (transient-setup 'courier-overview-menu))
    (t
     (user-error "No Courier action menu is available in this buffer"))))
 
 (define-key courier-request-mode-map (kbd "C-c C-c") #'courier-request-send)
-(define-key courier-request-mode-map (kbd "C-c C-b") #'courier-overview)
 (define-key courier-request-mode-map (kbd "C-c ?") #'courier-dispatch)
 (define-key courier-request-mode-map (kbd "C-c C-e") #'courier-request-switch-env)
 (define-key courier-request-mode-map (kbd "C-c C-j") #'courier-request-jump-section)

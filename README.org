@@ -16,8 +16,8 @@ buffers.
 - Select per-buffer environments from collection =env/*.env= files with =C-c C-e=
 - Pretty-print JSON responses, with =v= to toggle raw view
 - Start unsaved request drafts and place them into a collection on first save
-- Browse the current collection in an overview buffer with =C-c C-b=
-- Jump between requests and environments with =C-c C-o=
+- Jump between requests and environments with =C-c C-o= from one annotated
+  minibuffer picker, even outside an active Courier buffer
 - Open a context-aware action menu with =C-c ?=
 
 * Requirements
@@ -64,9 +64,22 @@ Open it in Emacs. Press =C-c C-c= to send.
 
 * Collections
 
-A Courier collection is a directory marked by =courier.json=. When this file is
-present, Courier treats that directory as the collection root for request
-discovery and does not scan environment files above it.
+A Courier collection is a directory marked by =courier.json=. Courier stores
+collections under a dedicated =collections/= directory inside
+=courier-home-directory=. When =courier.json= is present, Courier treats that
+directory as the collection root for request discovery and does not scan
+environment files above it.
+
+Example home layout:
+
+#+begin_example
+~/courier/
+  collections/
+    my-api/
+      courier.json
+      requests/
+      env/
+#+end_example
 
 Minimal =courier.json= example:
 
@@ -278,7 +291,6 @@ token=abc123
 | Key       | Command                        | Description            |
 |-----------+--------------------------------+------------------------|
 | =C-c C-c= | =courier-request-send=         | Send request           |
-| =C-c C-b= | =courier-overview=             | Open collection view   |
 | =C-c C-e= | =courier-request-switch-env=   | Switch environment     |
 | =C-c C-j= | =courier-request-jump-section= | Jump to request section |
 | =C-c [=   | =courier-request-prev-section= | Previous main section  |
@@ -293,14 +305,15 @@ token=abc123
 | =C-x C-s= | =courier-request-save-buffer=  | Save draft or file     |
 
 Use =M-x courier-new-request= or =C-c C-n= to open an unsaved draft buffer. The
-draft stores =name = "Untitled N"= in front matter and uses the same value in
-its buffer name, but the request editor itself starts at the request line using
-=courier-default-request-method=, which defaults to =GET=. On the first
-=C-x C-s=, Courier asks which collection should own the request, starting from
-=courier-default-collection-directory=, which defaults to a =courier/=
-directory under the current user's home directory. If the chosen directory is
-not already a Courier collection, Courier offers to create one there before
-saving the request into that collection's =requests/= directory.
+draft buffer is temporary and the request editor itself starts at the request
+line using =courier-default-request-method=, which defaults to =GET=. On the first
+=C-x C-s=, Courier asks which collection should own the request. Courier keeps
+collections under =courier-home-directory= in =collections/<name>/=. If you
+type a collection name that does not exist yet, Courier creates it there
+before saving the request into that collection's =requests/= directory. Courier
+then asks for the request filename explicitly instead of inventing one from the
+current request name; =.http= is added automatically unless you typed it
+yourself.
 The request-line method token is highlighted with a lightweight overlay so
 =GET=/=POST=/etc. remain visually obvious while editing.
 The request buffer uses a section view model with a navigation header line:
@@ -322,28 +335,19 @@ Saving then writes them back into the request URL instead of keeping two
 separate truths.
 
 Use =M-x courier-create-collection= to create a collection explicitly. Use
-=C-c C-o= inside a collection to open another =.http= file or switch the
-current buffer to a different environment from the same minibuffer picker.
-Use =C-c ?= in a request buffer for request actions, including the export
-submenu for copying =curl=, =httpie=, or =wget= commands with or without
-variable interpolation. Request content itself stays source-backed: Courier
-uses transient for actions, not as the primary editor for params, auth, or
-script content.
-
-Use =C-c C-b= to open the current collection overview. The overview buffer
-lists requests, shows recent status and environment context, and supports:
-
-- =RET= to open the request at point
-- =C-c ?= to show overview actions
-- =n= to create a new request
-- =f= to create a folder
-- =r= to rename the request at point
-- =m= to move the request at point
-- =s= to send it
-- =p= to preview it
-- =e= to switch its environment
-- =/= to filter the list
-- =g= to refresh
+=C-c C-o= to open another =.http= file or switch the current buffer to a
+different environment from the same minibuffer picker. Courier scans known
+collections under =courier-home-directory=, lists request files directly from
+the filesystem, and shows collection names as completion annotations instead of
+dropping into a directory prompt or parsing request contents just to build
+picker entries.
+Environment entries are only offered when the current buffer is a Courier
+request, because env switching is request-buffer-local. Request candidates keep
+their relative path as the main label; env candidates keep only the env name as
+the main label and move collection/path context into the annotation.
+Use =C-c ?= in a request buffer for request actions. Request content itself
+stays source-backed: Courier uses transient for actions, not as the primary
+editor for params, auth, or script content.
 
 Request and folder management stay file-based. Courier renames and moves normal
 =.http= files and directories so Git continues to see plain filesystem changes.
@@ -355,14 +359,14 @@ Request and folder management stay file-based. Courier renames and moves normal
 | =TAB=     | =courier-response-context-tab=     | Expand entry or move to next button |
 | =RET=     | =courier-response-activate=        | Activate timeline item or open body |
 | =C-c ?=   | =courier-dispatch=                 | Show response actions      |
-| =h=       | =courier-response-show-headers=    | Show Headers tab          |
-| =l=       | =courier-response-show-timeline=   | Show Timeline tab         |
+| =h=       | inline view switch                 | Show Headers tab          |
+| =l=       | inline view switch                 | Show Timeline tab         |
 | =o=       | =courier-response-open-body=       | Open body viewer          |
 | =g=       | =courier-response-retry=           | Resend request            |
 | =]=       | =courier-response-next-tab=        | Next response tab         |
 | =[=       | =courier-response-prev-tab=        | Previous response tab     |
-| =r=       | =courier-response-show-response=   | Show Response tab         |
-| =t=       | =courier-response-show-tests=      | Show Tests tab            |
+| =r=       | inline view switch                 | Show Response tab         |
+| =t=       | inline view switch                 | Show Tests tab            |
 | =v=       | =courier-response-set-view=        | Select body view          |
 | =V=       | =courier-response-toggle-pretty=   | Toggle raw/auto body view |
 | =C-c C-k= | =courier-response-cancel=          | Cancel request            |
@@ -374,9 +378,10 @@ and image views display the image when Emacs can render it. The main response
 buffer also applies syntax highlighting to =json=, =html=, =xml=, and
 =javascript= body views. The active top-level response view is shown in the
 =header-line= as =Response >>=, =Headers >>=, =Timeline >>=, or =Tests >>=;
-use =[= and =]= to cycle views, or the direct keys =r=, =h=, =l=, and =t=.
-Use =C-c ?= in request, response, and overview buffers to open a transient menu
-for the actions that make sense in the current Courier context.
+use =[= and =]= to cycle views, =C-c C-j= to jump directly to a response view,
+or the direct keys =r=, =h=, =l=, and =t=.
+Use =C-c ?= in request and response buffers to open a transient menu for the
+actions that make sense in the current Courier context.
 
 * Response Buffer
 
@@ -411,7 +416,7 @@ position (for example =2/5=).
 |-------------------------------+-----------+----------------------------------|
 | =courier-curl-executable=     | ="curl"=  | Path to curl                     |
 | =courier-body-text-max-size=  | =524288=  | Max body size decoded as text    |
-| =courier-default-collection-directory= | user home =courier/= | Default collection prompt root |
+| =courier-home-directory=         | user home =courier/= | Root for Courier-managed persistent data |
 | =courier-default-request-method= | ="GET"= | Default method for new drafts    |
 | =courier-default-timeout=     | =30=      | Default timeout in seconds       |
 | =courier-history-max=         | =20=      | Max history entries per request  |

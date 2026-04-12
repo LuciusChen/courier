@@ -1106,7 +1106,7 @@
         (setq pos (1+ pos)))
       (should found-face))))
 
-(ert-deftest courier-response-show-tests-switches-tab ()
+(ert-deftest courier-response-set-tab-switches-to-tests ()
   (with-temp-buffer
     (courier--render-response
      '(:status-code 200
@@ -1120,7 +1120,7 @@
        :stderr ""
        :exit-code 0)
      courier-test--request)
-    (courier-response-show-tests)
+    (courier-response-set-tab 'tests)
     (should (eq courier--response-tab 'tests))
     (should (string-match-p "\\` Tests(1)  >>  •  200 OK  •  10ms  •  12B"
                             (substring-no-properties header-line-format)))
@@ -1151,10 +1151,10 @@
        :exit-code 0)
      courier-test--request)
     (goto-char (point-max))
-    (courier-response-show-headers)
+    (courier-response-set-tab 'headers)
     (should (= (point) (point-min)))
     (goto-char (point-max))
-    (courier-response-show-response)
+    (courier-response-set-tab 'response)
     (should (= (point) (point-min)))))
 
 (ert-deftest courier-test-history-push-stores-responses ()
@@ -1176,7 +1176,7 @@
     (courier--render-response
      (courier-test--make-response 404)
      courier-test--request)
-    (courier-response-show-timeline)
+    (courier-response-set-tab 'timeline)
     (goto-char (point-min))
     (search-forward "200 OK")
     (courier-response-activate)
@@ -1196,7 +1196,7 @@
       (should (string-match-p
                "\\` Response  >>  •  200 OK  •  42ms  •  5B"
                line))
-      (courier-response-show-headers)
+      (courier-response-set-tab 'headers)
       (should (string-match-p
                "\\` Headers(1)  >>  •  200 OK  •  42ms  •  5B"
                (substring-no-properties header-line-format))))))
@@ -1229,7 +1229,7 @@
        :headers (("content-type" . "application/json"))
        :body "{\"name\":\"Lucy\"}"
        :path "/tmp/test.http"))
-    (courier-response-show-timeline)
+    (courier-response-set-tab 'timeline)
     (courier--select-history-index 0)
     (courier--toggle-timeline-section 'network-logs)
     (should (eq courier--response-tab 'timeline))
@@ -1244,7 +1244,7 @@
     (courier--render-response
      (courier-test--make-response 404)
      courier-test--request)
-    (courier-response-show-timeline)
+    (courier-response-set-tab 'timeline)
     (should (null courier--history-index))
     (should-not (string-match-p "Request\\|Network Logs" (buffer-string)))
     (should (string-match-p "404 OK" (buffer-string)))
@@ -1258,7 +1258,7 @@
     (courier--render-response
      (courier-test--make-response 404)
      courier-test--request)
-    (courier-response-show-timeline)
+    (courier-response-set-tab 'timeline)
     (courier--select-history-index 0)
     (should (= 0 (courier-test--count-matches "404 OK" (buffer-string))))
     (should (= 1 (courier-test--count-matches "200 OK" (buffer-string))))))
@@ -1271,7 +1271,7 @@
     (courier--render-response
      (courier-test--make-response 404)
      courier-test--request)
-    (courier-response-show-timeline)
+    (courier-response-set-tab 'timeline)
     (courier--select-history-index 1)
     (let ((button (button-at (point))))
       (should button)
@@ -1282,7 +1282,7 @@
     (courier--render-response
      (courier-test--make-response 200)
      courier-test--request)
-    (courier-response-show-timeline)
+    (courier-response-set-tab 'timeline)
     (courier--select-history-index 0)
     (courier--toggle-timeline-section 'network-logs)
     (let ((button (button-at (point))))
@@ -1294,7 +1294,7 @@
     (courier--render-response
      (courier-test--make-response 200)
      courier-test--request)
-    (courier-response-show-timeline)
+    (courier-response-set-tab 'timeline)
     (courier--select-history-index 0)
     (courier--toggle-timeline-section 'network-logs)
     (should (string-match-p "\\` Timeline  >>  •  200 OK  •  42ms  •  5B"
@@ -1305,7 +1305,7 @@
     (courier--render-response
      (courier-test--make-response 200)
      courier-test--request)
-    (courier-response-show-timeline)
+    (courier-response-set-tab 'timeline)
     (courier--select-history-index 0)
     (courier--toggle-timeline-section 'response)
     (should (string-match-p "Headers(1)" (buffer-string)))))
@@ -1315,7 +1315,7 @@
     (courier--render-response
      (courier-test--make-response 200)
      courier-test--request)
-    (courier-response-show-timeline)
+    (courier-response-set-tab 'timeline)
     (goto-char (point-min))
     (search-forward "200 OK")
     (let ((button (button-at (point))))
@@ -1327,7 +1327,7 @@
     (courier--render-response
      (courier-test--make-response 200)
      courier-test--request)
-    (courier-response-show-timeline)
+    (courier-response-set-tab 'timeline)
     (goto-char (point-min))
     (search-forward "200 OK")
     (let* ((button (button-at (point)))
@@ -1340,7 +1340,7 @@
     (courier--render-response
      (courier-test--make-response 200)
      courier-test--request)
-    (courier-response-show-timeline)
+    (courier-response-set-tab 'timeline)
     (goto-char (point-min))
     (search-forward "200 OK")
     (let ((face (get-text-property (1- (point)) 'face)))
@@ -1352,7 +1352,7 @@
     (courier--render-response
      (courier-test--make-response 200)
      courier-test--request)
-    (courier-response-show-timeline)
+    (courier-response-set-tab 'timeline)
     (courier--select-history-index 0)
     (goto-char (point-min))
     (search-forward "GET https://example.com")
@@ -1365,7 +1365,7 @@
     (courier--render-response
      (courier-test--make-response 200)
      courier-test--request)
-    (courier-response-show-timeline)
+    (courier-response-set-tab 'timeline)
     (courier--select-history-index 0)
     (let ((buffer (buffer-string)))
       (should (string-match-p "GET https://example.com" buffer))
@@ -1377,7 +1377,7 @@
     (courier--render-response
      (courier-test--make-response 200)
      courier-test--request)
-    (courier-response-show-timeline)
+    (courier-response-set-tab 'timeline)
     (goto-char (point-min))
     (search-forward "200 OK")
     (courier-response-context-tab)
@@ -1391,7 +1391,7 @@
     (courier--render-response
      (courier-test--make-response 404)
      courier-test--request)
-    (courier-response-show-timeline)
+    (courier-response-set-tab 'timeline)
     (goto-char (point-min))
     (search-forward "200 OK")
     (end-of-line)
@@ -1412,7 +1412,7 @@
     (courier--render-response
      (courier-test--make-response 404)
      courier-test--request)
-    (courier-response-show-timeline)
+    (courier-response-set-tab 'timeline)
     (goto-char (point-min))
     (search-forward "200 OK")
     (courier-response-context-tab)
@@ -1431,7 +1431,7 @@
     (courier--render-response
      (courier-test--make-response 404)
      courier-test--request)
-    (courier-response-show-timeline)
+    (courier-response-set-tab 'timeline)
     (courier-response-clear-timeline)
     (should-not courier--history)
     (should-not courier--history-index)
@@ -1592,7 +1592,7 @@
         (setq-local courier--request-path request-file)
         (should-not (courier--available-env-entries))))))
 
-(ert-deftest courier-request-candidates-include-method-name-and-path ()
+(ert-deftest courier-request-candidates-use-file-system-labels ()
   (courier-test--with-temp-dir (root)
     (let* ((request-file (expand-file-name "users/get-user.http" root)))
       (make-directory (file-name-directory request-file) t)
@@ -1603,34 +1603,35 @@
       (let ((candidate (car (courier--request-candidates root))))
         (should (equal (plist-get (cdr candidate) :path) request-file))
         (should (eq (plist-get (cdr candidate) :kind) 'request))
-        (should (string-match-p "^GET\\s-+Get User" (car candidate)))
-        (should (string-match-p "users/get-user\\.http$" (car candidate)))))))
+        (should (equal (car candidate) "users/get-user"))))))
 
-(ert-deftest courier-open-errors-on-malformed-request-file ()
+(ert-deftest courier-open-does-not-parse-request-files ()
   (courier-test--with-temp-dir (root)
-    (let ((request-file (expand-file-name "users/broken.http" root)))
+    (let* ((courier-home-directory root)
+           (collection-root (expand-file-name "collections/api-collection" root))
+           (request-root (expand-file-name "requests/users" collection-root))
+           (request-file (expand-file-name "broken.http" request-root)))
       (make-directory (file-name-directory request-file) t)
-      (with-temp-file request-file
-        (insert "+++\nname = \"Broken\"\n+++\n\nGET \n"))
-      (let ((default-directory root))
-        (should-error (courier-open) :type 'user-error)))))
-
-(ert-deftest courier-overview-errors-on-malformed-request-file ()
-  (courier-test--with-temp-dir (root)
-    (let* ((collection-root (expand-file-name "api-collection" root))
-           (request-dir (expand-file-name "requests/users" collection-root))
-           (request-file (expand-file-name "broken.http" request-dir)))
-      (make-directory request-dir t)
       (with-temp-file (expand-file-name "courier.json" collection-root)
         (insert "{}\n"))
       (with-temp-file request-file
         (insert "+++\nname = \"Broken\"\n+++\n\nGET \n"))
-      (let ((default-directory collection-root))
-        (should-error (courier-overview) :type 'user-error)))))
+      (with-temp-buffer
+        (setq default-directory root)
+        (cl-letf (((symbol-function 'courier-parse-file)
+                   (lambda (&rest _args)
+                     (ert-fail "courier-open should not parse request files")))
+                  ((symbol-function 'completing-read)
+                   (lambda (_prompt collection &rest _args)
+                     (car (all-completions "" collection))))
+                  ((symbol-function 'find-file)
+                   #'ignore))
+          (courier-open))))))
 
 (ert-deftest courier-open-opens-selected-request-file ()
   (courier-test--with-temp-dir (root)
-    (let* ((collection-root (expand-file-name "api-collection" root))
+    (let* ((courier-home-directory root)
+           (collection-root (expand-file-name "collections/api-collection" root))
            (request-root (expand-file-name "requests/users" collection-root))
            (first-file (expand-file-name "get-user.http" request-root))
            (second-file (expand-file-name "create-user.http" request-root))
@@ -1651,8 +1652,11 @@
                  :url "https://example.com/users")))
       (cl-letf (((symbol-function 'completing-read)
                  (lambda (_prompt collection &rest _args)
-                   (setq expected-file (plist-get (cdar collection) :path))
-                   (caar collection)))
+                   (let* ((selection (car (all-completions "" collection)))
+                          (candidate
+                           (assoc selection (courier--open-candidates))))
+                     (setq expected-file (plist-get (cdr candidate) :path))
+                     selection)))
                 ((symbol-function 'find-file)
                  (lambda (path)
                    (setq opened-file path))))
@@ -1660,10 +1664,30 @@
           (courier-open)))
       (should (equal opened-file expected-file)))))
 
-(ert-deftest courier-open-requires-collection ()
-  (with-temp-buffer
-    (setq default-directory temporary-file-directory)
-    (should-error (courier-open) :type 'user-error)))
+(ert-deftest courier-open-finds-collections-outside-context ()
+  (courier-test--with-temp-dir (root)
+    (let* ((courier-home-directory root)
+           (collection-root (expand-file-name "collections/api-collection" root))
+           (request-root (expand-file-name "requests/users" collection-root))
+           (request-file (expand-file-name "get-user.http" request-root))
+           opened-file)
+      (make-directory request-root t)
+      (with-temp-file (expand-file-name "courier.json" collection-root)
+        (insert "{}\n"))
+      (with-temp-file request-file
+        (insert (courier-test--http-content
+                 :name "Get User"
+                 :url "https://example.com/users/42")))
+      (with-temp-buffer
+        (setq default-directory root)
+        (cl-letf (((symbol-function 'completing-read)
+                   (lambda (_prompt collection &rest _args)
+                     (car (all-completions "" collection))))
+                  ((symbol-function 'find-file)
+                   (lambda (path)
+                     (setq opened-file path))))
+          (courier-open)))
+      (should (equal opened-file request-file)))))
 
 (ert-deftest courier-request-set-method-rewrites-request-line ()
   (courier-test--with-request
@@ -1760,20 +1784,8 @@
         (courier-dispatch))
       (should (eq called 'courier-response-menu)))))
 
-(ert-deftest courier-dispatch-routes-overview-mode ()
-  (with-temp-buffer
-    (courier-overview-mode)
-    (let (called)
-      (cl-letf (((symbol-function 'transient-setup)
-                 (lambda (prefix &rest _args)
-                   (setq called prefix))))
-        (courier-dispatch))
-      (should (eq called 'courier-overview-menu)))))
-
 (ert-deftest courier-mode-maps-bind-c-c-question ()
   (should (eq (lookup-key courier-request-mode-map (kbd "C-c ?"))
-              #'courier-dispatch))
-  (should (eq (lookup-key courier-overview-mode-map (kbd "C-c ?"))
               #'courier-dispatch))
   (should (eq (lookup-key courier--response-mode-map (kbd "C-c ?"))
               #'courier-dispatch)))
@@ -1792,65 +1804,17 @@
   (should (eq (lookup-key courier--response-mode-map (kbd "["))
               #'courier-response-prev-tab)))
 
-(ert-deftest courier-current-export-command-builds-curl ()
-  (courier-test--with-request
-      (courier-test--http-content
-       :method "POST"
-       :url "https://example.com/users"
-       :headers '(("accept" . "application/json"))
-       :body "{\"name\":\"Lucy\"}\n"
-       :params '(("page" . "1"))
-       :vars '(("token" . "abc123"))
-       :auth '(:type bearer :token "{{token}}"))
-    (courier-request-mode)
-    (setq-local courier--export-format 'curl
-                courier--export-interpolate t)
-    (let ((command (courier--current-export-command)))
-      (should (string-match-p (regexp-quote "curl --request POST") command))
-      (should (string-match-p
-               (regexp-quote "--url https\\://example.com/users\\?page\\=1")
-               command))
-      (should (string-match-p
-               (regexp-quote "authorization\\:\\ Bearer\\ abc123")
-               command))
-      (should (string-match-p (regexp-quote "--data-raw") command)))))
+(ert-deftest courier-response-mode-binds-jump-navigation ()
+  (should (eq (lookup-key courier--response-mode-map (kbd "C-c C-j"))
+              #'courier-response-jump-tab)))
 
-(ert-deftest courier-current-export-command-builds-httpie ()
-  (courier-test--with-request
-      (courier-test--http-content
-       :url "https://example.com/users"
-       :headers '(("accept" . "application/json"))
-       :params '(("page" . "1")))
-    (courier-request-mode)
-    (setq-local courier--export-format 'httpie
-                courier--export-interpolate t)
-    (let ((command (courier--current-export-command)))
-      (should (string-match-p
-               (regexp-quote "http GET https\\://example.com/users\\?page\\=1")
-               command))
-      (should (string-match-p
-               (regexp-quote "accept\\:application/json")
-               command)))))
-
-(ert-deftest courier-current-export-command-preserves-source-placeholders ()
-  (courier-test--with-request
-      (courier-test--http-content
-       :url "https://example.com/users/{{user_id}}"
-       :params '(("page" . "{{page}}"))
-       :auth '(:type bearer :token "{{token}}"))
-    (courier-request-mode)
-    (setq-local courier--export-format 'curl
-                courier--export-interpolate nil)
-    (let ((command (courier--current-export-command)))
-      (should (string-match-p
-               (regexp-quote "users/\\{\\{user_id\\}\\}")
-               command))
-      (should (string-match-p
-               (regexp-quote "page\\=\\{\\{page\\}\\}")
-               command))
-      (should (string-match-p
-               (regexp-quote "Bearer\\ \\{\\{token\\}\\}")
-               command)))))
+(ert-deftest courier-response-jump-tab-switches-view ()
+  (with-temp-buffer
+    (courier--render-response
+     (courier-test--make-response 200)
+     courier-test--request)
+    (courier-response-jump-tab 'tests)
+    (should (eq courier--response-tab 'tests))))
 
 (ert-deftest courier-request-jump-section-shows-post-response-script ()
   (courier-test--with-request
@@ -2015,10 +1979,11 @@
             (cl-letf (((symbol-function 'completing-read)
                        (lambda (_prompt collection &rest _args)
                          (setq selected-candidate
-                               (car (seq-find
-                                     (lambda (candidate)
-                                       (eq (plist-get (cdr candidate) :kind) 'env))
-                                     collection)))
+                               (seq-find
+                                (lambda (candidate)
+                                  (string= (get-text-property 0 'courier-group candidate)
+                                           "Environments"))
+                                (all-completions "" collection)))
                          selected-candidate)))
               (courier-open))
             (should (equal courier--active-env "local")))
@@ -2044,24 +2009,105 @@
       (with-temp-buffer
         (setq-local buffer-file-name request-file)
         (setq-local courier--request-path request-file)
-        (setq candidates (courier--open-candidates))
+        (courier-request-mode)
+        (let ((courier-home-directory root))
+          (setq candidates (courier--open-candidates)))
         (should (seq-some
                  (lambda (candidate)
                    (string= (get-text-property 0 'courier-group (car candidate))
                             "Requests"))
                  candidates))
         (should (seq-some
+                    (lambda (candidate)
+                       (string= (get-text-property 0 'courier-group (car candidate))
+                                "Environments"))
+                    candidates))))))
+
+(ert-deftest courier-open-candidates-only-include-current-collection-envs ()
+  (courier-test--with-temp-dir (root)
+    (let* ((courier-home-directory root)
+           (first-root (expand-file-name "collections/first-api" root))
+           (second-root (expand-file-name "collections/second-api" root))
+           (first-request (expand-file-name "requests/get-user.http" first-root))
+           (second-request (expand-file-name "requests/get-other.http" second-root))
+           (first-env (expand-file-name "env/local.env" first-root))
+           (second-env (expand-file-name "env/prod.env" second-root))
+           candidates)
+      (make-directory (file-name-directory first-request) t)
+      (make-directory (file-name-directory second-request) t)
+      (make-directory (file-name-directory first-env) t)
+      (make-directory (file-name-directory second-env) t)
+      (with-temp-file (expand-file-name "courier.json" first-root)
+        (insert "{}\n"))
+      (with-temp-file (expand-file-name "courier.json" second-root)
+        (insert "{}\n"))
+      (with-temp-file first-request
+        (insert "GET https://example.com/users/42\n"))
+      (with-temp-file second-request
+        (insert "GET https://example.com/other\n"))
+      (with-temp-file first-env
+        (insert "token=local\n"))
+      (with-temp-file second-env
+        (insert "token=prod\n"))
+      (find-file first-request)
+      (unwind-protect
+          (progn
+            (setq candidates (courier--open-candidates))
+            (should (seq-some
+                     (lambda (candidate)
+                       (and (eq (plist-get (cdr candidate) :kind) 'env)
+                            (equal (plist-get (cdr candidate) :path) first-env)))
+                     candidates))
+            (should-not (seq-some
+                         (lambda (candidate)
+                           (and (eq (plist-get (cdr candidate) :kind) 'env)
+                                (equal (plist-get (cdr candidate) :path) second-env)))
+                         candidates))
+            (should (seq-some
+                     (lambda (candidate)
+                       (and (eq (plist-get (cdr candidate) :kind) 'request)
+                            (equal (plist-get (cdr candidate) :path) second-request)))
+                     candidates)))
+        (kill-buffer (current-buffer))))))
+
+(ert-deftest courier-open-candidates-outside-request-buffer-hide-environments ()
+  (courier-test--with-temp-dir (root)
+    (let* ((courier-home-directory root)
+           (collection-root (expand-file-name "collections/api-collection" root))
+           (request-dir (expand-file-name "requests/users" collection-root))
+           (env-dir (expand-file-name "env" collection-root))
+           candidates)
+      (make-directory request-dir t)
+      (make-directory env-dir t)
+      (with-temp-file (expand-file-name "courier.json" collection-root)
+        (insert "{}\n"))
+      (with-temp-file (expand-file-name "get-user.http" request-dir)
+        (insert (courier-test--http-content
+                 :name "Get User"
+                 :url "https://example.com/users/42")))
+      (with-temp-file (expand-file-name "local.env" env-dir)
+        (insert "token=local\n"))
+      (with-temp-buffer
+        (setq candidates (courier--open-candidates))
+        (should (seq-some
                  (lambda (candidate)
                    (string= (get-text-property 0 'courier-group (car candidate))
-                            "Environments"))
-                 candidates))))))
+                            "Requests"))
+                 candidates))
+        (should-not (seq-some
+                     (lambda (candidate)
+                       (string= (get-text-property 0 'courier-group (car candidate))
+                                "Environments"))
+                     candidates))))))
 
-(ert-deftest courier-overview-renders-request-list ()
+(ert-deftest courier-open-candidates-annotate-collection-name ()
   (courier-test--with-temp-dir (root)
-    (let* ((collection-root (expand-file-name "api-collection" root))
+    (let* ((courier-home-directory root)
+           (collection-root (expand-file-name "collections/api-collection" root))
            (request-dir (expand-file-name "requests/users" collection-root))
            (request-file (expand-file-name "get-user.http" request-dir))
-           overview-buffer)
+           request-candidate
+           candidates)
       (make-directory request-dir t)
       (with-temp-file (expand-file-name "courier.json" collection-root)
         (insert "{\n  \"name\": \"Demo API\"\n}\n"))
@@ -2069,49 +2115,100 @@
         (insert (courier-test--http-content
                  :name "Get User"
                  :url "https://example.com/users/42")))
-      (cl-letf (((symbol-function 'display-buffer)
-                 (lambda (buffer &rest _args)
-                   (setq overview-buffer buffer)
-                   buffer)))
-        (let ((default-directory collection-root))
-          (courier-overview)))
-      (with-current-buffer overview-buffer
-        (should (derived-mode-p 'courier-overview-mode))
-        (should (string-match-p "Collection: Demo API"
-                                (buffer-string)))
-        (should (string-match-p "Get User" (buffer-string)))
-        (should (string-match-p "users/get-user\\.http"
-                                (buffer-string)))))))
+      (with-temp-buffer
+        (setq candidates (courier--open-candidates)))
+      (setq request-candidate
+            (car (seq-filter
+                  (lambda (candidate)
+                    (eq (plist-get (cdr candidate) :kind) 'request))
+                  candidates)))
+      (should (equal (get-text-property 0 'courier-annotation
+                                        (car request-candidate))
+                     "Demo API")))))
 
-(ert-deftest courier-overview-open-opens-request-at-point ()
+(ert-deftest courier-completion-table-exposes-affixation-metadata ()
+  (let* ((candidates
+          (list
+           (cons (propertize "users/get-user"
+                             'courier-group "Requests"
+                             'courier-annotation "api-collection")
+                 (list :kind 'request :path "/tmp/get-user.http"))))
+         (table (courier--completion-table
+                 candidates
+                 '(category . courier-open)
+                 '(group-function . courier--completion-group)
+                 '(affixation-function . courier--completion-affixation)))
+         (metadata (completion-metadata "" table nil))
+         (affixation (completion-metadata-get metadata 'affixation-function))
+         (group (completion-metadata-get metadata 'group-function))
+         (candidate (caar candidates))
+         (rows (funcall affixation (list candidate))))
+    (should affixation)
+    (should group)
+    (should (equal (funcall group candidate nil) "Requests"))
+    (should (equal (cadar rows) ""))
+    (should (string-match-p "api-collection" (cl-caddar rows)))))
+
+(ert-deftest courier-open-env-candidates-use-annotation-for-context ()
   (courier-test--with-temp-dir (root)
     (let* ((collection-root (expand-file-name "api-collection" root))
-           (request-dir (expand-file-name "requests/users" collection-root))
+           (request-dir (expand-file-name "requests" collection-root))
+           (env-dir (expand-file-name "env" collection-root))
            (request-file (expand-file-name "get-user.http" request-dir))
-           overview-buffer
-           opened-file)
+           env-candidate
+           candidates)
       (make-directory request-dir t)
+      (make-directory env-dir t)
       (with-temp-file (expand-file-name "courier.json" collection-root)
         (insert "{}\n"))
       (with-temp-file request-file
-        (insert (courier-test--http-content
-                 :name "Get User"
-                 :url "https://example.com/users/42")))
-      (cl-letf (((symbol-function 'display-buffer)
-                 (lambda (buffer &rest _args)
-                   (setq overview-buffer buffer)
-                   buffer)))
-        (let ((default-directory collection-root))
-          (courier-overview)))
-      (with-current-buffer overview-buffer
-        (goto-char (point-min))
-        (search-forward "Get User")
-        (beginning-of-line)
-        (cl-letf (((symbol-function 'find-file)
-                   (lambda (path)
-                     (setq opened-file path))))
-          (courier-overview-open)))
-      (should (equal opened-file request-file)))))
+        (insert "GET https://example.com/users/42\n"))
+      (with-temp-file (expand-file-name "local.env" env-dir)
+        (insert "token=local\n"))
+      (find-file request-file)
+      (unwind-protect
+          (progn
+            (setq candidates (courier--open-candidates))
+            (setq env-candidate
+                  (seq-find
+                   (lambda (candidate)
+                     (eq (plist-get (cdr candidate) :kind) 'env))
+                   candidates))
+            (should env-candidate)
+            (should (equal (car env-candidate) "* local"))
+            (should (equal (get-text-property 0 'courier-annotation
+                                              (car env-candidate))
+                           "api-collection • env/local.env")))
+        (kill-buffer (current-buffer))))))
+
+(ert-deftest courier-discover-collection-roots-reads-home-collections-only ()
+  (courier-test--with-temp-dir (root)
+    (let* ((courier-home-directory root)
+           (home-root (file-name-as-directory root))
+           (collections-root (expand-file-name "collections" root))
+           (first-root (expand-file-name "collections/first-api" root))
+           (second-root (expand-file-name "collections/second-api" root)))
+      (make-directory collections-root t)
+      (make-directory first-root t)
+      (make-directory second-root t)
+      (with-temp-file (expand-file-name "courier.json" home-root)
+        (insert "{\n  \"name\": \"Wrong Home\"\n}\n"))
+      (with-temp-file (expand-file-name "courier.json" first-root)
+        (insert "{\n  \"name\": \"First API\"\n}\n"))
+      (with-temp-file (expand-file-name "courier.json" second-root)
+        (insert "{\n  \"name\": \"Second API\"\n}\n"))
+      (should (equal (courier--discover-collection-roots)
+                     (list (file-name-as-directory first-root)
+                           (file-name-as-directory second-root)))))))
+
+(ert-deftest courier-collection-root-ignores-home-marker ()
+  (courier-test--with-temp-dir (root)
+    (let ((courier-home-directory root))
+      (with-temp-file (expand-file-name "courier.json" root)
+        (insert "{\n  \"name\": \"Wrong Home\"\n}\n"))
+      (with-temp-buffer
+        (setq default-directory root)
+        (should-not (courier--collection-root)))))) 
 
 (ert-deftest courier-new-request-creates-untitled-draft ()
   (let ((courier--untitled-request-counter 0)
@@ -2165,7 +2262,8 @@
 
 (ert-deftest courier-request-save-buffer-uses-configured-requests-dir ()
   (courier-test--with-temp-dir (root)
-    (let* ((collection-root (expand-file-name "api-collection" root))
+    (let* ((courier-home-directory root)
+           (collection-root (expand-file-name "collections/api-collection" root))
            (requests-root (expand-file-name "api-requests" collection-root))
            draft-buffer)
       (make-directory collection-root t)
@@ -2177,9 +2275,16 @@
             (insert "+++\nname = \"Create User\"\n+++\n\nGET \nAccept: application/json\n")
             (setq default-directory root)
             (courier-request-mode)
-            (cl-letf (((symbol-function 'read-directory-name)
-                       (lambda (&rest _args)
-                         collection-root)))
+            (cl-letf (((symbol-function 'completing-read)
+                       (lambda (prompt collection &rest _args)
+                         (if (string-prefix-p "Collection:" prompt)
+                             (car (all-completions "" collection))
+                           (error "Unexpected completing-read prompt: %s" prompt))))
+                      ((symbol-function 'read-string)
+                       (lambda (prompt &optional initial _history _default-value _inherit-input-method)
+                         (cond
+                          ((string-prefix-p "Request file name:" prompt) "create-user")
+                          (t initial)))))
               (courier-request-save-buffer))
             (should (equal (expand-file-name buffer-file-name)
                            (expand-file-name "create-user.http" requests-root)))
@@ -2189,19 +2294,22 @@
 
 (ert-deftest courier-request-save-buffer-creates-collection-when-needed ()
   (courier-test--with-temp-dir (root)
-    (let* ((collection-root (expand-file-name "api-collection" root))
+    (let* ((courier-home-directory root)
+           (collection-root (expand-file-name "collections/api-collection" root))
            (draft-buffer (generate-new-buffer "*courier-create-collection*")))
       (unwind-protect
           (with-current-buffer draft-buffer
             (insert "+++\nname = \"Untitled 1\"\n+++\n\nGET \nAccept: application/json\n")
             (setq default-directory root)
             (courier-request-mode)
-            (cl-letf (((symbol-function 'read-directory-name)
-                       (lambda (&rest _args)
-                         collection-root))
-                      ((symbol-function 'y-or-n-p)
-                       (lambda (&rest _args)
-                         t)))
+            (cl-letf (((symbol-function 'completing-read)
+                       (lambda (_prompt _collection &rest _args)
+                         "api-collection"))
+                      ((symbol-function 'read-string)
+                       (lambda (prompt &optional initial _history _default-value _inherit-input-method)
+                         (cond
+                          ((string-prefix-p "Request file name:" prompt) "untitled-1")
+                          (t initial)))))
               (courier-request-save-buffer))
             (should (file-exists-p (expand-file-name "courier.json" collection-root)))
             (should (file-exists-p (expand-file-name "requests/untitled-1.http"
@@ -2209,35 +2317,59 @@
         (when (buffer-live-p draft-buffer)
           (kill-buffer draft-buffer))))))
 
-(ert-deftest courier-request-save-buffer-prompts-from-default-collection-directory ()
+(ert-deftest courier-request-save-buffer-creates-collections-under-home ()
   (courier-test--with-temp-dir (root)
-    (let* ((courier-default-collection-directory
-            (expand-file-name "courier-home" root))
-           (collection-root (expand-file-name "api-collection"
-                                              courier-default-collection-directory))
-           (draft-buffer (generate-new-buffer "*courier-save-default-root*"))
-           captured-initial)
+    (let* ((courier-home-directory (expand-file-name "courier-home" root))
+           (collection-root (expand-file-name "collections/api-collection"
+                                              courier-home-directory))
+           (draft-buffer (generate-new-buffer "*courier-save-home-root*")))
       (unwind-protect
           (with-current-buffer draft-buffer
             (insert "+++\nname = \"Untitled 1\"\n+++\n\nGET \nAccept: application/json\n")
             (setq default-directory root)
             (courier-request-mode)
-            (cl-letf (((symbol-function 'read-directory-name)
-                       (lambda (_prompt initial &rest _args)
-                         (setq captured-initial initial)
-                         collection-root))
-                      ((symbol-function 'y-or-n-p)
-                       (lambda (&rest _args)
-                         t)))
+            (cl-letf (((symbol-function 'completing-read)
+                       (lambda (_prompt _collection &rest _args)
+                         "api-collection"))
+                      ((symbol-function 'read-string)
+                       (lambda (prompt &optional initial _history _default-value _inherit-input-method)
+                         (cond
+                          ((string-prefix-p "Request file name:" prompt) "untitled-1")
+                          (t initial)))))
               (courier-request-save-buffer))
-            (let ((expected
-                   (file-name-as-directory
-                    (expand-file-name courier-default-collection-directory))))
-              (should (equal (file-name-as-directory
-                              (expand-file-name captured-initial))
-                             expected)))
             (should (file-exists-p
-                     (expand-file-name "courier.json" collection-root))))
+                     (expand-file-name "courier.json" collection-root)))
+            (should (string-prefix-p
+                     (file-name-as-directory
+                      (expand-file-name (expand-file-name "collections"
+                                                          courier-home-directory)))
+                     (file-name-directory (expand-file-name buffer-file-name)))))
+        (when (buffer-live-p draft-buffer)
+          (kill-buffer draft-buffer))))))
+
+(ert-deftest courier-request-save-buffer-prompts-with-basename-without-http-suffix ()
+  (courier-test--with-temp-dir (root)
+    (let* ((courier-home-directory root)
+           (collection-root (expand-file-name "collections/api-collection" root))
+           (draft-buffer (generate-new-buffer "*courier-save-basename*"))
+           captured-initial)
+      (unwind-protect
+          (with-current-buffer draft-buffer
+            (insert "+++\nname = \"Create User\"\n+++\n\nGET \nAccept: application/json\n")
+            (setq default-directory root)
+            (courier-request-mode)
+            (cl-letf (((symbol-function 'completing-read)
+                       (lambda (_prompt _collection &rest _args)
+                         "api-collection"))
+                      ((symbol-function 'read-string)
+                       (lambda (prompt &optional initial _history _default-value _inherit-input-method)
+                         (when (string-prefix-p "Request file name:" prompt)
+                           (setq captured-initial initial)
+                           "create-user")
+                         initial)))
+              (courier-request-save-buffer))
+            (should (equal captured-initial "create-user"))
+            (should (string-suffix-p ".http" buffer-file-name)))
         (when (buffer-live-p draft-buffer)
           (kill-buffer draft-buffer))))))
 
