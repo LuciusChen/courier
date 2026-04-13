@@ -2352,6 +2352,20 @@
     (should (string-match-p "post_response = \\\"\\\"\\\"" (buffer-string)))
     (should (string-match-p "courier-script-response" (buffer-string)))))
 
+(ert-deftest courier-request-auth-section-uses-toml-fragment ()
+  (courier-test--with-request
+      (courier-test--http-content
+       :url "https://example.com/users"
+       :auth '(:type bearer :token "{{token}}"))
+    (courier-request-mode)
+    (courier-request-jump-section 'auth)
+    (should (string-match-p "^\\[auth\\]$" (buffer-string)))
+    (should (string-match-p "^type = \"bearer\"$" (buffer-string)))
+    (should (string-match-p "^token = \"{{token}}\"$" (buffer-string)))
+    (courier--sync-request-model)
+    (should (equal (plist-get courier--request-model :auth)
+                   '(:type bearer :token "{{token}}")))))
+
 (ert-deftest courier-request-jump-section-shows-request-section ()
   (courier-test--with-request
       "GET https://example.com/users?page=1\n"
@@ -2559,6 +2573,21 @@
                    "(message \"before\")"))
     (should (equal (plist-get courier--request-model :post-response-script)
                    "(message \"after\")"))))
+
+(ert-deftest courier-request-tests-section-round-trips-toml-array ()
+  (courier-test--with-request
+      (courier-test--http-content
+       :method "GET"
+       :url "https://example.com/users"
+       :tests '("status == 200" "body contains hello"))
+    (courier-request-mode)
+    (courier-request-jump-section 'tests)
+    (should (string-match-p "^tests = \\[$" (buffer-string)))
+    (should (string-match-p "\"status == 200\"," (buffer-string)))
+    (should (string-match-p "\"body contains hello\"," (buffer-string)))
+    (courier--sync-request-model)
+    (should (equal (plist-get courier--request-model :tests)
+                   '("status == 200" "body contains hello")))))
 
 (ert-deftest courier-request-set-auth-type-updates-request-model ()
   (courier-test--with-request

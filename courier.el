@@ -3715,8 +3715,9 @@ ACTIVE controls whether the active navigation face is used."
                 "# content_type = image/png\n"))
        (_ "")))
     ('auth
-     (concat "# Auth section\n"
-             "# Supported types: none, bearer, basic, header, api_key, oauth2\n"))
+     (concat "# [auth]\n"
+             "# type = \"bearer\"\n"
+             "# token = \"{{token}}\"\n"))
     ('vars
      (concat "# [vars]\n"
              "# token = \"courier-pigeon-token\"\n"
@@ -3738,7 +3739,11 @@ ACTIVE controls whether the active navigation face is used."
              "# post_response = \"\"\"\n"
              "# (message \"after response\")\n"
              "# \"\"\"\n"))
-    ('tests "# No tests.\n")
+    ('tests
+     (concat "# tests = [\n"
+             "#   \"status == 200\",\n"
+             "#   \"header content-type contains json\",\n"
+             "# ]\n"))
     (_ "")))
 
 (defun courier--format-request-kv-lines (pairs)
@@ -3758,43 +3763,19 @@ request URL query string."
   (or (plist-get request :params)
       (courier--parse-url-query-params (or (plist-get request :url) ""))))
 
-(defun courier--request-auth-lines (auth)
-  "Return editable text for AUTH."
-  (pcase (plist-get auth :type)
-    ('none
-     "type = none")
-    ('bearer
-     (format "type = bearer\ntoken = %s" (or (plist-get auth :token) "")))
-    ('basic
-     (format "type = basic\nusername = %s\npassword = %s"
-             (or (plist-get auth :username) "")
-             (or (plist-get auth :password) "")))
-    ('header
-     (format "type = header\nheader = %s\nvalue = %s"
-             (or (plist-get auth :header) "")
-             (or (plist-get auth :value) "")))
-    ('api_key
-     (format "type = api_key\nin = %s\nname = %s\nvalue = %s"
-             (or (plist-get auth :in) "header")
-             (or (plist-get auth :name) "")
-             (or (plist-get auth :value) "")))
-    ('oauth2
-     (string-join
-      (delq nil
-            (list (format "type = oauth2")
-                  (format "grant_type = %s"
-                          (or (plist-get auth :grant-type) "client_credentials"))
-                  (format "token_url = %s"
-                          (or (plist-get auth :token-url) ""))
-                  (format "client_id = %s"
-                          (or (plist-get auth :client-id) ""))
-                  (format "client_secret = %s"
-                          (or (plist-get auth :client-secret) ""))
-                  (when-let* ((scopes (plist-get auth :scopes)))
-                    (format "scopes = %s" (string-join scopes ", ")))))
-      "\n"))
-    (_
-     "")))
+(defun courier--request-auth-lines (request)
+  "Return editable TOML fragment for REQUEST auth."
+  (string-join (courier--serialize-front-matter-auth-sections request) "\n\n"))
+
+(defun courier--request-tests-lines (request)
+  "Return editable TOML fragment for REQUEST tests."
+  (if-let* ((tests (plist-get request :tests)))
+      (let ((lines (list "tests = [")))
+        (dolist (test tests)
+          (push (format "  %s," (courier--toml-quote-string test)) lines))
+        (push "]" lines)
+        (string-join (nreverse lines) "\n"))
+    ""))
 
 (defun courier--request-binary-body-lines (request)
   "Return editable text for binary body REQUEST metadata."
@@ -3943,13 +3924,13 @@ request URL query string."
            ('body
             (courier--request-body-section-text request))
            ('auth
-            (courier--request-auth-lines (plist-get request :auth)))
+            (courier--request-auth-lines request))
            ('vars
             (courier--request-vars-lines request))
            ('script
             (courier--request-script-lines request))
            ('tests
-            (string-join (plist-get request :tests) "\n"))
+            (courier--request-tests-lines request))
            (_
             ""))))
     (if (string-empty-p text)
@@ -4020,42 +4001,23 @@ request URL query string."
 
 (defun courier--parse-request-auth-lines (text)
   "Parse auth section TEXT into a Courier auth plist or nil."
-  (let* ((pairs (courier--parse-request-kv-lines text "auth"))
-         (type (cdr (assoc-string "type" pairs nil))))
-    (cond
-     ((null pairs) nil)
-     ((string-empty-p (or type ""))
-      (user-error "Auth section requires `type = ...'"))
-     ((string= type "none")
-      '(:type none))
-     ((string= type "bearer")
-      (list :type 'bearer
-            :token (or (cdr (assoc-string "token" pairs nil)) "")))
-     ((string= type "basic")
-      (list :type 'basic
-            :username (or (cdr (assoc-string "username" pairs nil)) "")
-            :password (or (cdr (assoc-string "password" pairs nil)) "")))
-     ((string= type "header")
-      (list :type 'header
-            :header (or (cdr (assoc-string "header" pairs nil)) "")
-            :value (or (cdr (assoc-string "value" pairs nil)) "")))
-     ((string= type "api_key")
-      (list :type 'api_key
-            :in (or (cdr (assoc-string "in" pairs nil)) "header")
-            :name (or (cdr (assoc-string "name" pairs nil)) "")
-            :value (or (cdr (assoc-string "value" pairs nil)) "")))
-     ((string= type "oauth2")
-      (let ((scopes (cdr (assoc-string "scopes" pairs nil))))
-        (list :type 'oauth2
-              :grant-type (or (cdr (assoc-string "grant_type" pairs nil))
-                              "client_credentials")
-              :token-url (or (cdr (assoc-string "token_url" pairs nil)) "")
-              :client-id (or (cdr (assoc-string "client_id" pairs nil)) "")
-              :client-secret (or (cdr (assoc-string "client_secret" pairs nil)) "")
-              :scopes (unless (string-empty-p (or scopes ""))
-                        (split-string scopes "\\s-*,\\s-*" t)))))
-     (t
-     (user-error "Unsupported auth type: %s" type)))))
+  (let* ((trimmed (string-trim (or text "")))
+         (request (if (or (string-empty-p trimmed)
+                          (courier--comment-only-section-p trimmed))
+                      (courier--empty-request)
+                    (courier--parse-front-matter trimmed 1
+                                                 (courier--empty-request)))))
+    (plist-get request :auth)))
+
+(defun courier--parse-request-tests-lines (text)
+  "Parse tests section TEXT into a list of Courier test expressions."
+  (let* ((trimmed (string-trim (or text "")))
+         (request (if (or (string-empty-p trimmed)
+                          (courier--comment-only-section-p trimmed))
+                      (courier--empty-request)
+                    (courier--parse-front-matter trimmed 1
+                                                 (courier--empty-request)))))
+    (plist-get request :tests)))
 
 (defun courier--request-vars-lines (request)
   "Return editable TOML fragment for REQUEST vars."
@@ -4426,11 +4388,7 @@ request URL query string."
                         (plist-get parsed-scripts :post-response-script))))
           ('tests
            (plist-put courier--request-model :tests
-                      (cl-loop for line in (split-string section-text "\n")
-                               for trimmed = (string-trim-right line)
-                               unless (or (string-empty-p trimmed)
-                                          (string-prefix-p "#" (string-trim-left trimmed)))
-                               collect trimmed)))
+                      (courier--parse-request-tests-lines section-text)))
           )))))
 
 (defun courier--render-request-buffer ()

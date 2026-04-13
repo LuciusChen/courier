@@ -397,6 +397,9 @@ the request identity block; the area below it is the active section view, not a
 jump target into raw source text, and the current section is indicated in the
 =header-line= rather than repeated as a second in-buffer title.
 
+=Auth=, =Vars=, =Script=, and =Tests= are edited as TOML-backed fragments so
+the visible section text matches the front matter Courier writes on save.
+
 =Params= can still be edited directly as part of the URL, but the request-side
 params views normalize those values into Courier params when you edit them.
 Saving then writes them back into the request URL instead of keeping two
