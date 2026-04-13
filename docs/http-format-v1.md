@@ -132,8 +132,8 @@ Tables:
 - `[vars]`
 - `[scripts]`
 
-Unknown keys should be preserved when possible and surfaced as unsupported in
-the UI instead of being silently dropped.
+Unknown keys and tables are currently parse errors. Courier rejects
+unsupported TOML structure instead of silently preserving or dropping it.
 
 ### `name`
 

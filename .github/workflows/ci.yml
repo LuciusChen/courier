@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Emacs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y emacs-nox ruby
+
+      - name: Show tool versions
+        run: |
+          emacs --version
+          python3 --version
+          ruby --version
+          curl --version
+
+      - name: Install package-lint
+        run: git clone --depth 1 https://github.com/purcell/package-lint.git /tmp/package-lint
+
+      - name: Byte-compile
+        run: emacs --batch -L . -l courier.el -f batch-byte-compile courier.el
+
+      - name: Checkdoc
+        run: emacs --batch -L . -l courier.el --eval '(checkdoc-file "courier.el")'
+
+      - name: Package-lint
+        run: |
+          emacs --batch -L . -L /tmp/package-lint \
+            --eval '(require (quote package))' \
+            --eval '(package-initialize)' \
+            --eval '(dolist (entry package--builtins) (let ((name (car entry)) (meta (cdr entry))) (unless (assq name package-alist) (push (cons name (list (package-desc-create :name name :version (append (aref meta 0) nil) :summary (aref meta 2) :reqs (aref meta 1) :kind (quote builtin)))) package-alist))))' \
+            --eval '(require (quote package-lint))' \
+            --eval '(with-temp-buffer (insert-file-contents "courier.el") (emacs-lisp-mode) (let ((warnings (package-lint-buffer))) (if warnings (progn (dolist (w warnings) (message "%s" w)) (kill-emacs 1)) (message "package-lint OK"))))'
+
+      - name: Run ERT
+        run: emacs --batch -L . -l courier.el -l ert -l test/courier-test.el --eval '(ert-run-tests-batch-and-exit t)'

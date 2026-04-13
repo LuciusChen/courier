@@ -36,6 +36,8 @@ Clone this repository and add it to your =load-path=:
 (require 'courier)
 #+end_src
 
+License: MIT. See [[file:LICENSE][LICENSE]].
+
 * Quick Start
 
 Create a file =example.http=:
@@ -430,13 +432,19 @@ Use =C-c C-j= to jump to any section, including =Parameters=, =Body=, =Headers=,
 =Authentication=, =Variables=, =Scripts=, and =Tests=. The request line stays fixed as
 the request identity block; the area below it is the active section view, not a
 jump target into raw source text, and the current section is indicated in the
-=header-line= rather than repeated as a second in-buffer title.
+=header-line= rather than repeated as a second in-buffer title. The request
+line always shows the effective URL, including query params edited through the
+structured params view.
 
-=Authentication=, =Variables=, =Scripts=, and =Tests= are edited as TOML-backed fragments so
-the visible section text matches the front matter Courier writes on save.
-=Variables= keeps one small scaffold command in the request action menu for
-appending =[[vars.post_response]]= blocks; =Tests= stays text-first and relies
-on =completion-at-point= instead of a form-like insert command.
+=Authentication= is edited as a TOML-backed fragment. =Variables= and =Scripts=
+stay TOML-backed too, but the request editor adds comment headings so request,
+pre-request, and post-response groups are easier to scan while still saving
+back to the same front matter tables. =Tests= stays text-first: edit one
+assertion per line in the section view, and Courier serializes those lines back
+into the front matter =tests = [...]= array on save. =Variables= keeps one
+small scaffold command in the request action menu for appending
+=[[vars.post_response]]= blocks; =Tests= relies on =completion-at-point=
+instead of a form-like insert command.
 =C-c C-t= only applies where a section has a concrete action:
 =Body= changes body type, =Authentication= changes auth type, and =Variables= appends a
 =[[vars.post_response]]= rule. In =Tests= it points you back to
@@ -446,7 +454,8 @@ available.
 =Params= can still be edited directly as part of the URL, but the request-side
 params views normalize those values into Courier params when you edit them.
 Saving then writes them back into the request URL instead of keeping two
-separate truths.
+separate truths, and the request line continues to reflect that effective URL
+while you edit other sections.
 
 Use =M-x courier-create-collection= to create a collection explicitly. Use
 =C-c C-o= to open another =.http= request from one annotated picker. Courier
@@ -491,9 +500,7 @@ documents open as file-backed viewers with =doc-view-mode= when available. The
 main response buffer also applies syntax highlighting to =json=, =html=,
 =xml=, and =javascript= body views. The =header-line= shows the current view as
 =View: Response=, =View: Headers=, =View: Timeline=, or =View: Tests=, followed
-by the response status summary. When Timeline detail sections are expanded, the
-header line includes the current subsection, such as
-=View: Timeline / Network Logs=. Use =C-c C-j= to jump directly to a response
+by the response status summary. Use =C-c C-j= to jump directly to a response
 view.
 Use =C-c ?= in request and response buffers to open a transient menu for the
 actions that make sense in the current Courier context.
@@ -550,6 +557,17 @@ Run the full ERT suite:
 emacs --batch -L . -l courier.el -l ert -l test/courier-test.el --eval '(ert-run-tests-batch-and-exit t)'
 #+end_src
 
+Run =package-lint=:
+
+#+begin_src sh
+emacs --batch -L . -L ~/.emacs.d/straight/repos/package-lint \
+  --eval '(require (quote package))' \
+  --eval '(package-initialize)' \
+  --eval '(dolist (entry package--builtins) (let ((name (car entry)) (meta (cdr entry))) (unless (assq name package-alist) (push (cons name (list (package-desc-create :name name :version (append (aref meta 0) nil) :summary (aref meta 2) :reqs (aref meta 1) :kind (quote builtin)))) package-alist))))' \
+  --eval '(require (quote package-lint))' \
+  --eval '(with-temp-buffer (insert-file-contents "courier.el") (emacs-lisp-mode) (let ((warnings (package-lint-buffer))) (if warnings (progn (dolist (w warnings) (message "%s" w)) (kill-emacs 1)) (message "package-lint OK"))))'
+#+end_src
+
 The ERT suite includes local integration tests for:
 
 - JSON echo requests
@@ -560,4 +578,5 @@ The ERT suite includes local integration tests for:
 
 These integration tests start a local Python stdlib HTTP server from
 =test/server/courier_test_server.py=. When =python3= is unavailable, they skip
-instead of producing false positives.
+instead of producing false positives. They also skip in restricted
+environments that forbid binding a localhost port.

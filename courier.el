@@ -1472,16 +1472,12 @@ Signal `user-error' when RESPONSE does not contain a valid token payload."
   (let ((body (or (plist-get response :body-text) "")))
     (when (string-empty-p body)
       (user-error "OAuth2 token response body is empty"))
-    (condition-case err
-        (let* ((payload (json-parse-string body :object-type 'alist :array-type 'list))
-               (token (or (alist-get "access_token" payload nil nil #'equal)
-                          (alist-get 'access_token payload))))
-          (unless (and (stringp token) (not (string-empty-p token)))
-            (user-error "OAuth2 token response is missing access_token"))
-          token)
-      (error
-       (user-error "OAuth2 token response is invalid: %s"
-                   (error-message-string err))))))
+    (let* ((payload (json-parse-string body :object-type 'alist :array-type 'list))
+           (token (or (alist-get "access_token" payload nil nil #'equal)
+                      (alist-get 'access_token payload))))
+      (unless (and (stringp token) (not (string-empty-p token)))
+        (user-error "OAuth2 token response is missing access_token"))
+      token)))
 
 ;;;###autoload
 (defun courier-resolve-request (request &optional env-vars)
@@ -2486,22 +2482,10 @@ Each entry is a cons cell of the form `(TIMESTAMP . RESPONSE)'.")
    (courier--response-tab-display-name tab)
    (courier--response-tab-count tab response)))
 
-(defun courier--current-timeline-subview ()
-  "Return the active timeline subsection for the current response buffer."
-  (when (and (eq courier--response-tab 'timeline)
-             courier--timeline-expanded-sections)
-    (car (last courier--timeline-expanded-sections))))
-
 (defun courier--response-view-state-label (response)
   "Return the current response view label for RESPONSE."
   (let* ((tab (or courier--response-tab 'response))
-         (label (courier--response-tab-label tab response))
-         (timeline-subview (courier--current-timeline-subview)))
-    (when timeline-subview
-      (setq label
-            (format "%s / %s"
-                    label
-                    (courier--timeline-tab-display-name timeline-subview))))
+         (label (courier--response-tab-label tab response)))
     (propertize label
                 'face 'courier-response-tab-active-face)))
 
@@ -3669,6 +3653,13 @@ The return value is one of:
             (propertize (courier--request-section-label current)
                         'face 'courier-request-nav-active-face))))
 
+(defun courier--request-effective-url (request)
+  "Return REQUEST URL with structured params projected into the query string."
+  (let ((url (or (plist-get request :url) "")))
+    (if (string-empty-p url)
+        ""
+      (courier--update-request-url-query url (plist-get request :params)))))
+
 (defun courier--request-display-name (path)
   "Return the display name for request PATH."
   (let ((request (if-let* ((buffer (courier--request-buffer-for-path path)))
@@ -3683,7 +3674,7 @@ The return value is one of:
   "Return the request line string for REQUEST."
   (format "%s %s"
           (or (plist-get request :method) courier-default-request-method)
-          (or (plist-get request :url) "")))
+          (courier--request-effective-url request)))
 
 (defun courier--request-divider-line ()
   "Return the subtle divider line between request header and section view."
@@ -3722,31 +3713,35 @@ The return value is one of:
              "# type = \"bearer\"\n"
              "# token = \"{{token}}\"\n"))
     ('vars
-     (concat "# [vars]\n"
+     (concat "# Request Vars\n"
+             "# [vars]\n"
              "# token = \"courier-pigeon-token\"\n"
              "# tenant = \"night-shift\"\n"
              "\n"
+             "# Pre-request Vars\n"
              "# [vars.pre_request]\n"
              "# request_id = \"courier-42\"\n"
              "\n"
+             "# Post-response Vars\n"
              "# [[vars.post_response]]\n"
              "# name = \"session_token\"\n"
              "# from = \"json\"\n"
              "# expr = \"$.data.token\"\n"))
     ('script
-     (concat "# [scripts]\n"
+     (concat "# Pre-request Script\n"
              "# pre_request = \"\"\"\n"
              "# (message \"before request\")\n"
              "# \"\"\"\n"
              "\n"
+             "# Post-response Script\n"
              "# post_response = \"\"\"\n"
              "# (message \"after response\")\n"
              "# \"\"\"\n"))
     ('tests
-     (concat "# tests = [\n"
-             "#   \"status == 200\",\n"
-             "#   \"header content-type contains json\",\n"
-             "# ]\n"))
+     (concat "# Test Assertions\n"
+             "# status == 200\n"
+             "# header content-type contains json\n"
+             "# size < 102400\n"))
     (_ "")))
 
 (defun courier--format-request-kv-lines (pairs)
@@ -3771,14 +3766,8 @@ request URL query string."
   (string-join (courier--serialize-front-matter-auth-sections request) "\n\n"))
 
 (defun courier--request-tests-lines (request)
-  "Return editable TOML fragment for REQUEST tests."
-  (if-let* ((tests (plist-get request :tests)))
-      (let ((lines (list "tests = [")))
-        (dolist (test tests)
-          (push (format "  %s," (courier--toml-quote-string test)) lines))
-        (push "]" lines)
-        (string-join (nreverse lines) "\n"))
-    ""))
+  "Return editable plain-text assertions for REQUEST tests."
+  (string-join (or (plist-get request :tests) nil) "\n"))
 
 (defun courier--request-body-toml-fragment (request keys)
   "Return TOML fragment for body-related KEYS of REQUEST."
@@ -3939,12 +3928,21 @@ REGEXP must place the editable string contents in capture group 1."
                          "^[ \t#]*from[ \t]*=[ \t]*\"\\([^\"]*\\)\"?")))
       (list (car bounds) (cdr bounds) courier--post-response-var-sources))))
 
-(defun courier--tests-dsl-capf ()
-  "Return completion data for test DSL strings in the tests section."
+(defun courier--tests-line-bounds ()
+  "Return editable bounds for the current tests line, or nil for comments."
   (when (eq (courier--request-current-section) 'tests)
-    (when-let* ((bounds (courier--capf-quoted-value-bounds
-                         "^[ \t]*\"\\([^\"]*\\)\"[,]?")))
-      (list (car bounds) (cdr bounds) courier--tests-dsl-completions))))
+    (let ((start (save-excursion
+                   (back-to-indentation)
+                   (point)))
+          (end (line-end-position)))
+      (unless (string-prefix-p "#"
+                               (buffer-substring-no-properties start end))
+        (cons start end)))))
+
+(defun courier--tests-dsl-capf ()
+  "Return completion data for tests section assertion lines."
+  (when-let* ((bounds (courier--tests-line-bounds)))
+    (list (car bounds) (cdr bounds) courier--tests-dsl-completions)))
 
 (defun courier--ensure-request-layout ()
   "Ensure the current Courier request buffer has layout markers."
@@ -4057,12 +4055,25 @@ REGEXP must place the editable string contents in capture group 1."
 (defun courier--parse-request-tests-lines (text)
   "Parse tests section TEXT into a list of Courier test expressions."
   (let* ((trimmed (string-trim (or text "")))
-         (request (if (or (string-empty-p trimmed)
-                          (courier--comment-only-section-p trimmed))
-                      (courier--empty-request)
+         (request (when (and (not (string-empty-p trimmed))
+                             (not (courier--comment-only-section-p trimmed))
+                             (string-match-p "\\`tests\\s-*=" trimmed))
                     (courier--parse-front-matter trimmed 1
                                                  (courier--empty-request)))))
-    (plist-get request :tests)))
+    (cond
+     ((or (string-empty-p trimmed)
+          (courier--comment-only-section-p trimmed))
+      nil)
+     (request
+      (plist-get request :tests))
+     (t
+      (let (tests)
+        (dolist (line (split-string trimmed "\n"))
+          (let ((assertion (string-trim line)))
+            (unless (or (string-empty-p assertion)
+                        (string-prefix-p "#" assertion))
+              (push assertion tests))))
+        (nreverse tests))))))
 
 (defun courier--request-vars-lines (request)
   "Return editable TOML fragment for REQUEST vars."
@@ -4074,7 +4085,9 @@ REGEXP must place the editable string contents in capture group 1."
                         (car pair)
                         (courier--toml-quote-string (cdr pair)))
                 lines))
-        (push (string-join (nreverse lines) "\n") sections)))
+        (push (format "# Request Vars\n%s"
+                      (string-join (nreverse lines) "\n"))
+              sections)))
     (when-let* ((vars (plist-get request :pre-request-vars)))
       (let ((lines (list "[vars.pre_request]")))
         (dolist (pair vars)
@@ -4082,7 +4095,9 @@ REGEXP must place the editable string contents in capture group 1."
                         (car pair)
                         (courier--toml-quote-string (cdr pair)))
                 lines))
-        (push (string-join (nreverse lines) "\n") sections)))
+        (push (format "# Pre-request Vars\n%s"
+                      (string-join (nreverse lines) "\n"))
+              sections)))
     (when-let* ((rules (plist-get request :post-response-vars)))
       (dolist (rule rules)
         (let ((lines (list "[[vars.post_response]]")))
@@ -4098,7 +4113,9 @@ REGEXP must place the editable string contents in capture group 1."
             (push (format "expr = %s"
                           (courier--toml-quote-string expr))
                   lines))
-          (push (string-join (nreverse lines) "\n") sections))))
+          (push (format "# Post-response Vars\n%s"
+                        (string-join (nreverse lines) "\n"))
+                sections))))
     (string-join (nreverse sections) "\n\n")))
 
 (defun courier--parse-request-vars-lines (text)
@@ -4120,10 +4137,14 @@ REGEXP must place the editable string contents in capture group 1."
         blocks)
     (when (and pre-request
                (not (string-empty-p (string-trim pre-request))))
-      (push (format "pre_request = \"\"\"\n%s\n\"\"\"" pre-request) blocks))
+      (push (format "# Pre-request Script\npre_request = \"\"\"\n%s\n\"\"\""
+                    pre-request)
+            blocks))
     (when (and post-response
                (not (string-empty-p (string-trim post-response))))
-      (push (format "post_response = \"\"\"\n%s\n\"\"\"" post-response) blocks))
+      (push (format "# Post-response Script\npost_response = \"\"\"\n%s\n\"\"\""
+                    post-response)
+            blocks))
     (string-join (nreverse blocks) "\n\n")))
 
 (defun courier--parse-request-script-lines (text)
@@ -5951,6 +5972,7 @@ Signal `user-error' when the current request line has no URL."
   "Return the params editor buffer name for SOURCE-BUFFER."
   (format "*courier-params: %s*" (buffer-name source-buffer)))
 
+;;;###autoload
 (define-derived-mode courier-request-params-mode text-mode "Courier-Params"
   "Major mode for editing Courier URL query params."
   (setq-local header-line-format
@@ -5968,20 +5990,18 @@ Signal `user-error' when the current request line has no URL."
     (file-equal-p (file-name-directory file)
                   (file-name-as-directory env-dir))))
 
+;;;###autoload
+(defun courier-env-file-p (&optional path)
+  "Return non-nil when PATH or the current buffer visits a Courier env file."
+  (courier--buffer-env-file-p path))
+
+;;;###autoload
 (define-derived-mode courier-env-mode text-mode "Courier-Env"
   "Major mode for editing Courier environment files."
   (setq-local font-lock-defaults '(courier-env-font-lock-keywords))
   (setq-local comment-start "#")
   (setq-local comment-start-skip "#+\\s-*")
   (add-hook 'xref-backend-functions #'courier--xref-backend nil t))
-
-(defun courier--maybe-enable-env-mode ()
-  "Enable `courier-env-mode' for Courier env files."
-  (when (and (not (derived-mode-p 'courier-env-mode))
-             (courier--buffer-env-file-p))
-    (courier-env-mode)))
-
-(add-hook 'find-file-hook #'courier--maybe-enable-env-mode)
 
 ;;;###autoload
 (defun courier-request-params-apply ()
@@ -6136,18 +6156,19 @@ Signal `user-error' when the current request line has no URL."
   (courier--render-request-buffer)
   (message "Courier method set to %s." method))
 
-(defun courier-request-set-body-type (body-type)
+(defun courier--read-request-body-type ()
+  "Read a request body type for the current Courier request buffer."
+  (intern
+   (completing-read "Body type: "
+                    (mapcar #'symbol-name courier--allowed-body-types)
+                    nil t nil nil
+                    (symbol-name
+                     (courier--request-body-type
+                      (or courier--request-model
+                          (courier--parse-buffer-for-editor)))))))
+
+(defun courier--request-set-body-type (body-type)
   "Set the current request body type to BODY-TYPE."
-  (interactive
-   (list
-    (intern
-     (completing-read "Body type: "
-                      (mapcar #'symbol-name courier--allowed-body-types)
-                      nil t nil nil
-                      (symbol-name
-                       (courier--request-body-type
-                        (or courier--request-model
-                            (courier--parse-buffer-for-editor))))))))
   (unless (memq body-type courier--allowed-body-types)
     (user-error "Unsupported body type: %s" body-type))
   (courier--sync-request-model)
@@ -6208,20 +6229,22 @@ Signal `user-error' when the current request line has no URL."
       (set-buffer-modified-p t)
       (message "Courier attached %s." (file-name-nondirectory absolute-path)))))
 
-(defun courier-request-add-response-var (source name &optional expr)
+(defun courier--read-response-var-rule ()
+  "Read one response var rule from minibuffer prompts."
+  (let* ((source (completing-read "Response var source: "
+                                  courier--post-response-var-sources
+                                  nil t nil nil "json"))
+         (name (string-trim (read-string "Response var name: ")))
+         (expr (pcase source
+                 ("json"
+                  (string-trim (read-string "JSON expr: ")))
+                 ("header"
+                  (string-trim (read-string "Header name: ")))
+                 (_ nil))))
+    (list source name expr)))
+
+(defun courier--request-add-response-var (source name &optional expr)
   "Append a post-response var rule using SOURCE, NAME, and EXPR."
-  (interactive
-   (let* ((source (completing-read "Response var source: "
-                                   courier--post-response-var-sources
-                                   nil t nil nil "json"))
-          (name (string-trim (read-string "Response var name: ")))
-          (expr (pcase source
-                  ("json"
-                   (string-trim (read-string "JSON expr: ")))
-                  ("header"
-                   (string-trim (read-string "Header name: ")))
-                  (_ nil))))
-     (list source name expr)))
   (when (string-empty-p name)
     (user-error "Response var name must not be empty"))
   (when (and (member source '("json" "header"))
@@ -6248,27 +6271,34 @@ In the Body section, switch body type.  In the Auth section, switch auth
 type.  In the Vars section, add a response var rule."
   (interactive)
   (pcase (courier--request-current-section)
-    ('body (call-interactively #'courier-request-set-body-type))
-    ('auth (call-interactively #'courier-request-set-auth-type))
-    ('vars (call-interactively #'courier-request-add-response-var))
+    ('body
+     (courier--request-set-body-type
+      (courier--read-request-body-type)))
+    ('auth
+     (courier--request-set-auth-type
+      (courier--read-request-auth-type)))
+    ('vars
+     (pcase-let ((`(,source ,name ,expr) (courier--read-response-var-rule)))
+       (courier--request-add-response-var source name expr)))
     ('tests
      (user-error "No section action for Tests.  Use completion-at-point"))
     (section
      (user-error "No section action for %s"
                  (courier--request-section-label section)))))
 
-(defun courier-request-set-auth-type (auth-type)
+(defun courier--read-request-auth-type ()
+  "Read an auth type for the current Courier request buffer."
+  (intern
+   (completing-read "Auth type: "
+                    (mapcar #'symbol-name courier--allowed-auth-types)
+                    nil t nil nil
+                    (symbol-name
+                     (courier--request-auth-type
+                      (or courier--request-model
+                          (courier--parse-buffer-for-editor)))))))
+
+(defun courier--request-set-auth-type (auth-type)
   "Set the current request auth type to AUTH-TYPE."
-  (interactive
-   (list
-    (intern
-     (completing-read "Auth type: "
-                      (mapcar #'symbol-name courier--allowed-auth-types)
-                      nil t nil nil
-                      (symbol-name
-                       (courier--request-auth-type
-                        (or courier--request-model
-                            (courier--parse-buffer-for-editor))))))))
   (unless (memq auth-type courier--allowed-auth-types)
     (user-error "Unsupported auth type: %s" auth-type))
   (courier--sync-request-model)
@@ -6546,8 +6576,6 @@ This renames the request file and updates its front matter name."
     ("m" "Method" courier-request-set-method)
     ("t" "Section action" courier-request-section-type)
     ("f" "Attach file" courier-request-attach-file)
-    ("v" "Response var" courier-request-add-response-var)
-    ("A" "Auth type" courier-request-set-auth-type)
     ("e" "Environment" courier-request-switch-env)
     ("s" "Save" courier-request-save-buffer)]
    ["Navigate"
@@ -6606,6 +6634,9 @@ This renames the request file and updates its front matter name."
 
 ;;;###autoload
 (add-to-list 'auto-mode-alist '("\\.http\\'" . courier-request-mode))
+
+;;;###autoload
+(add-to-list 'magic-fallback-mode-alist '(courier-env-file-p . courier-env-mode))
 
 (provide 'courier)
 

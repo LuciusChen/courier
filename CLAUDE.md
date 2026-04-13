@@ -149,10 +149,12 @@ emacs -batch -L . -l courier.el --eval '(checkdoc-file "courier.el")'
 
 ```bash
 emacs -batch -L . \
+  -L ~/.emacs.d/straight/repos/package-lint \
   --eval '(require (quote package))' \
   --eval '(package-initialize)' \
+  --eval '(dolist (entry package--builtins) (let ((name (car entry)) (meta (cdr entry))) (unless (assq name package-alist) (push (cons name (list (package-desc-create :name name :version (append (aref meta 0) nil) :summary (aref meta 2) :reqs (aref meta 1) :kind (quote builtin)))) package-alist))))' \
   --eval '(require (quote package-lint))' \
-  --eval '(with-temp-buffer (insert-file-contents "courier.el") (emacs-lisp-mode) (dolist (w (package-lint-buffer)) (message "%s" w)))'
+  --eval '(with-temp-buffer (insert-file-contents "courier.el") (emacs-lisp-mode) (let ((warnings (package-lint-buffer))) (if warnings (progn (dolist (w warnings) (message "%s" w)) (kill-emacs 1)) (message "package-lint OK"))))'
 ```
 
 ### 6. Update tests when behavior changes

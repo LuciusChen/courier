@@ -16,6 +16,17 @@
 (require 'courier)
 (require 'xref)
 
+(defconst courier-test--root-directory
+  (file-name-as-directory
+   (expand-file-name ".."
+                     (file-name-directory (or load-file-name buffer-file-name))))
+  "Absolute path to the Courier repository root.")
+
+(defconst courier-test--integration-server-script
+  (expand-file-name "test/server/courier_test_server.py"
+                    courier-test--root-directory)
+  "Absolute path to the Courier integration test server script.")
+
 (defmacro courier-test--with-request (content &rest body)
   "Evaluate BODY in a temp buffer containing CONTENT."
   (declare (indent 1) (debug t))
@@ -92,6 +103,28 @@ When PROCESS is non-nil, prefer `accept-process-output' on PROCESS."
       (accept-process-output process 0.05))
     (funcall predicate)))
 
+(defun courier-test--integration-server-bind-blocked-p (stderr)
+  "Return non-nil when STDERR shows localhost bind permission is unavailable."
+  (string-match-p
+   "PermissionError: \\[Errno 1\\] Operation not permitted"
+   stderr))
+
+(defun courier-test--skip-unless-integration-server-startable (stderr process root stdout-buffer stderr-buffer)
+  "Skip when STDERR shows the environment cannot start the integration server.
+
+PROCESS, ROOT, STDOUT-BUFFER, and STDERR-BUFFER are cleaned up before
+skipping."
+  (when (courier-test--integration-server-bind-blocked-p stderr)
+    (when (process-live-p process)
+      (delete-process process))
+    (when (buffer-live-p stdout-buffer)
+      (kill-buffer stdout-buffer))
+    (when (buffer-live-p stderr-buffer)
+      (kill-buffer stderr-buffer))
+    (when (file-directory-p root)
+      (delete-directory root t))
+    (ert-skip "Integration tests require permission to bind a localhost port")))
+
 (defun courier-test--start-integration-server ()
   "Start the local Courier integration test server and return its context plist."
   (let* ((python (or (executable-find "python3")
@@ -100,7 +133,7 @@ When PROCESS is non-nil, prefer `accept-process-output' on PROCESS."
          (port-file (expand-file-name "port" root))
          (stdout-buffer (generate-new-buffer " *courier-integration-server*"))
          (stderr-buffer (generate-new-buffer " *courier-integration-server-stderr*"))
-         (script "/Users/luciuschen/repos/courier/test/server/courier_test_server.py")
+         (script courier-test--integration-server-script)
          (process (make-process :name "courier-integration-server"
                                 :buffer stdout-buffer
                                 :stderr stderr-buffer
@@ -114,10 +147,14 @@ When PROCESS is non-nil, prefer `accept-process-output' on PROCESS."
                    (not (process-live-p process))))
              5.0 process)
       (let ((stderr (with-current-buffer stderr-buffer (buffer-string))))
+        (courier-test--skip-unless-integration-server-startable
+         stderr process root stdout-buffer stderr-buffer)
         (delete-process process)
         (error "Timed out starting Courier integration server: %s" stderr)))
     (unless (process-live-p process)
       (let ((stderr (with-current-buffer stderr-buffer (buffer-string))))
+        (courier-test--skip-unless-integration-server-startable
+         stderr process root stdout-buffer stderr-buffer)
         (kill-buffer stdout-buffer)
         (kill-buffer stderr-buffer)
         (delete-directory root t)
@@ -1617,7 +1654,7 @@ When PROCESS is non-nil, prefer `accept-process-output' on PROCESS."
         (unwind-protect
             (progn
               (with-temp-buffer
-                (setq default-directory "/Users/luciuschen/repos/courier/")
+                (setq default-directory courier-test--root-directory)
                 (cl-letf (((symbol-function 'completing-read)
                            (lambda (_prompt collection &rest _args)
                              (courier-test--pick-match "token" collection))))
@@ -1638,7 +1675,7 @@ When PROCESS is non-nil, prefer `accept-process-output' on PROCESS."
                              "courier-test-token"))
 
               (with-temp-buffer
-                (setq default-directory "/Users/luciuschen/repos/courier/")
+                (setq default-directory courier-test--root-directory)
                 (cl-letf (((symbol-function 'completing-read)
                            (lambda (_prompt collection &rest _args)
                              (courier-test--pick-match "followup" collection))))
@@ -1710,7 +1747,7 @@ When PROCESS is non-nil, prefer `accept-process-output' on PROCESS."
                                  "Bearer courier-test-token"))))
 
               (with-temp-buffer
-                (setq default-directory "/Users/luciuschen/repos/courier/")
+                (setq default-directory courier-test--root-directory)
                 (cl-letf (((symbol-function 'completing-read)
                            (lambda (_prompt collection &rest _args)
                              (courier-test--pick-match "staging" collection))))
@@ -1943,6 +1980,14 @@ When PROCESS is non-nil, prefer `accept-process-output' on PROCESS."
         (unwind-protect
             (should (derived-mode-p 'courier-env-mode))
           (kill-buffer (current-buffer)))))))
+
+(ert-deftest courier-load-registers-env-mode-without-find-file-hook ()
+  (should-not
+   (cl-loop for hook in find-file-hook
+            thereis (and (symbolp hook)
+                         (string-prefix-p "courier" (symbol-name hook)))))
+  (should (equal (cdr (assoc 'courier-env-file-p magic-fallback-mode-alist))
+                 #'courier-env-mode)))
 
 (ert-deftest courier-env-mode-fontifies-comments-and-keys ()
   (with-temp-buffer
@@ -2703,7 +2748,7 @@ When PROCESS is non-nil, prefer `accept-process-output' on PROCESS."
     (courier-response-set-tab 'timeline)
     (courier--select-history-index 0)
     (courier--toggle-timeline-section 'network-logs)
-    (should (string-match-p "\\` View: Timeline / Network Logs  200 OK  •  42ms  •  5B"
+    (should (string-match-p "\\` View: Timeline  200 OK  •  42ms  •  5B"
                             (substring-no-properties header-line-format)))))
 
 (ert-deftest courier-response-timeline-response-view-shows-header-count ()
@@ -3190,9 +3235,11 @@ When PROCESS is non-nil, prefer `accept-process-output' on PROCESS."
     (courier-request-mode)
     (courier-request-jump-section 'vars)
     (let (called)
-      (cl-letf (((symbol-function 'courier-request-add-response-var)
+      (cl-letf (((symbol-function 'courier--read-response-var-rule)
+                 (lambda ()
+                   '("json" "trace_id" "$.meta.trace_id")))
+                ((symbol-function 'courier--request-add-response-var)
                  (lambda (&rest _args)
-                   (interactive)
                    (setq called t))))
         (call-interactively #'courier-request-section-type))
       (should called))))
@@ -3276,9 +3323,18 @@ When PROCESS is non-nil, prefer `accept-process-output' on PROCESS."
     (should (string-match-p "^# Query params$" (buffer-string)))
     (should (string-match-p "^# include = profile,roles$" (buffer-string)))
     (courier-request-jump-section 'vars)
+    (should (string-match-p "^# Request Vars$" (buffer-string)))
+    (should (string-match-p "^# Pre-request Vars$" (buffer-string)))
+    (should (string-match-p "^# Post-response Vars$" (buffer-string)))
     (should (string-match-p "^# token = \"courier-pigeon-token\"$" (buffer-string)))
     (should (string-match-p "^# name = \"session_token\"$" (buffer-string)))
-    (should (string-match-p "^# expr = \"\\$\\.data\\.token\"$" (buffer-string)))))
+    (should (string-match-p "^# expr = \"\\$\\.data\\.token\"$" (buffer-string)))
+    (courier-request-jump-section 'script)
+    (should (string-match-p "^# Pre-request Script$" (buffer-string)))
+    (should (string-match-p "^# Post-response Script$" (buffer-string)))
+    (courier-request-jump-section 'tests)
+    (should (string-match-p "^# Test Assertions$" (buffer-string)))
+    (should (string-match-p "^# status == 200$" (buffer-string)))))
 
 (ert-deftest courier-request-render-establishes-content-start-marker ()
   (courier-test--with-request
@@ -3342,6 +3398,10 @@ When PROCESS is non-nil, prefer `accept-process-output' on PROCESS."
                        "https://example.com/users"))
         (should (equal (plist-get courier--request-model :params)
                        '(("page" . "2") ("filter" . "active"))))
+        (should (string-prefix-p "GET https://example.com/users?page=2&filter=active"
+                                 (buffer-substring-no-properties
+                                  (point-min)
+                                  (line-end-position))))
         (should (string-match-p
                  (regexp-quote "GET https://example.com/users?page=2&filter=active\n\n")
                  (courier--serialize-request courier--request-model)))))))
@@ -3379,7 +3439,7 @@ When PROCESS is non-nil, prefer `accept-process-output' on PROCESS."
                             (substring-no-properties
                              (courier--request-header-line-format))))))
 
-(ert-deftest courier-request-set-body-type-updates-request-model ()
+(ert-deftest courier-request-section-type-updates-request-body-model ()
   (courier-test--with-request
       (courier-test--http-content
        :method "POST"
@@ -3387,11 +3447,14 @@ When PROCESS is non-nil, prefer `accept-process-output' on PROCESS."
        :body-type 'json
        :body "{\"name\":\"Lucy\"}\n")
     (courier-request-mode)
-    (courier-request-set-body-type 'none)
+    (courier-request-jump-section 'body)
+    (cl-letf (((symbol-function 'courier--read-request-body-type)
+               (lambda () 'none)))
+      (courier-request-section-type))
     (should (eq (plist-get courier--request-model :body-type) 'none))
     (should (equal (plist-get courier--request-model :body) ""))))
 
-(ert-deftest courier-request-set-body-type-refreshes-header-line ()
+(ert-deftest courier-request-section-type-refreshes-body-header-line ()
   (courier-test--with-request
       (courier-test--http-content
        :method "POST"
@@ -3399,7 +3462,10 @@ When PROCESS is non-nil, prefer `accept-process-output' on PROCESS."
        :body-type 'json
        :body "{\"name\":\"Lucy\"}\n")
     (courier-request-mode)
-    (courier-request-set-body-type 'form-urlencoded)
+    (courier-request-jump-section 'body)
+    (cl-letf (((symbol-function 'courier--read-request-body-type)
+               (lambda () 'form-urlencoded)))
+      (courier-request-section-type))
     (let ((line (substring-no-properties
                  (courier--request-header-line-format))))
       (should (string-match-p "Body: Form" line)))))
@@ -3536,7 +3602,7 @@ When PROCESS is non-nil, prefer `accept-process-output' on PROCESS."
       (should (member "application/pdf" (all-completions "" (nth 2 capf))))
       (should (member "image/png" (all-completions "" (nth 2 capf)))))))
 
-(ert-deftest courier-request-add-response-var-appends-post-response-rule ()
+(ert-deftest courier-request-section-type-appends-post-response-rule ()
   (courier-test--with-request
       (courier-test--http-content
        :method "GET"
@@ -3545,15 +3611,15 @@ When PROCESS is non-nil, prefer `accept-process-output' on PROCESS."
                               :from json
                               :expr "$.data.token")))
     (courier-request-mode)
-    (let ((answers '("trace_id" "$.meta.trace_id")))
-      (cl-letf (((symbol-function 'completing-read)
-                 (lambda (&rest _args) "json"))
-                ((symbol-function 'read-string)
-                 (lambda (&rest _args) (pop answers))))
-        (call-interactively #'courier-request-add-response-var)))
+    (courier-request-jump-section 'vars)
+    (cl-letf (((symbol-function 'courier--read-response-var-rule)
+               (lambda ()
+                 '("json" "trace_id" "$.meta.trace_id"))))
+      (courier-request-section-type))
     (should (equal (plist-get courier--request-model :post-response-vars)
                    '((:name "session_token" :from json :expr "$.data.token")
                      (:name "trace_id" :from json :expr "$.meta.trace_id"))))
+    (should (string-match-p "^# Post-response Vars$" (buffer-string)))
     (should (string-match-p
              "\\[\\[vars\\.post_response\\]\\]\nname = \"trace_id\"\nfrom = \"json\"\nexpr = \"\\$\\.meta\\.trace_id\""
              (buffer-string)))))
@@ -3610,13 +3676,15 @@ When PROCESS is non-nil, prefer `accept-process-output' on PROCESS."
        :post-response-script "(message \"after\")")
     (courier-request-mode)
     (courier-request-jump-section 'script)
+    (should (string-match-p "^# Pre-request Script$" (buffer-string)))
+    (should (string-match-p "^# Post-response Script$" (buffer-string)))
     (courier--sync-request-model)
     (should (equal (plist-get courier--request-model :pre-request-script)
                    "(message \"before\")"))
     (should (equal (plist-get courier--request-model :post-response-script)
                    "(message \"after\")"))))
 
-(ert-deftest courier-request-tests-section-round-trips-toml-array ()
+(ert-deftest courier-request-tests-section-round-trips-plain-lines ()
   (courier-test--with-request
       (courier-test--http-content
        :method "GET"
@@ -3624,35 +3692,48 @@ When PROCESS is non-nil, prefer `accept-process-output' on PROCESS."
        :tests '("status == 200" "body contains hello"))
     (courier-request-mode)
     (courier-request-jump-section 'tests)
-    (should (string-match-p "^tests = \\[$" (buffer-string)))
-    (should (string-match-p "\"status == 200\"," (buffer-string)))
-    (should (string-match-p "\"body contains hello\"," (buffer-string)))
+    (should (string-match-p "^status == 200$" (buffer-string)))
+    (should (string-match-p "^body contains hello$" (buffer-string)))
     (courier--sync-request-model)
     (should (equal (plist-get courier--request-model :tests)
-                   '("status == 200" "body contains hello")))))
+                   '("status == 200" "body contains hello")))
+    (should (string-match-p
+             (regexp-quote "tests = [\n  \"status == 200\",\n  \"body contains hello\",\n]")
+             (courier--serialize-request courier--request-model)))))
 
-(ert-deftest courier-request-set-auth-type-updates-request-model ()
+(ert-deftest courier-request-section-type-updates-auth-model ()
   (courier-test--with-request
       (courier-test--http-content
        :method "GET"
        :url "https://example.com/users")
     (courier-request-mode)
-    (courier-request-set-auth-type 'basic)
+    (courier-request-jump-section 'auth)
+    (cl-letf (((symbol-function 'courier--read-request-auth-type)
+               (lambda () 'basic)))
+      (courier-request-section-type))
     (should (equal (plist-get courier--request-model :auth)
                    '(:type basic
                      :username "{{user}}"
                      :password "{{password}}")))))
 
-(ert-deftest courier-request-set-auth-type-refreshes-header-line ()
+(ert-deftest courier-request-section-type-refreshes-auth-header-line ()
   (courier-test--with-request
       (courier-test--http-content
        :method "GET"
        :url "https://example.com/users")
     (courier-request-mode)
-    (courier-request-set-auth-type 'header)
+    (courier-request-jump-section 'auth)
+    (cl-letf (((symbol-function 'courier--read-request-auth-type)
+               (lambda () 'header)))
+      (courier-request-section-type))
     (let ((line (substring-no-properties
                  (courier--request-header-line-format))))
       (should (string-match-p "Authentication: Header" line)))))
+
+(ert-deftest courier-request-section-helpers-are-not-standalone-commands ()
+  (should-not (commandp 'courier--request-set-body-type))
+  (should-not (commandp 'courier--request-add-response-var))
+  (should-not (commandp 'courier--request-set-auth-type)))
 
 (ert-deftest courier-open-env-opens-selected-environment-file ()
   (courier-test--with-temp-dir (root)
@@ -4287,7 +4368,6 @@ When PROCESS is non-nil, prefer `accept-process-output' on PROCESS."
 (ert-deftest courier-request-save-buffer-prompts-with-basename-without-http-suffix ()
   (courier-test--with-temp-dir (root)
     (let* ((courier-home-directory root)
-           (collection-root (expand-file-name "collections/api-collection" root))
            (draft-buffer (generate-new-buffer "*courier-save-basename*"))
            captured-initial)
       (unwind-protect
