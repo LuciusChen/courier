@@ -230,10 +230,6 @@ root."
   '((t :inherit bold :underline t))
   "Face used for the active Courier response navigation tab.")
 
-(defface courier-response-tab-inactive-face
-  '((t :inherit shadow))
-  "Face used for inactive Courier response navigation tabs.")
-
 (defface courier-response-tab-count-face
   '((t :inherit shadow :height 0.95))
   "Face used for response tab counts in Courier.")
@@ -2545,21 +2541,24 @@ Each entry is a cons cell of the form `(TIMESTAMP . RESPONSE)'.")
    (courier--response-tab-display-name tab)
    (courier--response-tab-count tab response)))
 
-(defun courier--response-view-prefix (response)
-  "Return the header-line view prefix for RESPONSE."
-  (concat
-   (propertize (courier--response-tab-label 'response response)
-               'face (if (eq courier--response-tab 'response)
-                         'courier-response-tab-active-face
-                       'courier-response-tab-inactive-face))
-   (if (eq courier--response-tab 'response)
-       ""
-     (concat
-      "  "
-      (propertize (courier--response-tab-label courier--response-tab response)
-                  'face 'courier-response-tab-active-face)))
-   "  "
-   (propertize ">>" 'face 'courier-response-tab-inactive-face)))
+(defun courier--current-timeline-subview ()
+  "Return the active timeline subsection for the current response buffer."
+  (when (and (eq courier--response-tab 'timeline)
+             courier--timeline-expanded-sections)
+    (car (last courier--timeline-expanded-sections))))
+
+(defun courier--response-view-state-label (response)
+  "Return the current response view label for RESPONSE."
+  (let* ((tab (or courier--response-tab 'response))
+         (label (courier--response-tab-label tab response))
+         (timeline-subview (courier--current-timeline-subview)))
+    (when timeline-subview
+      (setq label
+            (format "%s / %s"
+                    label
+                    (courier--timeline-tab-display-name timeline-subview))))
+    (propertize label
+                'face 'courier-response-tab-active-face)))
 
 (defun courier--ensure-response-layout ()
   "Ensure the current Courier response buffer has content markers."
@@ -2691,8 +2690,8 @@ Each entry is a cons cell of the form `(TIMESTAMP . RESPONSE)'.")
   "Return the complete header line format for RESPONSE."
   (let* ((summary-response (or (courier--header-summary-response)
                                response))
-         (view-prefix
-          (courier--response-view-prefix summary-response))
+         (view-label
+          (courier--response-view-state-label summary-response))
          (summary
           (if (and (eq courier--response-tab 'timeline)
                    (numberp courier--history-index))
@@ -2702,7 +2701,12 @@ Each entry is a cons cell of the form `(TIMESTAMP . RESPONSE)'.")
                  summary-response timestamp courier--history-index
                  (length courier--history)))
             (courier--response-header-line summary-response))))
-    (concat " " view-prefix "  " summary)))
+    (concat " "
+            (propertize "View:" 'face 'shadow)
+            " "
+            view-label
+            "  "
+            summary)))
 
 (defun courier--body-viewer-buffer-name ()
   "Return the body viewer buffer name for the current response buffer."
@@ -3357,7 +3361,16 @@ Each entry is a cons cell of the form `(TIMESTAMP . RESPONSE)'.")
 (defun courier--response-jump-choices ()
   "Return completion choices for response tabs."
   (mapcar (lambda (tab)
-            (cons (capitalize (symbol-name tab)) tab))
+            (cons
+             (format "%s -- %s"
+                     (courier--response-tab-display-name tab)
+                     (pcase tab
+                       ('response "view response body")
+                       ('headers "view response headers")
+                       ('timeline "inspect previous runs")
+                       ('tests "view test results")
+                       (_ "view response")))
+             tab))
           courier--response-tabs))
 
 ;;;###autoload
@@ -3365,8 +3378,10 @@ Each entry is a cons cell of the form `(TIMESTAMP . RESPONSE)'.")
   "Jump directly to response TAB."
   (interactive
    (let* ((choices (courier--response-jump-choices))
-          (current (capitalize (symbol-name (or courier--response-tab 'response))))
-          (selection (completing-read "Jump to response view: "
+          (current-tab (or courier--response-tab 'response))
+          (current
+           (car (rassoc current-tab choices)))
+          (selection (completing-read "Response view: "
                                       choices nil t nil nil current)))
      (list (cdr (assoc selection choices)))))
   (unless courier--response
@@ -3611,7 +3626,7 @@ The return value is one of:
 
 (defconst courier--request-secondary-sections
   '(auth vars script tests)
-  "Secondary navigation sections hidden behind `>>' in request buffers.")
+  "Secondary request sections shown through the section jump command.")
 
 (defface courier-request-method-get-face
   '((t :inherit success :weight bold))
@@ -3632,14 +3647,6 @@ The return value is one of:
 (defface courier-request-nav-active-face
   '((t :inherit bold :underline t))
   "Face used for the active Courier request navigation section.")
-
-(defface courier-request-nav-inactive-face
-  '((t :inherit shadow))
-  "Face used for inactive Courier request navigation sections.")
-
-(defface courier-request-nav-more-face
-  '((t :inherit shadow :weight bold))
-  "Face used for the `>>' marker in Courier request navigation.")
 
 (defface courier-request-divider-face
   '((t :inherit shadow))
@@ -3679,30 +3686,37 @@ The return value is one of:
   (pcase section
     ('url "URL")
     ('headers "Headers")
-    ('body (format "Body(%s)"
+    ('body (format "Body: %s"
                    (courier--body-type-label
                     (courier--request-body-type courier--request-model))))
-    ('params "Params")
-    ('auth (format "Auth(%s)"
+    ('params "Parameters")
+    ('auth (format "Authentication: %s"
                    (courier--auth-type-label
                     (courier--request-auth-type courier--request-model))))
-    ('vars "Vars")
-    ('script "Script")
+    ('vars "Variables")
+    ('script "Scripts")
     ('tests "Tests")
     (_ (capitalize (symbol-name section)))))
 
-(defun courier--request-nav-item (section active)
-  "Return a propertized request navigation label for SECTION.
-ACTIVE controls whether the active navigation face is used."
-  (propertize (courier--request-section-label section)
-              'face (if active
-                        'courier-request-nav-active-face
-                      'courier-request-nav-inactive-face)))
+(defun courier--request-section-description (section)
+  "Return a short description for request SECTION."
+  (pcase section
+    ('params "edit URL query parameters")
+    ('body "edit request body")
+    ('headers "edit HTTP headers")
+    ('auth "edit authentication settings")
+    ('vars "edit request and response vars")
+    ('script "edit pre and post scripts")
+    ('tests "edit assertions")
+    (_ "edit section")))
 
 (defun courier--request-jump-choices ()
   "Return an alist of request section jump choices."
   (mapcar (lambda (item)
-            (cons (courier--request-section-label item) item))
+            (cons (format "%s -- %s"
+                          (courier--request-section-label item)
+                          (courier--request-section-description item))
+                  item))
           (append courier--request-primary-sections
                   courier--request-secondary-sections)))
 
@@ -3717,20 +3731,12 @@ ACTIVE controls whether the active navigation face is used."
 
 (defun courier--request-header-line-format ()
   "Return the request navigation header line for the current buffer."
-  (let* ((current (courier--request-current-section))
-         (primary (mapconcat
-                   (lambda (section)
-                     (courier--request-nav-item section (eq current section)))
-                   courier--request-primary-sections
-                   "  "))
-         (secondary
-         (when (memq current courier--request-secondary-sections)
-            (concat "  "
-                    (courier--request-nav-item current t)))))
-    (concat " " primary
-            (or secondary "")
-            "  "
-            (propertize ">>" 'face 'courier-request-nav-more-face))))
+  (let ((current (courier--request-current-section)))
+    (concat " "
+            (propertize "Section:" 'face 'shadow)
+            " "
+            (propertize (courier--request-section-label current)
+                        'face 'courier-request-nav-active-face))))
 
 (defun courier--request-display-name (path)
   "Return the display name for request PATH."
@@ -6435,8 +6441,8 @@ type.  In the Vars section, add a response var rule."
           (current (and (memq current-section
                               (append courier--request-primary-sections
                                       courier--request-secondary-sections))
-                        (courier--request-section-label current-section)))
-          (selection (completing-read "Jump to section: " choices nil t nil nil current)))
+                        (car (rassoc current-section choices))))
+          (selection (completing-read "Request section: " choices nil t nil nil current)))
      (list (cdr (assoc selection choices)))))
   (courier--request-jump-section section))
 

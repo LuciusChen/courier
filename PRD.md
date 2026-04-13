@@ -287,9 +287,9 @@ manager. It is a source of variable values for request resolution.
 ### 6. Send and inspect response
 
 - user sends request
-- response buffer centers on one response at a time, with `Response` kept as
-  the anchor label in the header line; when `Headers`, `Timeline`, or `Tests`
-  is active, that view is shown before `>>`, followed by the status summary
+- response buffer centers on one response at a time, with the header line
+  showing `View: Response`, `View: Headers`, `View: Timeline`, or
+  `View: Tests`, followed by the status summary
 - user changes response view as needed through a jump command
 - response history remains available for the same request
 - `C-c ?` opens a context-aware action menu in request and response buffers
@@ -308,11 +308,9 @@ manager. It is a source of variable values for request resolution.
 - Courier then asks for the request filename explicitly and appends `.http`
   automatically unless the user already typed it
 - the request is then saved into that collection's `requestsDir`
-- request editing stays text-first; the buffer shows
-  `Params  Body  Headers  >>` as the current request view indicator; when a
-  secondary section such as `Auth`, `Vars`, `Script`, or `Tests` is active, it
-  is shown before `>>`, while
-  `C-c C-j` switches to any request section
+- request editing stays text-first; the header line shows the current section,
+  such as `Section: Body: JSON`, while `C-c C-j` switches to any request
+  section
 - transient remains for actions such as send, preview, save, and env
   switching, not for primary content editing
 - request editing stays text-first:
@@ -450,7 +448,7 @@ Deliver:
 - cleaner header line
 - a header-line current-view indicator for Response, Headers, Timeline, and Tests,
   switched through a jump command
-- a collapsed-by-default Timeline history list
+- a collapsed-by-default Timeline list
 - expandable Timeline detail sections for Request, Response, and Network Logs
 - syntax highlighting through suitable major modes
 - image rendering support

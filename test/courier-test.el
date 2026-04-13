@@ -2389,7 +2389,7 @@ When PROCESS is non-nil, prefer `accept-process-output' on PROCESS."
     (courier-response-set-view 'raw)
     (should (eq courier--body-view 'raw))
     (should (eq courier--response-tab 'response))
-    (should (string-match-p "\\` Response  >>  200 OK  •  42ms  •  5B"
+    (should (string-match-p "\\` View: Response  200 OK  •  42ms  •  5B"
                             (substring-no-properties header-line-format)))))
 
 (ert-deftest courier-response-header-line-uses-clutch-style-separator ()
@@ -2537,7 +2537,7 @@ When PROCESS is non-nil, prefer `accept-process-output' on PROCESS."
      courier-test--request)
     (courier-response-set-tab 'tests)
     (should (eq courier--response-tab 'tests))
-    (should (string-match-p "\\` Response  Tests(1)  >>  200 OK  •  10ms  •  12B"
+    (should (string-match-p "\\` View: Tests(1)  200 OK  •  10ms  •  12B"
                             (substring-no-properties header-line-format)))
     (should (string-match-p "status == 200" (buffer-string)))))
 
@@ -2599,11 +2599,11 @@ When PROCESS is non-nil, prefer `accept-process-output' on PROCESS."
      courier-test--request)
     (let ((line (substring-no-properties header-line-format)))
       (should (string-match-p
-               "\\` Response  >>  200 OK  •  42ms  •  5B"
+               "\\` View: Response  200 OK  •  42ms  •  5B"
                line))
       (courier-response-set-tab 'headers)
       (should (string-match-p
-               "\\` Response  Headers(1)  >>  200 OK  •  42ms  •  5B"
+               "\\` View: Headers(1)  200 OK  •  42ms  •  5B"
                (substring-no-properties header-line-format))))))
 
 (ert-deftest courier-response-buffer-does-not-render-top-navigation-row ()
@@ -2622,7 +2622,7 @@ When PROCESS is non-nil, prefer `accept-process-output' on PROCESS."
      courier-test--request)
     (goto-char (point-min))
     (should-not (search-forward "Headers(1)" (line-end-position) t))
-    (should (string-match-p "\\` Response  >>  200 OK  •  10ms  •  12B"
+    (should (string-match-p "\\` View: Response  200 OK  •  10ms  •  12B"
                             (substring-no-properties header-line-format)))))
 
 (ert-deftest courier-response-timeline-network-logs-switches-section ()
@@ -2702,7 +2702,7 @@ When PROCESS is non-nil, prefer `accept-process-output' on PROCESS."
     (courier-response-set-tab 'timeline)
     (courier--select-history-index 0)
     (courier--toggle-timeline-section 'network-logs)
-    (should (string-match-p "\\` Response  Timeline  >>  200 OK  •  42ms  •  5B"
+    (should (string-match-p "\\` View: Timeline / Network Logs  200 OK  •  42ms  •  5B"
                             (substring-no-properties header-line-format)))))
 
 (ert-deftest courier-response-timeline-response-view-shows-header-count ()
@@ -3150,10 +3150,7 @@ When PROCESS is non-nil, prefer `accept-process-output' on PROCESS."
     (courier-request-mode)
     (let ((line (substring-no-properties
                  (courier--request-header-line-format))))
-      (should (string-match-p "Params" line))
-      (should (string-match-p "Headers" line))
-      (should (string-match-p "Body" line))
-      (should (string-match-p ">>" line)))))
+      (should (string-match-p "\\` Section: Body: JSON" line)))))
 
 (ert-deftest courier-request-header-line-shows-current-secondary-section ()
   (courier-test--with-request
@@ -3164,8 +3161,7 @@ When PROCESS is non-nil, prefer `accept-process-output' on PROCESS."
     (courier-request-jump-section 'auth)
     (let ((line (substring-no-properties
                  (courier--request-header-line-format))))
-      (should (string-match-p "Auth(Bearer)" line))
-      (should (string-match-p "Auth(Bearer)  >>" line)))))
+      (should (string-match-p "\\` Section: Authentication: Bearer" line)))))
 
 (ert-deftest courier-request-header-line-shows-none-auth-label ()
   (courier-test--with-request
@@ -3175,7 +3171,7 @@ When PROCESS is non-nil, prefer `accept-process-output' on PROCESS."
     (courier-request-jump-section 'auth)
     (let ((line (substring-no-properties
                  (courier--request-header-line-format))))
-      (should (string-match-p "Auth(None)" line)))))
+      (should (string-match-p "\\` Section: Authentication: None" line)))))
 
 (ert-deftest courier-request-header-line-shows-body-type-label ()
   (courier-test--with-request
@@ -3187,7 +3183,7 @@ When PROCESS is non-nil, prefer `accept-process-output' on PROCESS."
     (courier-request-jump-section 'body)
     (let ((line (substring-no-properties
                  (courier--request-header-line-format))))
-      (should (string-match-p "Body(XML)" line)))))
+      (should (string-match-p "\\` Section: Body: XML" line)))))
 
 (ert-deftest courier-dispatch-routes-request-mode ()
   (courier-test--with-request
@@ -3421,7 +3417,7 @@ When PROCESS is non-nil, prefer `accept-process-output' on PROCESS."
     (courier-request-set-method "POST")
     (should (equal (plist-get courier--request-model :method) "POST"))
     (should (string-match-p "^POST $" (buffer-string)))
-    (should (string-match-p "Body(JSON)"
+    (should (string-match-p "Body: JSON"
                             (substring-no-properties
                              (courier--request-header-line-format))))))
 
@@ -3448,7 +3444,7 @@ When PROCESS is non-nil, prefer `accept-process-output' on PROCESS."
     (courier-request-set-body-type 'form-urlencoded)
     (let ((line (substring-no-properties
                  (courier--request-header-line-format))))
-      (should (string-match-p "Body(Form)" line)))))
+      (should (string-match-p "Body: Form" line)))))
 
 (ert-deftest courier-request-body-section-round-trips-binary-metadata ()
   (courier-test--with-request
@@ -3698,7 +3694,7 @@ When PROCESS is non-nil, prefer `accept-process-output' on PROCESS."
     (courier-request-set-auth-type 'header)
     (let ((line (substring-no-properties
                  (courier--request-header-line-format))))
-      (should (string-match-p "Auth(Header)" line)))))
+      (should (string-match-p "Authentication: Header" line)))))
 
 (ert-deftest courier-open-env-opens-selected-environment-file ()
   (courier-test--with-temp-dir (root)
@@ -4205,7 +4201,7 @@ When PROCESS is non-nil, prefer `accept-process-output' on PROCESS."
         (should (string-prefix-p "GET \n" (buffer-string)))
         (should (string-match-p "^----------------------------------------$"
                                 (nth 1 (split-string (buffer-string) "\n"))))
-        (should (string-match-p "Body(JSON)"
+        (should (string-match-p "Section: Body: JSON"
                                 (substring-no-properties
                                  (courier--request-header-line-format))))
         (should (= (line-number-at-pos) 1))
@@ -4228,7 +4224,7 @@ When PROCESS is non-nil, prefer `accept-process-output' on PROCESS."
         (should (string-prefix-p "POST \n" (buffer-string)))
         (should (string-match-p "^----------------------------------------$"
                                 (nth 1 (split-string (buffer-string) "\n"))))
-        (should (string-match-p "Body(JSON)"
+        (should (string-match-p "Section: Body: JSON"
                                 (substring-no-properties
                                  (courier--request-header-line-format))))
         (should (= (line-number-at-pos) 1))
