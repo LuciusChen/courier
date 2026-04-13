@@ -3223,8 +3223,42 @@ When PROCESS is non-nil, prefer `accept-process-output' on PROCESS."
               #'courier-request-jump-section))
   (should (eq (lookup-key courier-request-mode-map (kbd "C-c C-f"))
               #'courier-request-attach-file))
+  (should (eq (lookup-key courier-request-mode-map (kbd "C-c C-t"))
+              #'courier-request-section-type))
   (should-not (lookup-key courier-request-mode-map (kbd "C-c [")))
   (should-not (lookup-key courier-request-mode-map (kbd "C-c ]"))))
+
+(ert-deftest courier-request-section-type-routes-vars-to-response-var ()
+  (courier-test--with-request
+      (courier-test--http-content
+       :method "GET"
+       :url "https://example.com/users")
+    (courier-request-mode)
+    (courier-request-jump-section 'vars)
+    (let (called)
+      (cl-letf (((symbol-function 'courier-request-add-response-var)
+                 (lambda (&rest _args)
+                   (interactive)
+                   (setq called t))))
+        (call-interactively #'courier-request-section-type))
+      (should called))))
+
+(ert-deftest courier-request-section-type-guides-tests-to-capf ()
+  (courier-test--with-request
+      (courier-test--http-content
+       :method "GET"
+       :url "https://example.com/users"
+       :tests '("status == 200"))
+    (courier-request-mode)
+    (courier-request-jump-section 'tests)
+    (let ((message
+           (condition-case err
+               (progn
+                 (courier-request-section-type)
+                 nil)
+             (user-error (error-message-string err)))))
+      (should (equal message
+                     "No section action for Tests.  Use completion-at-point")))))
 
 (ert-deftest courier-response-mode-binds-jump-navigation ()
   (should (eq (lookup-key courier--response-mode-map (kbd "C-c C-j"))
@@ -3547,6 +3581,63 @@ When PROCESS is non-nil, prefer `accept-process-output' on PROCESS."
       (should capf)
       (should (member "application/pdf" (all-completions "" (nth 2 capf))))
       (should (member "image/png" (all-completions "" (nth 2 capf)))))))
+
+(ert-deftest courier-request-add-response-var-appends-post-response-rule ()
+  (courier-test--with-request
+      (courier-test--http-content
+       :method "GET"
+       :url "https://example.com/users"
+       :post-response-vars '((:name "session_token"
+                              :from json
+                              :expr "$.data.token")))
+    (courier-request-mode)
+    (let ((answers '("trace_id" "$.meta.trace_id")))
+      (cl-letf (((symbol-function 'completing-read)
+                 (lambda (&rest _args) "json"))
+                ((symbol-function 'read-string)
+                 (lambda (&rest _args) (pop answers))))
+        (call-interactively #'courier-request-add-response-var)))
+    (should (equal (plist-get courier--request-model :post-response-vars)
+                   '((:name "session_token" :from json :expr "$.data.token")
+                     (:name "trace_id" :from json :expr "$.meta.trace_id"))))
+    (should (string-match-p
+             "\\[\\[vars\\.post_response\\]\\]\nname = \"trace_id\"\nfrom = \"json\"\nexpr = \"\\$\\.meta\\.trace_id\""
+             (buffer-string)))))
+
+(ert-deftest courier-request-post-response-var-from-capf-completes-sources ()
+  (courier-test--with-request
+      (courier-test--http-content
+       :method "GET"
+       :url "https://example.com/users"
+       :post-response-vars '((:name "session_token"
+                              :from json
+                              :expr "$.data.token")))
+    (courier-request-mode)
+    (courier-request-jump-section 'vars)
+    (goto-char (point-min))
+    (search-forward "from = \"")
+    (let ((capf (run-hook-with-args-until-success 'completion-at-point-functions)))
+      (should capf)
+      (should (member "json" (all-completions "" (nth 2 capf))))
+      (should (member "header" (all-completions "" (nth 2 capf))))
+      (should (member "status" (all-completions "" (nth 2 capf)))))))
+
+(ert-deftest courier-request-tests-capf-completes-dsl-snippets ()
+  (courier-test--with-request
+      (courier-test--http-content
+       :method "GET"
+       :url "https://example.com/users"
+       :tests '("status == 200"))
+    (courier-request-mode)
+    (courier-request-jump-section 'tests)
+    (goto-char (point-min))
+    (search-forward "status")
+    (let ((capf (run-hook-with-args-until-success 'completion-at-point-functions)))
+      (should capf)
+      (should (member "status == 200" (all-completions "" (nth 2 capf))))
+      (should (member "header content-type contains json"
+                      (all-completions "" (nth 2 capf))))
+      (should (member "size < 102400" (all-completions "" (nth 2 capf)))))))
 
 (ert-deftest courier-mime-type-for-extension-uses-built-in-mapping ()
   (should (equal (courier--mime-type-for-extension "payload.bin")

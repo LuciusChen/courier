@@ -233,6 +233,11 @@ Courier resolves variable sources in this order:
 That means request-local vars beat env values, and =pre_request= vars beat all
 other variable sources.
 
+For =[[vars.post_response]]= rules, use =C-c C-t= in the Vars section to
+append a correctly shaped TOML block. When point is inside =from = "... " =,
+=completion-at-point= offers the allowed sources: =json=, =header=, and
+=status=.
+
 ** Body Types
 
 =[body].type= controls how Courier interprets and sends the request body.
@@ -273,8 +278,7 @@ Send-time behavior:
   default content type when present and no explicit =Content-Type= header exists
 - =none= requires an empty body and sends no request body
 
-Use =M-x courier-request-set-body-type= or =C-c ?= in a request buffer to set
-the body type. In the request section view, the active body type is shown in
+Use =C-c C-t= in the Body section to set the body type. In the request section view, the active body type is shown in
 the header line as =Body(JSON)=, =Body(XML)=, and so on. For =binary= and
 =multipart= bodies, the body section itself is edited as a TOML fragment that
 matches the saved front matter, including =[body]= and =[[body.parts]]=
@@ -297,8 +301,7 @@ Courier resolves auth values through the same variable expansion path as the
 rest of the request. If an explicit header with the same name already exists in
 the request, that explicit header wins.
 
-Use =M-x courier-request-set-auth-type= or =C-c ?= in a request buffer to set
-the auth type. The editor currently recognizes =none=, =bearer=, =basic=,
+Use =C-c C-t= in the Auth section to set the auth type. The editor currently recognizes =none=, =bearer=, =basic=,
 =header=, =api_key=, and =oauth2=. In the request section view, the active
 auth type is shown in the header line as =Auth(None)=, =Auth(Bearer)=,
 =Auth(Basic)=, =Auth(Header)=, =Auth(API Key)=, or =Auth(OAuth2)=.
@@ -379,6 +382,9 @@ token=abc123
 | =time < 500=                        | Response time under N ms       |
 | =size < 102400=                     | Response size under N bytes    |
 
+In the =Tests= section, =completion-at-point= offers common assertion
+snippets such as =status == 200= and =header content-type contains json=.
+
 * Key Bindings
 
 ** Request Mode (=.http= files)
@@ -390,6 +396,7 @@ token=abc123
 | =C-c C-f= | =courier-request-attach-file=  | Attach file to body    |
 | =C-c C-j= | =courier-request-jump-section= | Jump to request section |
 | =C-c C-m= | =courier-request-set-method=   | Change HTTP method     |
+| =C-c C-t= | =courier-request-section-type= | Section action         |
 | =C-c C-n= | =courier-new-request=          | Create request draft   |
 | =C-c C-p= | =courier-request-preview=      | Preview resolved form  |
 | =C-c ?=   | =courier-dispatch=             | Show request actions   |
@@ -425,6 +432,14 @@ jump target into raw source text, and the current section is indicated in the
 
 =Auth=, =Vars=, =Script=, and =Tests= are edited as TOML-backed fragments so
 the visible section text matches the front matter Courier writes on save.
+=Vars= keeps one small scaffold command in the request action menu for
+appending =[[vars.post_response]]= blocks; =Tests= stays text-first and relies
+on =completion-at-point= instead of a form-like insert command.
+=C-c C-t= only applies where a section has a concrete action:
+=Body= changes body type, =Auth= changes auth type, and =Vars= appends a
+=[[vars.post_response]]= rule. In =Tests= it points you back to
+=completion-at-point=, and other sections report that no section action is
+available.
 
 =Params= can still be edited directly as part of the URL, but the request-side
 params views normalize those values into Courier params when you edit them.

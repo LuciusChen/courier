@@ -315,6 +315,13 @@ manager. It is a source of variable values for request resolution.
   `C-c C-j` switches to any request section
 - transient remains for actions such as send, preview, save, and env
   switching, not for primary content editing
+- request editing stays text-first:
+  - complex typed changes use explicit commands such as body type, auth type,
+    env switching, attach file, and response-var scaffolding
+  - `[[vars.post_response]]` gets one scaffold command because its TOML shape
+    is non-obvious
+  - `tests` stays plain text and uses completion snippets instead of a
+    separate insert workflow
 - query params may be edited either directly in the URL or through a dedicated
   key/value editor; once edited structurally, Courier normalizes them into
   request params instead of keeping a duplicated URL-query truth

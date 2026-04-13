@@ -162,6 +162,19 @@ root."
              "multipart/form-data")))
   "Common MIME types offered by Courier completion.")
 
+(defconst courier--post-response-var-sources
+  '("json" "header" "status")
+  "Allowed `from' values for `[[vars.post_response]]' rules.")
+
+(defconst courier--tests-dsl-completions
+  '("status == 200"
+    "status != 404"
+    "header content-type contains json"
+    "body contains hello"
+    "time < 500"
+    "size < 102400")
+  "Common Courier test DSL snippets offered by completion.")
+
 (defconst courier--response-tabs
   '(response headers timeline tests)
   "Supported Courier response tabs.")
@@ -3963,18 +3976,38 @@ request URL query string."
   (file-relative-name (expand-file-name path)
                       (courier--request-attachment-base-directory)))
 
-(defun courier--content-type-capf ()
-  "Return completion data for `content_type' values at point."
+(defun courier--capf-quoted-value-bounds (regexp)
+  "Return string bounds for REGEXP on the current line, or nil.
+
+REGEXP must place the editable string contents in capture group 1."
   (let ((pos (point)))
     (save-excursion
       (goto-char (line-beginning-position))
-      (when (re-search-forward
-             "^[ \t#]*content_type[ \t]*=[ \t]*\"\\([^\"]*\\)\"?"
-             (line-end-position) t)
+      (when (re-search-forward regexp (line-end-position) t)
         (let ((start (match-beginning 1))
               (end (match-end 1)))
           (when (<= start pos end)
-            (list start end courier--common-content-types)))))))
+            (cons start end)))))))
+
+(defun courier--content-type-capf ()
+  "Return completion data for `content_type' values at point."
+  (when-let* ((bounds (courier--capf-quoted-value-bounds
+                       "^[ \t#]*content_type[ \t]*=[ \t]*\"\\([^\"]*\\)\"?")))
+    (list (car bounds) (cdr bounds) courier--common-content-types)))
+
+(defun courier--post-response-var-from-capf ()
+  "Return completion data for `from' values in the vars section."
+  (when (eq (courier--request-current-section) 'vars)
+    (when-let* ((bounds (courier--capf-quoted-value-bounds
+                         "^[ \t#]*from[ \t]*=[ \t]*\"\\([^\"]*\\)\"?")))
+      (list (car bounds) (cdr bounds) courier--post-response-var-sources))))
+
+(defun courier--tests-dsl-capf ()
+  "Return completion data for test DSL strings in the tests section."
+  (when (eq (courier--request-current-section) 'tests)
+    (when-let* ((bounds (courier--capf-quoted-value-bounds
+                         "^[ \t]*\"\\([^\"]*\\)\"[,]?")))
+      (list (car bounds) (cdr bounds) courier--tests-dsl-completions))))
 
 (defun courier--ensure-request-layout ()
   "Ensure the current Courier request buffer has layout markers."
@@ -5794,27 +5827,43 @@ Entries are read from the configured env directory only."
     (display-buffer buffer '(display-buffer-pop-up-window))
     buffer))
 
+(defun courier--preview-insert-label (label)
+  "Insert preview LABEL with highlighting."
+  (insert (propertize label 'face 'font-lock-keyword-face)))
+
+(defun courier--preview-insert-section (title)
+  "Insert preview section TITLE with highlighting."
+  (insert (propertize title 'face 'font-lock-function-name-face) "\n"))
+
 (defun courier--preview-request (request argv)
   "Render REQUEST preview with ARGV into the preview buffer."
-  (let ((buffer (courier--preview-buffer)))
+  (let ((buffer (courier--preview-buffer))
+        (method (plist-get request :method)))
     (with-current-buffer buffer
       (let ((inhibit-read-only t))
         (erase-buffer)
-        (insert (format "Name:    %s\n" (or (plist-get request :name) "(none)")))
-        (insert (format "Method:  %s\n" (plist-get request :method)))
-        (insert (format "URL:     %s\n\n" (plist-get request :url)))
-        (insert "Headers:\n")
+        (courier--preview-insert-label "Name:    ")
+        (insert (or (plist-get request :name) "(none)") "\n")
+        (courier--preview-insert-label "Method:  ")
+        (insert (propertize method 'face (courier--method-overlay-face method)) "\n")
+        (courier--preview-insert-label "URL:     ")
+        (insert (propertize (plist-get request :url) 'face 'link) "\n\n")
+        (courier--preview-insert-section "Headers:")
         (if-let* ((headers (plist-get request :headers)))
             (dolist (header headers)
-              (insert (format "  %s: %s\n" (car header) (cdr header))))
-          (insert "  (none)\n"))
-        (insert "\nBody:\n")
+              (insert "  "
+                      (propertize (car header) 'face 'font-lock-variable-name-face)
+                      ": " (cdr header) "\n"))
+          (insert (propertize "  (none)\n" 'face 'shadow)))
+        (insert "\n")
+        (courier--preview-insert-section "Body:")
         (if (string-empty-p (or (plist-get request :body) ""))
-            (insert "  (empty)\n")
+            (insert (propertize "  (empty)\n" 'face 'shadow))
           (insert (plist-get request :body) "\n"))
-        (insert "\nCurl argv:\n")
+        (insert "\n")
+        (courier--preview-insert-section "Curl argv:")
         (dolist (arg argv)
-          (insert (format "  %s\n" arg)))
+          (insert "  " (propertize arg 'face 'font-lock-string-face) "\n"))
         (special-mode)))
     (display-buffer buffer)))
 
@@ -6119,6 +6168,8 @@ Signal `user-error' when the current request line has no URL."
   (setq-local outline-regexp "^[A-Z]+ ")
   (setq-local revert-buffer-function #'courier-request-revert-buffer)
   (add-hook 'xref-backend-functions #'courier--xref-backend nil t)
+  (add-hook 'completion-at-point-functions #'courier--tests-dsl-capf nil t)
+  (add-hook 'completion-at-point-functions #'courier--post-response-var-from-capf nil t)
   (add-hook 'completion-at-point-functions #'courier--content-type-capf nil t)
   (setq-local courier--request-path (and buffer-file-name (expand-file-name buffer-file-name)))
   (setq-local courier--collection-root-hint
@@ -6197,7 +6248,6 @@ Signal `user-error' when the current request line has no URL."
   (courier--render-request-buffer)
   (message "Courier method set to %s." method))
 
-;;;###autoload
 (defun courier-request-set-body-type (body-type)
   "Set the current request body type to BODY-TYPE."
   (interactive
@@ -6270,7 +6320,55 @@ Signal `user-error' when the current request line has no URL."
       (set-buffer-modified-p t)
       (message "Courier attached %s." (file-name-nondirectory absolute-path)))))
 
+(defun courier-request-add-response-var (source name &optional expr)
+  "Append a post-response var rule using SOURCE, NAME, and EXPR."
+  (interactive
+   (let* ((source (completing-read "Response var source: "
+                                   courier--post-response-var-sources
+                                   nil t nil nil "json"))
+          (name (string-trim (read-string "Response var name: ")))
+          (expr (pcase source
+                  ("json"
+                   (string-trim (read-string "JSON expr: ")))
+                  ("header"
+                   (string-trim (read-string "Header name: ")))
+                  (_ nil))))
+     (list source name expr)))
+  (when (string-empty-p name)
+    (user-error "Response var name must not be empty"))
+  (when (and (member source '("json" "header"))
+             (or (null expr) (string-empty-p expr)))
+    (user-error "%s response vars require expr"
+                (capitalize source)))
+  (courier--sync-request-model)
+  (plist-put
+   courier--request-model :post-response-vars
+   (append (copy-tree (plist-get courier--request-model :post-response-vars) t)
+           (list (append (list :name name
+                               :from (intern source))
+                         (when (and expr (not (string-empty-p expr)))
+                           (list :expr expr))))))
+  (setq courier--request-tab 'vars)
+  (courier--refresh-request-content)
+  (set-buffer-modified-p t)
+  (message "Courier response var %s added." name))
+
 ;;;###autoload
+(defun courier-request-section-type ()
+  "Run the type-switching command appropriate for the current section.
+In the Body section, switch body type.  In the Auth section, switch auth
+type.  In the Vars section, add a response var rule."
+  (interactive)
+  (pcase (courier--request-current-section)
+    ('body (call-interactively #'courier-request-set-body-type))
+    ('auth (call-interactively #'courier-request-set-auth-type))
+    ('vars (call-interactively #'courier-request-add-response-var))
+    ('tests
+     (user-error "No section action for Tests.  Use completion-at-point"))
+    (section
+     (user-error "No section action for %s"
+                 (courier--request-section-label section)))))
+
 (defun courier-request-set-auth-type (auth-type)
   "Set the current request auth type to AUTH-TYPE."
   (interactive
@@ -6558,8 +6656,9 @@ This renames the request file and updates its front matter name."
    ("l" "Validate" courier-request-validate)]
    ["Edit"
     ("m" "Method" courier-request-set-method)
-    ("B" "Body type" courier-request-set-body-type)
+    ("t" "Section action" courier-request-section-type)
     ("f" "Attach file" courier-request-attach-file)
+    ("v" "Response var" courier-request-add-response-var)
     ("A" "Auth type" courier-request-set-auth-type)
     ("e" "Environment" courier-request-switch-env)
     ("s" "Save" courier-request-save-buffer)]
@@ -6608,6 +6707,7 @@ This renames the request file and updates its front matter name."
 (define-key courier-request-mode-map (kbd "C-c C-e") #'courier-request-switch-env)
 (define-key courier-request-mode-map (kbd "C-c C-f") #'courier-request-attach-file)
 (define-key courier-request-mode-map (kbd "C-c C-j") #'courier-request-jump-section)
+(define-key courier-request-mode-map (kbd "C-c C-t") #'courier-request-section-type)
 (define-key courier-request-mode-map (kbd "C-c C-l") #'courier-request-validate)
 (define-key courier-request-mode-map (kbd "C-c C-m") #'courier-request-set-method)
 (define-key courier-request-mode-map (kbd "C-c C-n") #'courier-new-request)
