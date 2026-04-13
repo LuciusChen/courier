@@ -82,6 +82,126 @@
          (progn ,@body)
        (delete-directory ,(car binding) t))))
 
+(defun courier-test--wait-until (predicate &optional timeout process)
+  "Wait until PREDICATE returns non-nil or TIMEOUT seconds elapse.
+When PROCESS is non-nil, prefer `accept-process-output' on PROCESS."
+  (let ((deadline (+ (float-time) (or timeout 5.0))))
+    (while (and (not (funcall predicate))
+                (< (float-time) deadline))
+      (accept-process-output process 0.05))
+    (funcall predicate)))
+
+(defun courier-test--start-integration-server ()
+  "Start the local Courier integration test server and return its context plist."
+  (let* ((python (or (executable-find "python3")
+                     (ert-skip "python3 is required for integration tests")))
+         (root (make-temp-file "courier-integration-" t))
+         (port-file (expand-file-name "port" root))
+         (stdout-buffer (generate-new-buffer " *courier-integration-server*"))
+         (stderr-buffer (generate-new-buffer " *courier-integration-server-stderr*"))
+         (script "/Users/luciuschen/repos/courier/test/server/courier_test_server.py")
+         (process (make-process :name "courier-integration-server"
+                                :buffer stdout-buffer
+                                :stderr stderr-buffer
+                                :connection-type 'pipe
+                                :command (list python script "--port-file" port-file)
+                                :noquery t)))
+    (unless (courier-test--wait-until
+             (lambda ()
+               (or (and (file-exists-p port-file)
+                        (> (nth 7 (file-attributes port-file)) 0))
+                   (not (process-live-p process))))
+             5.0 process)
+      (let ((stderr (with-current-buffer stderr-buffer (buffer-string))))
+        (delete-process process)
+        (error "Timed out starting Courier integration server: %s" stderr)))
+    (unless (process-live-p process)
+      (let ((stderr (with-current-buffer stderr-buffer (buffer-string))))
+        (kill-buffer stdout-buffer)
+        (kill-buffer stderr-buffer)
+        (delete-directory root t)
+        (error "Courier integration server exited early: %s" stderr)))
+    (let ((port (string-to-number
+                 (string-trim
+                  (with-temp-buffer
+                    (insert-file-contents port-file)
+                    (buffer-string))))))
+      (list :process process
+            :port port
+            :base-url (format "http://127.0.0.1:%d" port)
+            :root root
+            :port-file port-file
+            :stdout-buffer stdout-buffer
+            :stderr-buffer stderr-buffer))))
+
+(defun courier-test--stop-integration-server (server)
+  "Stop integration SERVER created by `courier-test--start-integration-server'."
+  (when-let* ((process (plist-get server :process)))
+    (when (process-live-p process)
+      (delete-process process)
+      (courier-test--wait-until (lambda () (not (process-live-p process))) 1.0 nil)))
+  (dolist (key '(:stdout-buffer :stderr-buffer))
+    (when-let* ((buffer (plist-get server key)))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer))))
+  (when-let* ((root (plist-get server :root)))
+    (when (file-directory-p root)
+      (delete-directory root t))))
+
+(defmacro courier-test--with-integration-server (binding &rest body)
+  "Start a local integration server BINDING and evaluate BODY."
+  (declare (indent 1) (debug t))
+  `(let ((,(car binding) (courier-test--start-integration-server)))
+     (unwind-protect
+         (progn ,@body)
+       (courier-test--stop-integration-server ,(car binding)))))
+
+(defun courier-test--json-body (response)
+  "Parse RESPONSE body text as a JSON alist."
+  (json-parse-string (plist-get response :body-text)
+                     :object-type 'hash-table
+                     :array-type 'list))
+
+(defun courier-test--json-get (object key)
+  "Return KEY from JSON OBJECT hash-table or alist."
+  (if (hash-table-p object)
+      (gethash key object)
+    (alist-get key object nil nil #'equal)))
+
+(defun courier-test--send-resolved-sync (request)
+  "Send already resolved REQUEST and return the response plist."
+  (let ((done nil)
+        response
+        process)
+    (setq process
+          (courier-send-request
+           request
+           (lambda (value)
+             (setq response value
+                   done t))))
+    (unless (courier-test--wait-until (lambda () done) 5.0 nil)
+      (when (process-live-p process)
+        (delete-process process))
+      (ert-fail "Timed out waiting for Courier integration request"))
+    response))
+
+(defun courier-test--send-sync (request)
+  "Resolve and send REQUEST, then return the response plist."
+  (let ((done nil)
+        response
+        process)
+    (setq process
+          (courier-send-request
+           (courier-resolve-request request nil)
+           (lambda (value)
+             (setq response value
+                   done t))))
+    (unless (courier-test--wait-until (lambda () done) 5.0 nil)
+      (when (process-live-p process)
+        (delete-process process))
+      (ert-fail "Timed out waiting for Courier integration request"))
+    response))
+
 (defun courier-test--argv-flag-value (argv flag)
   "Return the value immediately after FLAG in ARGV."
   (when-let* ((position (cl-position flag argv :test #'string=)))
@@ -107,6 +227,13 @@
   (if (listp face)
       (memq expected face)
     (eq face expected)))
+
+(defun courier-test--pick-match (pattern collection)
+  "Return the first completion candidate in COLLECTION matching PATTERN."
+  (or (seq-find (lambda (candidate)
+                  (string-match-p pattern candidate))
+                (all-completions "" collection))
+      (ert-fail (format "No completion candidate matching %s" pattern))))
 
 ;; Parser tests.
 
@@ -739,6 +866,12 @@
     (should (equal (plist-get resolved :headers)
                    '(("content-type" . "application/x-www-form-urlencoded"))))))
 
+(ert-deftest courier-form-body-pairs-ignore-trailing-newline ()
+  (should (equal (courier--form-body-pairs-from-string
+                  "name={{name}}&mode={{mode}}\n")
+                 '(("name" . "{{name}}")
+                   ("mode" . "{{mode}}")))))
+
 (ert-deftest courier-resolve-request-clears-body-for-none-type ()
   (let* ((request (list :path "/tmp/demo.http"
                         :name "Demo"
@@ -1174,6 +1307,460 @@
           (when (process-live-p process)
             (delete-process process)))))))
 
+;; Integration tests.
+
+(ert-deftest courier-integration-echo-round-trips-json-request ()
+  (courier-test--with-integration-server (server)
+    (let* ((response
+            (courier-test--send-sync
+             (list :path "/tmp/echo.http"
+                   :name "Echo"
+                   :method "POST"
+                   :url (concat (plist-get server :base-url) "/echo")
+                   :headers nil
+                   :body "{\"hello\":\"courier\"}"
+                   :body-type 'json
+                   :params '(("page" . "1"))
+                   :vars nil
+                   :tests nil
+                   :settings nil)))
+           (payload (courier-test--json-body response)))
+      (should (= (plist-get response :status-code) 200))
+      (should (equal (courier-test--json-get payload "method") "POST"))
+      (should (equal (courier-test--json-get payload "path") "/echo"))
+      (should (equal (courier-test--json-get (courier-test--json-get payload "query") "page")
+                     "1"))
+      (should (equal (courier-test--json-get (courier-test--json-get payload "headers")
+                                             "content-type")
+                     "application/json"))
+      (should (string-match-p "courier" (courier-test--json-get payload "body_text"))))))
+
+(ert-deftest courier-integration-multipart-request-sends-real-parts ()
+  (courier-test--with-integration-server (server)
+    (courier-test--with-temp-files ((upload ".txt"))
+      (with-temp-file upload
+        (insert "avatar-bytes"))
+      (let* ((response
+              (courier-test--send-sync
+               (list :path "/tmp/multipart.http"
+                     :name "Multipart"
+                     :method "POST"
+                     :url (concat (plist-get server :base-url) "/multipart")
+                     :headers nil
+                     :body ""
+                     :body-type 'multipart
+                     :body-parts (list (list :name "avatar"
+                                             :kind 'file
+                                             :path upload
+                                             :content-type "text/plain")
+                                       (list :name "display_name"
+                                             :kind 'text
+                                             :value "Courier"))
+                     :params nil
+                     :vars nil
+                     :tests nil
+                     :settings nil)))
+             (payload (courier-test--json-body response))
+             (parts (courier-test--json-get payload "parts"))
+             (file-part (seq-find (lambda (part)
+                                    (equal (courier-test--json-get part "name") "avatar"))
+                                  parts))
+             (text-part (seq-find (lambda (part)
+                                    (equal (courier-test--json-get part "name")
+                                           "display_name"))
+                                  parts)))
+        (should (= (plist-get response :status-code) 200))
+        (should (equal (courier-test--json-get file-part "kind") "file"))
+        (should (equal (courier-test--json-get file-part "content_type") "text/plain"))
+        (should (= (courier-test--json-get file-part "size")
+                   (length "avatar-bytes")))
+        (should (equal (courier-test--json-get text-part "kind") "text"))
+        (should (equal (courier-test--json-get text-part "value") "Courier"))))))
+
+(ert-deftest courier-integration-binary-request-sends-source-file ()
+  (courier-test--with-integration-server (server)
+    (courier-test--with-temp-files ((upload ".bin"))
+      (with-temp-file upload
+        (set-buffer-multibyte nil)
+        (insert "courier-binary-payload"))
+      (let* ((response
+              (courier-test--send-sync
+               (list :path "/tmp/binary.http"
+                     :name "Binary"
+                     :method "POST"
+                     :url (concat (plist-get server :base-url) "/binary")
+                     :headers nil
+                     :body ""
+                     :body-type 'binary
+                     :body-file-path upload
+                     :body-file-content-type "application/octet-stream"
+                     :params nil
+                     :vars nil
+                     :tests nil
+                     :settings nil)))
+             (payload (courier-test--json-body response)))
+        (should (= (plist-get response :status-code) 200))
+        (should (equal (courier-test--json-get payload "content_type")
+                       "application/octet-stream"))
+        (should (= (courier-test--json-get payload "body_size")
+                   (length "courier-binary-payload")))
+        (should (equal (courier-test--json-get payload "body_sha256")
+                       (secure-hash 'sha256 "courier-binary-payload")))))))
+
+(ert-deftest courier-integration-oauth2-client-credentials-round-trips ()
+  (courier-test--with-integration-server (server)
+    (let* ((base-url (plist-get server :base-url))
+           (response
+            (courier-test--send-sync
+             (list :path "/tmp/oauth.http"
+                   :name "OAuth"
+                   :method "GET"
+                   :url (concat base-url "/protected")
+                   :headers nil
+                   :body ""
+                   :body-type 'none
+                   :params nil
+                   :vars nil
+                   :tests nil
+                   :settings nil
+                   :auth (list :type 'oauth2
+                               :grant-type "client_credentials"
+                               :token-url (concat base-url "/oauth/token")
+                               :client-id "courier-client"
+                               :client-secret "courier-secret"
+                               :scopes '("read")))))
+           (payload (courier-test--json-body response)))
+      (should (= (plist-get response :status-code) 200))
+      (should (equal (courier-test--json-get payload "authorization")
+                     "Bearer courier-test-token")))))
+
+(ert-deftest courier-integration-image-response-detects-image-view ()
+  (courier-test--with-integration-server (server)
+    (let ((response
+           (courier-test--send-sync
+            (list :path "/tmp/image.http"
+                  :name "Image"
+                  :method "GET"
+                  :url (concat (plist-get server :base-url) "/image/png")
+                  :headers nil
+                  :body ""
+                  :body-type 'none
+                  :params nil
+                  :vars nil
+                  :tests nil
+                  :settings nil))))
+      (should (= (plist-get response :status-code) 200))
+      (should (equal (plist-get response :content-type) "image/png"))
+      (should (eq (courier--auto-body-view response) 'image))
+      (should-not (plist-get response :body-text))
+      (should (file-exists-p (plist-get response :body-file))))))
+
+(ert-deftest courier-integration-pdf-response-detects-document-view ()
+  (courier-test--with-integration-server (server)
+    (let* ((response
+            (courier-test--send-sync
+             (list :path "/tmp/pdf.http"
+                   :name "PDF"
+                   :method "GET"
+                   :url (concat (plist-get server :base-url) "/pdf")
+                   :headers nil
+                   :body ""
+                   :body-type 'none
+                   :params nil
+                   :vars nil
+                   :tests nil
+                   :settings nil)))
+           (body-file (plist-get response :body-file)))
+      (should (= (plist-get response :status-code) 200))
+      (should (equal (plist-get response :content-type) "application/pdf"))
+      (should (eq (courier--auto-body-view response) 'document))
+      (should (file-exists-p body-file))
+      (with-temp-buffer
+        (set-buffer-multibyte nil)
+        (insert-file-contents-literally body-file nil 0 5)
+        (should (equal (buffer-string) "%PDF-"))))))
+
+(ert-deftest courier-integration-request-workflow-round-trips-env-runtime-and-scripts ()
+  (courier-test--with-integration-server (server)
+    (courier-test--with-temp-dir (home)
+      (let* ((courier-home-directory home)
+             (collection-root (expand-file-name "collections/smoke-api" home))
+             (request-root (expand-file-name "requests/flows" collection-root))
+             (env-root (expand-file-name "env" collection-root))
+             (token-file (expand-file-name "token.http" request-root))
+             (follow-file (expand-file-name "followup.http" request-root))
+             (folder-config (expand-file-name "courier.json" request-root))
+             (local-env (expand-file-name "local.env" env-root))
+             (staging-env (expand-file-name "staging.env" env-root))
+             token-buffer follow-buffer env-buffer)
+        (make-directory request-root t)
+        (make-directory env-root t)
+        (with-temp-file (expand-file-name "courier.json" collection-root)
+          (insert
+           (concat
+            "{\n"
+            "  \"name\": \"smoke-api\",\n"
+            "  \"requestsDir\": \"requests\",\n"
+            "  \"envDir\": \"env\",\n"
+            "  \"defaultEnv\": \"local\",\n"
+            "  \"defaults\": {\n"
+            "    \"vars\": {\n"
+            "      \"base_url\": \"" (plist-get server :base-url) "\",\n"
+            "      \"tool\": \"from-collection\"\n"
+            "    },\n"
+            "    \"headers\": {\n"
+            "      \"accept\": \"application/json\"\n"
+            "    }\n"
+            "  }\n"
+            "}\n")))
+        (with-temp-file folder-config
+          (insert
+           "{\n"
+           "  \"defaults\": {\n"
+           "    \"vars\": {\n"
+           "      \"tool\": \"from-folder\"\n"
+           "    }\n"
+           "  }\n"
+           "}\n"))
+        (with-temp-file local-env
+          (insert
+           (concat
+            "api_key=local-key\n"
+            "user=local-user\n"
+            "token_url=" (plist-get server :base-url) "/oauth/token\n")))
+        (with-temp-file staging-env
+          (insert
+           (concat
+            "api_key=staging-key\n"
+            "user=staging-user\n"
+            "token_url=" (plist-get server :base-url) "/oauth/token\n")))
+        (with-temp-file token-file
+          (insert
+           "+++\n"
+           "name = \"Token\"\n"
+           "\n"
+           "[body]\n"
+           "type = \"form-urlencoded\"\n"
+           "\n"
+           "[vars]\n"
+           "client_id = \"courier-client\"\n"
+           "client_secret = \"courier-secret\"\n"
+           "scope = \"read\"\n"
+           "\n"
+           "[[vars.post_response]]\n"
+           "name = \"access_token\"\n"
+           "from = \"json\"\n"
+           "expr = \"$.access_token\"\n"
+           "+++\n"
+           "POST {{token_url}}\n"
+           "Content-Type: application/x-www-form-urlencoded\n\n"
+           "grant_type=client_credentials&client_id={{client_id}}&client_secret={{client_secret}}&scope={{scope}}\n"))
+        (with-temp-file follow-file
+          (insert
+           "+++\n"
+           "name = \"Followup\"\n"
+           "tests = [\"status == 200\"]\n"
+           "\n"
+           "[auth]\n"
+           "type = \"api_key\"\n"
+           "in = \"query\"\n"
+           "name = \"api_key\"\n"
+           "value = \"{{api_key}}\"\n"
+           "\n"
+           "[vars]\n"
+           "tool = \"from-request\"\n"
+           "\n"
+           "[vars.pre_request]\n"
+           "request_id = \"req-42\"\n"
+           "\n"
+           "[scripts]\n"
+           "pre_request = \"\"\"\n"
+           "(setq courier-script-request\n"
+           "      (plist-put courier-script-request :url\n"
+           "                 (concat (plist-get courier-script-request :url)\n"
+           "                         \"?user=\"\n"
+           "                         (or (cdr (assoc \"user\" courier-script-env-vars)) \"\"))))\n"
+           "courier-script-request\n"
+           "\"\"\"\n"
+           "post_response = \"\"\"\n"
+           "(setq courier-script-response\n"
+           "      (plist-put courier-script-response :reason \"Smoke OK\"))\n"
+           "courier-script-response\n"
+           "\"\"\"\n"
+           "+++\n"
+           "GET {{base_url}}/echo\n"
+           "Authorization: Bearer {{access_token}}\n"
+           "X-Request-Id: {{request_id}}\n"
+           "X-Tool: {{tool}}\n"))
+        (unwind-protect
+            (progn
+              (with-temp-buffer
+                (setq default-directory "/Users/luciuschen/repos/courier/")
+                (cl-letf (((symbol-function 'completing-read)
+                           (lambda (_prompt collection &rest _args)
+                             (courier-test--pick-match "token" collection))))
+                  (courier-open)))
+              (setq token-buffer (get-file-buffer token-file))
+              (should (buffer-live-p token-buffer))
+              (with-current-buffer token-buffer
+                (let ((request (progn
+                                 (setq-local courier--active-env "local")
+                                 (courier--resolved-current-request))))
+                  (courier--apply-post-response-vars
+                   request
+                   (courier-test--send-resolved-sync request)
+                   "local")))
+              (should (equal (cdr (assoc-string "access_token"
+                                                (courier--read-runtime-vars collection-root "local")
+                                                nil))
+                             "courier-test-token"))
+
+              (with-temp-buffer
+                (setq default-directory "/Users/luciuschen/repos/courier/")
+                (cl-letf (((symbol-function 'completing-read)
+                           (lambda (_prompt collection &rest _args)
+                             (courier-test--pick-match "followup" collection))))
+                  (courier-open)))
+              (setq follow-buffer (get-file-buffer follow-file))
+              (should (buffer-live-p follow-buffer))
+              (with-current-buffer follow-buffer
+                (courier-request-jump-section 'vars)
+                (goto-char (point-min))
+                (should (search-forward "tool = \"from-request\"" nil t))
+                (replace-match "tool = \"from-ui\"" t t)
+                (courier-request-save-buffer)
+                (let* ((response (progn
+                                   (setq-local courier--active-env "local")
+                                   (courier-test--send-resolved-sync
+                                    (courier--resolved-current-request))))
+                       (payload (courier-test--json-body response)))
+                  (should (equal (courier-test--json-get
+                                  (courier-test--json-get payload "query")
+                                  "user")
+                                 "local-user"))
+                  (should (equal (courier-test--json-get
+                                  (courier-test--json-get payload "query")
+                                  "api_key")
+                                 "local-key"))
+                  (should (equal (courier-test--json-get
+                                  (courier-test--json-get payload "headers")
+                                  "authorization")
+                                 "Bearer courier-test-token"))
+                  (should (equal (courier-test--json-get
+                                  (courier-test--json-get payload "headers")
+                                  "x-tool")
+                                 "from-ui"))
+                  (should (equal (plist-get response :reason) "Smoke OK"))))
+
+              (with-current-buffer token-buffer
+                (let ((request (progn
+                                 (setq-local courier--active-env "staging")
+                                 (courier--resolved-current-request))))
+                  (courier--apply-post-response-vars
+                   request
+                   (courier-test--send-resolved-sync request)
+                   "staging")))
+              (should (equal (cdr (assoc-string "access_token"
+                                                (courier--read-runtime-vars collection-root "staging")
+                                                nil))
+                             "courier-test-token"))
+
+              (with-current-buffer follow-buffer
+                (cl-letf (((symbol-function 'completing-read)
+                           (lambda (&rest _args) "staging")))
+                  (courier-request-switch-env))
+                (let* ((response (courier-test--send-resolved-sync
+                                  (progn
+                                    (setq-local courier--active-env "staging")
+                                    (courier--resolved-current-request))))
+                       (payload (courier-test--json-body response)))
+                  (should (equal (courier-test--json-get
+                                  (courier-test--json-get payload "query")
+                                  "user")
+                                 "staging-user"))
+                  (should (equal (courier-test--json-get
+                                  (courier-test--json-get payload "query")
+                                  "api_key")
+                                 "staging-key"))
+                  (should (equal (courier-test--json-get
+                                  (courier-test--json-get payload "headers")
+                                  "authorization")
+                                 "Bearer courier-test-token"))))
+
+              (with-temp-buffer
+                (setq default-directory "/Users/luciuschen/repos/courier/")
+                (cl-letf (((symbol-function 'completing-read)
+                           (lambda (_prompt collection &rest _args)
+                             (courier-test--pick-match "staging" collection))))
+                  (courier-open-env)))
+              (setq env-buffer (get-file-buffer staging-env))
+              (should (buffer-live-p env-buffer))
+              (with-current-buffer env-buffer
+                (should (derived-mode-p 'courier-env-mode))))
+          (dolist (buffer (list token-buffer follow-buffer env-buffer))
+            (when (buffer-live-p buffer)
+              (kill-buffer buffer))))))))
+
+(ert-deftest courier-integration-html-response-detects-html-view ()
+  (courier-test--with-integration-server (server)
+    (let ((response
+           (courier-test--send-sync
+            (list :path "/tmp/html.http"
+                  :name "HTML"
+                  :method "GET"
+                  :url (concat (plist-get server :base-url) "/html")
+                  :headers nil
+                  :body ""
+                  :body-type 'none
+                  :params nil
+                  :vars nil
+                  :tests nil
+                  :settings nil))))
+      (should (= (plist-get response :status-code) 200))
+      (should (equal (plist-get response :content-type) "text/html"))
+      (should (eq (courier--auto-body-view response) 'html))
+      (should (string-match-p "Courier" (or (plist-get response :body-text) ""))))))
+
+(ert-deftest courier-integration-svg-response-detects-image-view ()
+  (courier-test--with-integration-server (server)
+    (let ((response
+           (courier-test--send-sync
+            (list :path "/tmp/svg.http"
+                  :name "SVG"
+                  :method "GET"
+                  :url (concat (plist-get server :base-url) "/image/svg")
+                  :headers nil
+                  :body ""
+                  :body-type 'none
+                  :params nil
+                  :vars nil
+                  :tests nil
+                  :settings nil))))
+      (should (= (plist-get response :status-code) 200))
+      (should (equal (plist-get response :content-type) "image/svg+xml"))
+      (should (eq (courier--auto-body-view response) 'image)))))
+
+(ert-deftest courier-integration-bad-charset-surfaces-parse-error ()
+  (courier-test--with-integration-server (server)
+    (let ((response
+           (courier-test--send-sync
+            (list :path "/tmp/bad-charset.http"
+                  :name "Bad Charset"
+                  :method "GET"
+                  :url (concat (plist-get server :base-url) "/bad-charset")
+                  :headers nil
+                  :body ""
+                  :body-type 'none
+                  :params nil
+                  :vars nil
+                  :tests nil
+                  :settings nil))))
+      (should (= (plist-get response :status-code) 0))
+      (should (equal (plist-get response :reason) "Parse Error"))
+      (let ((stderr (downcase (or (plist-get response :stderr) ""))))
+        (should (string-match-p "unsupported response charset" stderr))
+        (should (string-match-p "x-courier-invalid" stderr))))))
+
 ;; Response parser tests.
 
 (ert-deftest courier-parse-response-simple-200 ()
@@ -1319,6 +1906,34 @@
       (insert "broken-line\n"))
     (should-error (courier-parse-env-file env) :type 'user-error)))
 
+(ert-deftest courier-env-mode-activates-for-collection-env-files ()
+  (courier-test--with-temp-dir (root)
+    (let* ((courier-home-directory root)
+           (collection-root (expand-file-name "collections/api-collection" root))
+           (env-dir (expand-file-name "env" collection-root))
+           (env-file (expand-file-name "local.env" env-dir)))
+      (make-directory env-dir t)
+      (with-temp-file (expand-file-name "courier.json" collection-root)
+        (insert "{}\n"))
+      (with-temp-file env-file
+        (insert "token=local\n"))
+      (with-current-buffer (find-file-noselect env-file)
+        (unwind-protect
+            (should (derived-mode-p 'courier-env-mode))
+          (kill-buffer (current-buffer)))))))
+
+(ert-deftest courier-env-mode-fontifies-comments-and-keys ()
+  (with-temp-buffer
+    (insert "# local demo values\nbase_url=https://example.com\n")
+    (courier-env-mode)
+    (font-lock-ensure)
+    (goto-char (point-min))
+    (let ((comment-face (get-text-property (point) 'face)))
+      (should (courier-test--face-includes-p comment-face 'font-lock-comment-face)))
+    (search-forward "base_url")
+    (let ((key-face (get-text-property (1- (point)) 'face)))
+      (should (courier-test--face-includes-p key-face 'font-lock-variable-name-face)))))
+
 (ert-deftest courier-collection-config-uses-defaults ()
   (courier-test--with-temp-dir (root)
     (let ((config-file (expand-file-name "courier.json" root)))
@@ -1398,6 +2013,98 @@
             (let ((resolved (courier--resolved-current-request)))
               (should (equal (plist-get resolved :url)
                              "https://example.com/users/runtime-token/42")))
+          (kill-buffer (current-buffer)))))))
+
+(ert-deftest courier-current-env-selection-runtime-overrides-env ()
+  (courier-test--with-temp-dir (root)
+    (let* ((courier-home-directory root)
+           (collection-root (expand-file-name "collections/api-collection" root))
+           (env-dir (expand-file-name "env" collection-root))
+           (request-dir (expand-file-name "requests" collection-root))
+           (request-file (expand-file-name "show.http" request-dir)))
+      (make-directory env-dir t)
+      (make-directory request-dir t)
+      (with-temp-file (expand-file-name "courier.json" collection-root)
+        (insert "{\n  \"name\": \"API Collection\"\n}\n"))
+      (with-temp-file (expand-file-name "local.env" env-dir)
+        (insert "token=env-token\n"
+                "session=env-session\n"))
+      (with-temp-file request-file
+        (insert "GET https://example.com/users/{{token}}/{{session}}\n"))
+      (courier--write-runtime-vars collection-root "local"
+                                   '(("token" . "runtime-token")))
+      (with-current-buffer (find-file-noselect request-file)
+        (unwind-protect
+            (let ((courier--active-env "local"))
+              (should (equal (courier--current-env-selection)
+                             '("local"
+                               ("token" . "runtime-token")
+                               ("session" . "env-session")))))
+          (kill-buffer (current-buffer)))))))
+
+(ert-deftest courier-prepared-current-request-uses-documented-var-precedence ()
+  (courier-test--with-temp-dir (root)
+    (let* ((courier-home-directory root)
+           (collection-root (expand-file-name "collections/api-collection" root))
+           (request-dir (expand-file-name "requests/admin/tools" collection-root))
+           (folder-config (expand-file-name "courier.json"
+                                            (expand-file-name "requests/admin" collection-root)))
+           (env-dir (expand-file-name "env" collection-root))
+           (request-file (expand-file-name "show.http" request-dir)))
+      (make-directory request-dir t)
+      (make-directory env-dir t)
+      (with-temp-file (expand-file-name "courier.json" collection-root)
+        (insert "{\n"
+                "  \"defaults\": {\n"
+                "    \"vars\": {\n"
+                "      \"base_url\": \"https://collection.example.com\",\n"
+                "      \"token\": \"collection-token\",\n"
+                "      \"session\": \"collection-session\"\n"
+                "    }\n"
+                "  }\n"
+                "}\n"))
+      (with-temp-file folder-config
+        (insert "{\n"
+                "  \"defaults\": {\n"
+                "    \"vars\": {\n"
+                "      \"base_url\": \"https://folder.example.com\",\n"
+                "      \"token\": \"folder-token\"\n"
+                "    }\n"
+                "  }\n"
+                "}\n"))
+      (with-temp-file (expand-file-name "local.env" env-dir)
+        (insert "token=env-token\n"
+                "session=env-session\n"))
+      (with-temp-file request-file
+        (insert "+++\n"
+                "[vars]\n"
+                "token = \"request-token\"\n"
+                "\n"
+                "[vars.pre_request]\n"
+                "token = \"pre-token\"\n"
+                "+++\n\n"
+                "GET {{base_url}}/users/{{token}}/{{session}}\n"))
+      (courier--write-runtime-vars collection-root "local"
+                                   '(("token" . "runtime-token")
+                                     ("session" . "runtime-session")))
+      (with-current-buffer (find-file-noselect request-file)
+        (unwind-protect
+            (let ((courier--active-env "local"))
+              (let* ((request (courier--prepared-current-request))
+                     (resolved (courier-resolve-request request
+                                                        (plist-get request :env-vars))))
+                (should-not (assoc-string "base_url"
+                                          (plist-get request :vars)
+                                          nil))
+                (should (equal (cdr (assoc-string "token"
+                                                  (plist-get request :vars)
+                                                  nil))
+                               "pre-token"))
+                (should-not (assoc-string "session"
+                                          (plist-get request :vars)
+                                          nil))
+                (should (equal (plist-get resolved :url)
+                               "https://folder.example.com/users/pre-token/runtime-session"))))
           (kill-buffer (current-buffer)))))))
 
 (ert-deftest courier-post-response-vars-persist-runtime-values ()
@@ -2158,7 +2865,6 @@
            (request-root (expand-file-name "requests/users" collection-root))
            (first-file (expand-file-name "get-user.http" request-root))
            (second-file (expand-file-name "create-user.http" request-root))
-           opened-file
            expected-file)
       (make-directory request-root t)
       (with-temp-file (expand-file-name "courier.json" collection-root)
@@ -2179,21 +2885,22 @@
                           (candidate
                            (assoc selection (courier--open-candidates))))
                      (setq expected-file (plist-get (cdr candidate) :path))
-                     selection)))
-                ((symbol-function 'find-file)
-                 (lambda (path)
-                   (setq opened-file path))))
+                     selection))))
         (let ((default-directory collection-root))
-          (courier-open)))
-      (should (equal opened-file expected-file)))))
+          (courier-open)
+          (should (derived-mode-p 'courier-request-mode))
+          (should (equal (expand-file-name buffer-file-name)
+                         (expand-file-name expected-file)))
+          (should (string= (buffer-name)
+                           (file-name-nondirectory expected-file)))
+          (kill-buffer (current-buffer)))))))
 
 (ert-deftest courier-open-finds-collections-outside-context ()
   (courier-test--with-temp-dir (root)
     (let* ((courier-home-directory root)
            (collection-root (expand-file-name "collections/api-collection" root))
            (request-root (expand-file-name "requests/users" collection-root))
-           (request-file (expand-file-name "get-user.http" request-root))
-           opened-file)
+           (request-file (expand-file-name "get-user.http" request-root)))
       (make-directory request-root t)
       (with-temp-file (expand-file-name "courier.json" collection-root)
         (insert "{}\n"))
@@ -2205,12 +2912,17 @@
         (setq default-directory root)
         (cl-letf (((symbol-function 'completing-read)
                    (lambda (_prompt collection &rest _args)
-                     (car (all-completions "" collection))))
-                  ((symbol-function 'find-file)
-                   (lambda (path)
-                     (setq opened-file path))))
+                     (car (all-completions "" collection)))))
           (courier-open)))
-      (should (equal opened-file request-file)))))
+      (let ((buffer (get-file-buffer request-file)))
+        (should (buffer-live-p buffer))
+        (with-current-buffer buffer
+          (should (derived-mode-p 'courier-request-mode))
+          (should (equal (expand-file-name buffer-file-name)
+                         (expand-file-name request-file)))
+          (should (string= (buffer-name)
+                           (file-name-nondirectory request-file))))
+        (kill-buffer buffer)))))
 
 (ert-deftest courier-request-set-method-rewrites-request-line ()
   (courier-test--with-request
@@ -2612,56 +3324,47 @@
                  (courier--request-header-line-format))))
       (should (string-match-p "Auth(Header)" line)))))
 
-(ert-deftest courier-open-switches-environment ()
+(ert-deftest courier-open-env-opens-selected-environment-file ()
   (courier-test--with-temp-dir (root)
-    (let* ((collection-root (expand-file-name "api-collection" root))
-           (request-dir (expand-file-name "requests/users" collection-root))
+    (let* ((collection-root (expand-file-name "collections/api-collection" root))
            (env-dir (expand-file-name "env" collection-root))
-           (request-file (expand-file-name "get-user.http" request-dir))
+           (env-file (expand-file-name "local.env" env-dir))
            selected-candidate)
-      (make-directory request-dir t)
       (make-directory env-dir t)
       (with-temp-file (expand-file-name "courier.json" collection-root)
         (insert "{\n  \"defaultEnv\": \"local\"\n}\n"))
-      (with-temp-file request-file
-        (insert "GET https://example.com/users/42\n"))
-      (with-temp-file (expand-file-name "local.env" env-dir)
+      (with-temp-file env-file
         (insert "token=local\n"))
-      (with-temp-file (expand-file-name "prod.env" env-dir)
-        (insert "token=prod\n"))
-      (find-file request-file)
-      (unwind-protect
-          (progn
-            (cl-letf (((symbol-function 'completing-read)
-                       (lambda (_prompt collection &rest _args)
-                         (setq selected-candidate
-                               (seq-find
-                                (lambda (candidate)
-                                  (string= (get-text-property 0 'courier-group candidate)
-                                           "Environments"))
-                                (all-completions "" collection)))
-                         selected-candidate)))
-              (courier-open))
-            (should (equal courier--active-env "local")))
-        (kill-buffer (current-buffer))))))
+      (cl-letf (((symbol-function 'completing-read)
+                 (lambda (_prompt collection &rest _args)
+                   (setq selected-candidate
+                         (seq-find
+                          (lambda (candidate)
+                            (string= candidate "local"))
+                          (all-completions "" collection)))
+                   selected-candidate)))
+        (let ((courier-home-directory root))
+          (courier-open-env)
+          (should (derived-mode-p 'courier-env-mode))
+          (should (equal (expand-file-name buffer-file-name)
+                         (expand-file-name env-file)))
+          (should (string= (buffer-name)
+                           (file-name-nondirectory env-file)))
+          (kill-buffer (current-buffer)))))))
 
-(ert-deftest courier-open-candidates-group-requests-and-environments ()
+(ert-deftest courier-open-candidates-use-collection-groups-only ()
   (courier-test--with-temp-dir (root)
-    (let* ((collection-root (expand-file-name "api-collection" root))
+    (let* ((collection-root (expand-file-name "collections/api-collection" root))
            (request-dir (expand-file-name "requests/users" collection-root))
-           (env-dir (expand-file-name "env" collection-root))
            (request-file (expand-file-name "get-user.http" request-dir))
            candidates)
       (make-directory request-dir t)
-      (make-directory env-dir t)
       (with-temp-file (expand-file-name "courier.json" collection-root)
         (insert "{}\n"))
       (with-temp-file request-file
         (insert (courier-test--http-content
                  :name "Get User"
                  :url "https://example.com/users/42")))
-      (with-temp-file (expand-file-name "local.env" env-dir)
-        (insert "token=local\n"))
       (with-temp-buffer
         (setq-local buffer-file-name request-file)
         (setq-local courier--request-path request-file)
@@ -2671,84 +3374,7 @@
         (should (seq-some
                  (lambda (candidate)
                    (string= (get-text-property 0 'courier-group (car candidate))
-                            "Requests"))
-                 candidates))
-        (should (seq-some
-                    (lambda (candidate)
-                       (string= (get-text-property 0 'courier-group (car candidate))
-                                "Environments"))
-                    candidates))))))
-
-(ert-deftest courier-open-candidates-only-include-current-collection-envs ()
-  (courier-test--with-temp-dir (root)
-    (let* ((courier-home-directory root)
-           (first-root (expand-file-name "collections/first-api" root))
-           (second-root (expand-file-name "collections/second-api" root))
-           (first-request (expand-file-name "requests/get-user.http" first-root))
-           (second-request (expand-file-name "requests/get-other.http" second-root))
-           (first-env (expand-file-name "env/local.env" first-root))
-           (second-env (expand-file-name "env/prod.env" second-root))
-           candidates)
-      (make-directory (file-name-directory first-request) t)
-      (make-directory (file-name-directory second-request) t)
-      (make-directory (file-name-directory first-env) t)
-      (make-directory (file-name-directory second-env) t)
-      (with-temp-file (expand-file-name "courier.json" first-root)
-        (insert "{}\n"))
-      (with-temp-file (expand-file-name "courier.json" second-root)
-        (insert "{}\n"))
-      (with-temp-file first-request
-        (insert "GET https://example.com/users/42\n"))
-      (with-temp-file second-request
-        (insert "GET https://example.com/other\n"))
-      (with-temp-file first-env
-        (insert "token=local\n"))
-      (with-temp-file second-env
-        (insert "token=prod\n"))
-      (find-file first-request)
-      (unwind-protect
-          (progn
-            (setq candidates (courier--open-candidates))
-            (should (seq-some
-                     (lambda (candidate)
-                       (and (eq (plist-get (cdr candidate) :kind) 'env)
-                            (equal (plist-get (cdr candidate) :path) first-env)))
-                     candidates))
-            (should-not (seq-some
-                         (lambda (candidate)
-                           (and (eq (plist-get (cdr candidate) :kind) 'env)
-                                (equal (plist-get (cdr candidate) :path) second-env)))
-                         candidates))
-            (should (seq-some
-                     (lambda (candidate)
-                       (and (eq (plist-get (cdr candidate) :kind) 'request)
-                            (equal (plist-get (cdr candidate) :path) second-request)))
-                     candidates)))
-        (kill-buffer (current-buffer))))))
-
-(ert-deftest courier-open-candidates-outside-request-buffer-hide-environments ()
-  (courier-test--with-temp-dir (root)
-    (let* ((courier-home-directory root)
-           (collection-root (expand-file-name "collections/api-collection" root))
-           (request-dir (expand-file-name "requests/users" collection-root))
-           (env-dir (expand-file-name "env" collection-root))
-           candidates)
-      (make-directory request-dir t)
-      (make-directory env-dir t)
-      (with-temp-file (expand-file-name "courier.json" collection-root)
-        (insert "{}\n"))
-      (with-temp-file (expand-file-name "get-user.http" request-dir)
-        (insert (courier-test--http-content
-                 :name "Get User"
-                 :url "https://example.com/users/42")))
-      (with-temp-file (expand-file-name "local.env" env-dir)
-        (insert "token=local\n"))
-      (with-temp-buffer
-        (setq candidates (courier--open-candidates))
-        (should (seq-some
-                 (lambda (candidate)
-                   (string= (get-text-property 0 'courier-group (car candidate))
-                            "Requests"))
+                            "api-collection"))
                  candidates))
         (should-not (seq-some
                      (lambda (candidate)
@@ -2756,7 +3382,7 @@
                                 "Environments"))
                      candidates))))))
 
-(ert-deftest courier-open-candidates-annotate-collection-name ()
+(ert-deftest courier-open-candidates-group-by-collection-name ()
   (courier-test--with-temp-dir (root)
     (let* ((courier-home-directory root)
            (collection-root (expand-file-name "collections/api-collection" root))
@@ -2778,16 +3404,17 @@
                   (lambda (candidate)
                     (eq (plist-get (cdr candidate) :kind) 'request))
                   candidates)))
-      (should (equal (get-text-property 0 'courier-annotation
+      (should (equal (get-text-property 0 'courier-group
                                         (car request-candidate))
-                     "Demo API")))))
+                     "Demo API"))
+      (should-not (get-text-property 0 'courier-annotation
+                                     (car request-candidate))))))
 
 (ert-deftest courier-completion-table-exposes-affixation-metadata ()
   (let* ((candidates
           (list
            (cons (propertize "users/get-user"
-                             'courier-group "Requests"
-                             'courier-annotation "api-collection")
+                             'courier-group "Demo API")
                  (list :kind 'request :path "/tmp/get-user.http"))))
          (table (courier--completion-table
                  candidates
@@ -2801,41 +3428,36 @@
          (rows (funcall affixation (list candidate))))
     (should affixation)
     (should group)
-    (should (equal (funcall group candidate nil) "Requests"))
+    (should (equal (funcall group candidate nil) "Demo API"))
     (should (equal (cadar rows) ""))
-    (should (string-match-p "api-collection" (cl-caddar rows)))))
+    (should (equal (cl-caddar rows) ""))))
 
 (ert-deftest courier-open-env-candidates-use-annotation-for-context ()
   (courier-test--with-temp-dir (root)
-    (let* ((collection-root (expand-file-name "api-collection" root))
-           (request-dir (expand-file-name "requests" collection-root))
+    (let* ((collection-root (expand-file-name "collections/api-collection" root))
            (env-dir (expand-file-name "env" collection-root))
-           (request-file (expand-file-name "get-user.http" request-dir))
            env-candidate
            candidates)
-      (make-directory request-dir t)
       (make-directory env-dir t)
       (with-temp-file (expand-file-name "courier.json" collection-root)
         (insert "{}\n"))
-      (with-temp-file request-file
-        (insert "GET https://example.com/users/42\n"))
       (with-temp-file (expand-file-name "local.env" env-dir)
         (insert "token=local\n"))
-      (find-file request-file)
-      (unwind-protect
-          (progn
-            (setq candidates (courier--open-candidates))
-            (setq env-candidate
-                  (seq-find
-                   (lambda (candidate)
-                     (eq (plist-get (cdr candidate) :kind) 'env))
-                   candidates))
-            (should env-candidate)
-            (should (equal (car env-candidate) "* local"))
-            (should (equal (get-text-property 0 'courier-annotation
-                                              (car env-candidate))
-                           "api-collection • env/local.env")))
-        (kill-buffer (current-buffer))))))
+      (let ((courier-home-directory root))
+        (setq candidates (courier--open-env-candidates)))
+      (setq env-candidate
+            (seq-find
+             (lambda (candidate)
+               (eq (plist-get (cdr candidate) :kind) 'env-file))
+             candidates))
+      (should env-candidate)
+      (should (equal (car env-candidate) "local"))
+      (should (equal (get-text-property 0 'courier-group
+                                        (car env-candidate))
+                     "api-collection"))
+      (should (equal (get-text-property 0 'courier-annotation
+                                        (car env-candidate))
+                     "env/local.env")))))
 
 (ert-deftest courier-discover-collection-roots-reads-home-collections-only ()
   (courier-test--with-temp-dir (root)
@@ -3079,16 +3701,22 @@
       (unwind-protect
           (with-current-buffer buffer
             (courier-request-mode)
-            (let ((request (courier--prepared-current-request)))
-              (should (equal (plist-get request :vars)
-                             '(("base_url" . "https://api.example.com")
-                               ("token" . "root-token"))))
+            (let* ((request (courier--prepared-current-request))
+                   (resolved (courier-resolve-request request
+                                                      (plist-get request :env-vars))))
+              (should (equal (plist-get request :vars) nil))
               (should (equal (plist-get request :headers)
                              '(("accept" . "application/json"))))
               (should (equal (plist-get request :auth)
                              '(:type bearer :token "{{token}}")))
               (should (equal (plist-get request :settings)
-                             '(:timeout 15 :follow-redirects t)))))
+                             '(:timeout 15 :follow-redirects t)))
+              (should (equal (plist-get resolved :url)
+                             "https://api.example.com/users/42"))
+              (should (equal (cdr (assoc-string "authorization"
+                                                (plist-get resolved :headers)
+                                                nil))
+                             "Bearer root-token"))))
         (when (buffer-live-p buffer)
           (kill-buffer buffer))))))
 
@@ -3133,11 +3761,12 @@
       (unwind-protect
           (with-current-buffer buffer
             (courier-request-mode)
-            (let ((request (courier--prepared-current-request)))
-              (should (equal (cdr (assoc-string "base_url"
-                                                (plist-get request :vars)
-                                                nil))
-                             "https://api.example.com"))
+            (let* ((request (courier--prepared-current-request))
+                   (resolved (courier-resolve-request request
+                                                      (plist-get request :env-vars))))
+              (should-not (assoc-string "base_url"
+                                        (plist-get request :vars)
+                                        nil))
               (should (equal (cdr (assoc-string "token"
                                                 (plist-get request :vars)
                                                 nil))
@@ -3149,7 +3778,9 @@
               (should (equal (plist-get request :auth)
                              '(:type header :header "X-Admin-Key" :value "{{token}}")))
               (should (equal (plist-get request :settings)
-                             '(:timeout 25 :follow-redirects t)))))
+                             '(:timeout 25 :follow-redirects t)))
+              (should (equal (plist-get resolved :url)
+                             "https://api.example.com/users/42"))))
         (when (buffer-live-p buffer)
           (kill-buffer buffer))))))
 

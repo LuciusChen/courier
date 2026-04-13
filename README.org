@@ -16,8 +16,9 @@ buffers.
 - Select per-buffer environments from collection =env/*.env= files with =C-c C-e=
 - Pretty-print JSON responses, with =v= to toggle raw view
 - Start unsaved request drafts and place them into a collection on first save
-- Jump between requests and environments with =C-c C-o= from one annotated
-  minibuffer picker, even outside an active Courier buffer
+- Open requests with =C-c C-o= from one annotated minibuffer picker, even
+  outside an active Courier buffer
+- Open environment files globally with =M-x courier-open-env=
 - Import OpenAPI JSON or YAML into Courier collections with =M-x courier-import-openapi=
 - Open a context-aware action menu with =C-c ?=
 
@@ -113,11 +114,14 @@ defaults. Merge order is:
 
 - collection root defaults
 - nested folder defaults
-- request front matter
+- selected environment file
+- runtime vars written from prior responses
+- request front matter =[vars]=
+- request front matter =[vars.pre_request]=
 
 Within that merge:
 
-- request vars override folder and collection vars
+- later sources override earlier sources with the same key
 - explicit request headers override inherited headers
 - explicit request auth overrides inherited auth
 - request settings such as =timeout= override inherited settings
@@ -216,6 +220,18 @@ If you prefer editing URL query params as key/value lines, use
 =M-x courier-request-edit-params= or the request action menu. Courier opens a
 small editor buffer and normalizes the result back into the request URL when
 you apply it.
+
+Courier resolves variable sources in this order:
+
+- collection defaults from =courier.json=
+- nested folder defaults from =requests/**/courier.json=
+- selected environment file from =env/*.env=
+- runtime vars previously extracted from responses
+- request =[vars]=
+- request =[vars.pre_request]=
+
+That means request-local vars beat env values, and =pre_request= vars beat all
+other variable sources.
 
 ** Body Types
 
@@ -334,8 +350,10 @@ named =default=.
 If =defaultEnv= is set in =courier.json= and that environment exists, Courier
 activates it automatically for the current request buffer. Otherwise, Courier
 prompts with =completing-read= when multiple environments are available. The
-choice remains buffer-local. Values from front matter =[vars]= override values
-from environment files.
+choice remains buffer-local. Environment values are then merged with runtime
+vars, request =[vars]=, and request =[vars.pre_request]= according to the
+variable precedence described above. Opening an env file directly uses
+=courier-env-mode=, which highlights comments and variable keys.
 
 Example =env/local.env=:
 
@@ -369,7 +387,7 @@ token=abc123
 | =C-c C-p= | =courier-request-preview=      | Preview resolved form  |
 | =C-c ?=   | =courier-dispatch=             | Show request actions   |
 | =C-c C-l= | =courier-request-validate=     | Validate syntax        |
-| =C-c C-o= | =courier-open=                 | Open request or env    |
+| =C-c C-o= | =courier-open=                 | Open request           |
 | =C-c C-r= | =courier-rename-request=       | Rename current request |
 | =C-x C-s= | =courier-request-save-buffer=  | Save draft or file     |
 
@@ -406,16 +424,15 @@ Saving then writes them back into the request URL instead of keeping two
 separate truths.
 
 Use =M-x courier-create-collection= to create a collection explicitly. Use
-=C-c C-o= to open another =.http= file or switch the current buffer to a
-different environment from the same minibuffer picker. Courier scans known
-collections under =courier-home-directory=, lists request files directly from
-the filesystem, and shows collection names as completion annotations instead of
+=C-c C-o= to open another =.http= request from one annotated picker. Courier
+scans known collections under =courier-home-directory=, lists request files
+directly from the filesystem, and groups the picker by collection instead of
 dropping into a directory prompt or parsing request contents just to build
 picker entries.
-Environment entries are only offered when the current buffer is a Courier
-request, because env switching is request-buffer-local. Request candidates keep
-their relative path as the main label; env candidates keep only the env name as
-the main label and move collection/path context into the annotation.
+Use =C-c C-e= to switch the active environment for the current request buffer.
+Use =M-x courier-open-env= to open an environment file for editing from
+anywhere; env candidates are grouped by collection, keep the env name as the
+main label, and use the annotation for the env file path.
 Use =C-c ?= in a request buffer for request actions. Request content itself
 stays source-backed: Courier uses transient for actions, not as the primary
 editor for params, auth, or script content.
@@ -487,3 +504,29 @@ timeline entry it also shows the history position (for example =2/5=).
 | =courier-default-request-method= | ="GET"= | Default method for new drafts    |
 | =courier-default-timeout=     | =30=      | Default timeout in seconds       |
 | =courier-history-max=         | =20=      | Max history entries per request  |
+
+* Testing
+
+Byte-compile the package:
+
+#+begin_src sh
+emacs --batch -L . -l courier.el -f batch-byte-compile courier.el
+#+end_src
+
+Run the full ERT suite:
+
+#+begin_src sh
+emacs --batch -L . -l courier.el -l ert -l test/courier-test.el --eval '(ert-run-tests-batch-and-exit t)'
+#+end_src
+
+The ERT suite includes local integration tests for:
+
+- JSON echo requests
+- multipart uploads
+- binary uploads
+- OAuth2 client credentials
+- image and PDF responses
+
+These integration tests start a local Python stdlib HTTP server from
+=test/server/courier_test_server.py=. When =python3= is unavailable, they skip
+instead of producing false positives.

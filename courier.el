@@ -1211,19 +1211,20 @@ When RELAXED is non-nil, allow incomplete draft request lines."
 (defun courier--apply-request-defaults (request)
   "Return REQUEST with collection and folder defaults applied."
   (let* ((defaults (courier--request-defaults request))
+         (default-vars (plist-get defaults :vars))
          (request-auth (plist-get request :auth)))
-    (plist-put request :vars
-               (courier-merge-vars (plist-get defaults :vars)
-                                   (plist-get request :vars)))
-    (plist-put request :headers
-               (courier--merge-headers (plist-get defaults :headers)
-                                       (plist-get request :headers)))
-    (plist-put request :settings
-               (courier--merge-settings (plist-get defaults :settings)
-                                        (plist-get request :settings)))
+    (setq request (plist-put request :default-vars default-vars))
+    (setq request
+          (plist-put request :headers
+                     (courier--merge-headers (plist-get defaults :headers)
+                                             (plist-get request :headers))))
+    (setq request
+          (plist-put request :settings
+                     (courier--merge-settings (plist-get defaults :settings)
+                                              (plist-get request :settings))))
     (if request-auth
         request
-      (plist-put request :auth (plist-get defaults :auth)))))
+      (setq request (plist-put request :auth (plist-get defaults :auth))))))
 
 ;;;###autoload
 (defun courier-validate-request (request)
@@ -1349,11 +1350,12 @@ When RELAXED is non-nil, allow incomplete draft request lines."
 
 (defun courier--form-body-pairs-from-string (body)
   "Parse BODY as a form-urlencoded-like raw string into an alist."
-  (let ((body (or body "")))
+  (let ((body (string-trim (or body ""))))
     (if (string-empty-p body)
         nil
       (mapcar
        (lambda (part)
+         (setq part (string-trim part))
          (pcase-let* ((`(,name ,value)
                        (if (string-match "\\`\\([^=]*\\)=\\(.*\\)\\'" part)
                            (list (match-string 1 part) (match-string 2 part))
@@ -3606,6 +3608,14 @@ The return value is one of:
      . font-lock-variable-name-face))
   "Font-lock keywords for `courier-request-mode'.")
 
+(defconst courier-env-font-lock-keywords
+  '(("^#.*$" . font-lock-comment-face)
+    ("^\\([A-Za-z_][A-Za-z0-9_]*\\)\\(=\\)\\(.*\\)$"
+     (1 font-lock-variable-name-face)
+     (2 'shadow)
+     (3 font-lock-string-face)))
+  "Font-lock keywords for `courier-env-mode'.")
+
 (defun courier--mode-line-lighter ()
   "Return the mode-line lighter for `courier-request-mode'."
   (if courier--active-env
@@ -5150,8 +5160,7 @@ When NEW-NAME is non-nil, also update any live response buffer name metadata."
   (let* ((label (courier--open-request-display-path path collection-root))
          (collection-name (courier--open-collection-label collection-root)))
     (cons (propertize label
-                      'courier-group "Requests"
-                      'courier-annotation collection-name)
+                      'courier-group collection-name)
           (list :kind 'request
                 :path path
                 :collection-root collection-root))))
@@ -5162,50 +5171,31 @@ When NEW-NAME is non-nil, also update any live response buffer name metadata."
             (courier--request-candidate path collection-root))
           (courier--request-files collection-root)))
 
-(defun courier--env-sort-rank (name)
-  "Return a stable sort rank for environment NAME."
-  (cond
-   ((and courier--active-env
-         (string= name courier--active-env))
-    -1)
-   ((string= name "local") 0)
-   ((string= name "staging") 1)
-   ((string= name "prod") 2)
-   ((string= name "default") 3)
-   (t 10)))
-
-(defun courier--env-candidate (entry collection-root)
-  "Return a completion candidate for env ENTRY in COLLECTION-ROOT."
+(defun courier--env-file-candidate (entry collection-root)
+  "Return a completion candidate for env file ENTRY in COLLECTION-ROOT."
   (let* ((name (car entry))
          (path (cdr entry))
-         (marker (if (and courier--active-env
-                          (string= name courier--active-env))
-                     "*"
-                   " "))
          (relative-path (file-relative-name path collection-root))
          (collection-name (courier--open-collection-label collection-root))
-         (label (format "%s %s" marker name))
-         (annotation (format "%s • %s" collection-name relative-path)))
+         (label name)
+         (annotation relative-path))
     (cons (propertize label
-                      'courier-group "Environments"
+                      'courier-group collection-name
                       'courier-annotation annotation)
-          (list :kind 'env
-                :name name
+          (list :kind 'env-file
                 :path path
                 :collection-root collection-root))))
 
-(defun courier--env-candidates (entries collection-root)
-  "Return completion candidates for environment ENTRIES in COLLECTION-ROOT."
+(defun courier--env-file-candidates (entries collection-root)
+  "Return completion candidates for env file ENTRIES in COLLECTION-ROOT."
   (let ((sorted-entries
          (sort (copy-sequence entries)
                (lambda (left right)
-                 (let ((left-rank (courier--env-sort-rank (car left)))
-                       (right-rank (courier--env-sort-rank (car right))))
-                   (if (= left-rank right-rank)
-                       (string< (car left) (car right))
-                     (< left-rank right-rank)))))))
+                 (if (string= (car left) (car right))
+                     (string< (cdr left) (cdr right))
+                   (string< (car left) (car right)))))))
     (mapcar (lambda (entry)
-              (courier--env-candidate entry collection-root))
+              (courier--env-file-candidate entry collection-root))
             sorted-entries)))
 
 (defun courier--discover-collection-roots (&optional base-directory)
@@ -5252,19 +5242,22 @@ home `collections/' directory."
 
 (defun courier--open-candidates ()
   "Return grouped completion candidates for `courier-open'."
-  (let ((active-root (and (derived-mode-p 'courier-request-mode)
-                          (courier--active-collection-root)))
-        candidates)
+  (let (candidates)
     (dolist (collection-root (courier--open-collection-roots))
       (setq candidates
             (append candidates
-                    (courier--request-candidates collection-root)
-                    (if (and active-root
-                             (equal collection-root active-root))
-                        (courier--env-candidates
-                         (courier--open-env-entries collection-root)
-                         collection-root)
-                      nil))))
+                    (courier--request-candidates collection-root))))
+    candidates))
+
+(defun courier--open-env-candidates ()
+  "Return grouped completion candidates for `courier-open-env'."
+  (let (candidates)
+    (dolist (collection-root (courier--open-collection-roots))
+      (setq candidates
+            (append candidates
+                    (courier--env-file-candidates
+                     (courier--open-env-entries collection-root)
+                     collection-root))))
     candidates))
 
 (defun courier--completion-group (candidate transform)
@@ -5333,18 +5326,42 @@ METADATA entries follow `completion-metadata'."
   (force-mode-line-update)
   (message "Courier environment set to %s." courier--active-env))
 
+(defun courier--open-request-file (path)
+  "Open Courier request file at PATH in a normal file-visiting buffer."
+  (let ((buffer (find-file-noselect path)))
+    (switch-to-buffer buffer)
+    (with-current-buffer buffer
+      (unless (derived-mode-p 'courier-request-mode)
+        (courier-request-mode)))
+    buffer))
+
+(defun courier--open-env-file (path)
+  "Open Courier env file at PATH in a normal file-visiting buffer."
+  (let ((buffer (find-file-noselect path)))
+    (switch-to-buffer buffer)
+    (with-current-buffer buffer
+      (unless (derived-mode-p 'courier-env-mode)
+        (when (courier--buffer-env-file-p path)
+          (courier-env-mode))))
+    buffer))
+
 (defun courier--handle-open-selection (selection candidates)
   "Handle SELECTION from CANDIDATES."
   (pcase (plist-get (cdr (assoc selection candidates)) :kind)
     ('request
-     (find-file (plist-get (cdr (assoc selection candidates)) :path)))
-    ('env
-     (unless (derived-mode-p 'courier-request-mode)
-       (user-error "Environment selection requires a Courier request buffer"))
-     (courier--set-active-env
-      (plist-get (cdr (assoc selection candidates)) :name)))
+     (courier--open-request-file
+      (plist-get (cdr (assoc selection candidates)) :path)))
     (_
      (user-error "Unknown Courier selection: %s" selection))))
+
+(defun courier--handle-open-env-selection (selection candidates)
+  "Handle env file SELECTION from CANDIDATES."
+  (pcase (plist-get (cdr (assoc selection candidates)) :kind)
+    ('env-file
+     (courier--open-env-file
+      (plist-get (cdr (assoc selection candidates)) :path)))
+    (_
+     (user-error "Unknown Courier env selection: %s" selection))))
 
 (defun courier--collection-env-dir (&optional start)
   "Return the collection env directory for START, or nil."
@@ -5456,14 +5473,17 @@ Entries are read from the configured env directory only."
          (env-selection (courier--current-env-selection))
          (env-name (car env-selection))
          (env-vars (cdr env-selection))
+         (base-vars (courier-merge-vars
+                     (plist-get defaulted-request :default-vars)
+                     env-vars))
          (request-with-vars
           (plist-put defaulted-request :vars
                      (courier-merge-vars
                       (plist-get defaulted-request :vars)
                       (plist-get defaulted-request :pre-request-vars))))
-         (request (courier--run-pre-request-script request-with-vars env-vars)))
+         (request (courier--run-pre-request-script request-with-vars base-vars)))
     (plist-put request :env-name env-name)
-    (plist-put request :env-vars env-vars)
+    (plist-put request :env-vars base-vars)
     request))
 
 (defun courier--resolved-current-request ()
@@ -5728,6 +5748,29 @@ Signal `user-error' when the current request line has no URL."
 
 (define-key courier-request-params-mode-map (kbd "C-c C-c") #'courier-request-params-apply)
 (define-key courier-request-params-mode-map (kbd "C-c C-k") #'courier-request-params-cancel)
+
+(defun courier--buffer-env-file-p (&optional path)
+  "Return non-nil when PATH or the current buffer visits a Courier env file."
+  (when-let* ((file (and (or path buffer-file-name)
+                         (expand-file-name (or path buffer-file-name))))
+              ((courier--env-file-name-p (file-name-nondirectory file)))
+              (env-dir (courier--collection-env-dir file)))
+    (file-equal-p (file-name-directory file)
+                  (file-name-as-directory env-dir))))
+
+(define-derived-mode courier-env-mode text-mode "Courier-Env"
+  "Major mode for editing Courier environment files."
+  (setq-local font-lock-defaults '(courier-env-font-lock-keywords))
+  (setq-local comment-start "#")
+  (setq-local comment-start-skip "#+\\s-*"))
+
+(defun courier--maybe-enable-env-mode ()
+  "Enable `courier-env-mode' for Courier env files."
+  (when (and (not (derived-mode-p 'courier-env-mode))
+             (courier--buffer-env-file-p))
+    (courier-env-mode)))
+
+(add-hook 'find-file-hook #'courier--maybe-enable-env-mode)
 
 ;;;###autoload
 (defun courier-request-params-apply ()
@@ -6035,11 +6078,11 @@ Unsaved request buffers choose a collection on first save."
 
 ;;;###autoload
 (defun courier-open ()
-  "Open another Courier request or switch environments."
+  "Open another Courier request."
   (interactive)
   (let ((candidates (courier--open-candidates)))
     (unless candidates
-      (user-error "No Courier requests or environments found"))
+      (user-error "No Courier requests found"))
     (let* ((table (courier--completion-table
                    candidates
                    '(category . courier-open)
@@ -6050,6 +6093,24 @@ Unsaved request buffers choose a collection on first save."
              "Courier open: "
              table nil t)))
       (courier--handle-open-selection selection candidates))))
+
+;;;###autoload
+(defun courier-open-env ()
+  "Open a Courier environment file."
+  (interactive)
+  (let ((candidates (courier--open-env-candidates)))
+    (unless candidates
+      (user-error "No Courier environment files found"))
+    (let* ((table (courier--completion-table
+                   candidates
+                   '(category . courier-open-env)
+                   '(group-function . courier--completion-group)
+                   '(affixation-function . courier--completion-affixation)))
+           (selection
+            (completing-read
+             "Courier env: "
+             table nil t)))
+      (courier--handle-open-env-selection selection candidates))))
 
 ;;;###autoload
 (defun courier-new-request ()
@@ -6179,7 +6240,8 @@ This renames the request file and updates its front matter name."
     ("e" "Environment" courier-request-switch-env)
     ("s" "Save" courier-request-save-buffer)]
    ["Navigate"
-    ("o" "Open" courier-open)]
+    ("o" "Open request" courier-open)
+    ("E" "Open env file" courier-open-env)]
    ["Manage"
     ("n" "New request" courier-new-request)
     ("r" "Rename" courier-rename-request)

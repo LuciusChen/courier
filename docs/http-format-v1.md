@@ -323,7 +323,44 @@ tenant = "acme"
 Rules:
 
 - string values only in v1
-- request vars override env vars with the same name
+- request vars override env and runtime vars with the same name
+
+### `[vars.pre_request]`
+
+```toml
+[vars.pre_request]
+request_id = "42"
+token = "override-for-this-request"
+```
+
+Rules:
+
+- string values only in v1
+- values participate in normal template expansion
+- `vars.pre_request` overrides all earlier variable sources for the current request
+
+### `[[vars.post_response]]`
+
+```toml
+[[vars.post_response]]
+name = "token"
+from = "json"
+expr = "$.token"
+```
+
+Rules:
+
+- repeated table
+- required keys:
+  - `name`
+  - `from`
+- `from` must be one of:
+  - `json`
+  - `header`
+  - `status`
+- `expr` is required for `json` and `header`
+- extracted values are written as runtime vars for the current collection and env
+- runtime vars override env vars on later requests
 
 ### `tests`
 
@@ -404,11 +441,24 @@ This format is designed so request-side views map directly to one source block:
 - `Body` type selector -> `[body].type`
 - `Params` view -> parsed URL query, saved back into URL
 - `Auth` view -> `[auth]`
-- `Vars` view -> `[vars]`
+- `Vars` view -> `[vars]`, `[vars.pre_request]`, `[[vars.post_response]]`
 - `Script` view -> `[scripts]`
 - `Tests` view -> `tests`
 
 Missing sections are empty states, not errors.
+
+## Variable Precedence
+
+Courier resolves variables in this order:
+
+1. collection defaults
+2. nested folder defaults
+3. selected env vars
+4. runtime vars
+5. request `[vars]`
+6. request `[vars.pre_request]`
+
+Later sources override earlier ones with the same key.
 
 ## Round-Trip Rules
 

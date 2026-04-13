@@ -195,7 +195,13 @@ Rules:
 - env files live under `env/`
 - env names come from filenames like `local.env`, `staging.env`, `prod.env`
 - collection-level `defaultEnv` may be used when no explicit env is selected
-- request-level front matter `[vars]` values override env values
+- variable precedence is:
+  - collection defaults
+  - folder defaults
+  - selected env vars
+  - runtime vars
+  - request `[vars]`
+  - request `[vars.pre_request]`
 - env selection is buffer-local unless a broader command explicitly changes it
 
 `env` is not collection metadata, not response history, and not a secret
@@ -252,21 +258,33 @@ manager. It is a source of variable values for request resolution.
 
 - user invokes one jump command
 - minibuffer shows grouped candidates
-- request candidates keep the file-derived label as the primary text and carry
-  collection names as annotations
+- request candidates are grouped by collection
+- request candidates keep the file-derived label as the primary text
 - request candidates open files
-- environment candidates switch env, but only when invoked from a request buffer
-- environment candidates keep the env name as the primary text and move
-  collection/path context into annotations
 - request candidates are derived from filesystem paths, not parsed request contents
 
-### 3. Edit method quickly
+### 3. Open environment file
+
+- user invokes a dedicated env-file command
+- minibuffer shows environment files from known collections
+- env candidates are grouped by collection
+- env candidates keep the env name as the primary text
+- env file path appears in the annotation
+- selecting an env candidate opens the `.env` file for editing
+
+### 4. Switch active environment
+
+- user invokes request-local env switching
+- Courier prompts with env names from the current request collection
+- selecting a name switches the active env for the current request buffer only
+
+### 5. Edit method quickly
 
 - user invokes a method command
 - minibuffer offers allowed methods
 - Courier edits the request line directly
 
-### 4. Send and inspect response
+### 6. Send and inspect response
 
 - user sends request
 - response buffer centers on one response at a time, with `Response` kept as
@@ -276,7 +294,7 @@ manager. It is a source of variable values for request resolution.
 - response history remains available for the same request
 - `C-c ?` opens a context-aware action menu in request and response buffers
 
-### 5. Create a new request
+### 7. Create a new request
 
 - user creates a new request draft without choosing a path first
 - Courier gives it an `Untitled N` name and opens it as an unsaved buffer
@@ -367,19 +385,19 @@ Acceptance:
 - env behavior is predictable and documented
 - request-level vars override env vars correctly
 
-### Phase 3: Unified Picker
+### Phase 3: Split Pickers
 
 Deliver:
 
-- one command that shows `Requests` and `Environments`
-- grouped minibuffer display
-- different ordering rules per group
-- request selection opens files
-- env selection switches current env
+- one request picker that opens requests from anywhere
+- one env picker that opens env files from anywhere
+- collection-grouped minibuffer display
+- request and env actions use distinct commands with distinct semantics
 
 Acceptance:
 
-- different requests and envs are reachable from one picker
+- requests are reachable globally without path memorization
+- env files are reachable globally without overloading request open semantics
 - grouped display is clear enough to use without memorizing paths
 
 ### Phase 4: Request Editing Ergonomics
