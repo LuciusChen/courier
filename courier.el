@@ -85,7 +85,7 @@ not declare an explicit `[body].type` in its front matter."
   "Root directory used for Courier-managed persistent content.
 
 Courier stores collections under a dedicated `collections/' subdirectory of
-this home. Other persisted Courier-managed content may also live under this
+this home.  Other persisted Courier-managed content may also live under this
 root."
   :type 'directory
   :group 'courier)
@@ -129,6 +129,38 @@ root."
 (defconst courier--allowed-auth-types
   '(none bearer basic header api_key oauth2)
   "Supported Courier request auth types.")
+
+(defconst courier--mime-type-alist
+  '(("json" . "application/json")
+    ("xml" . "application/xml")
+    ("html" . "text/html")
+    ("css" . "text/css")
+    ("js" . "application/javascript")
+    ("txt" . "text/plain")
+    ("csv" . "text/csv")
+    ("png" . "image/png")
+    ("jpg" . "image/jpeg")
+    ("jpeg" . "image/jpeg")
+    ("gif" . "image/gif")
+    ("svg" . "image/svg+xml")
+    ("webp" . "image/webp")
+    ("pdf" . "application/pdf")
+    ("zip" . "application/zip")
+    ("gz" . "application/gzip")
+    ("tar" . "application/x-tar")
+    ("bin" . "application/octet-stream")
+    ("mp4" . "video/mp4")
+    ("webm" . "video/webm")
+    ("mp3" . "audio/mpeg")
+    ("wav" . "audio/wav"))
+  "File extension to MIME type mapping for Courier file attachment.")
+
+(defconst courier--common-content-types
+  (delete-dups
+   (append (mapcar #'cdr courier--mime-type-alist)
+           '("application/x-www-form-urlencoded"
+             "multipart/form-data")))
+  "Common MIME types offered by Courier completion.")
 
 (defconst courier--response-tabs
   '(response headers timeline tests)
@@ -206,8 +238,8 @@ root."
   "Face used for Courier timeline section headings.")
 
 (defface courier-response-timeline-entry-face
-  '((((background dark)) :background "#1f2227")
-    (((background light)) :background "#eceff4")
+  '((((background dark)) :background "#1f2227" :extend t)
+    (((background light)) :background "#eceff4" :extend t)
     (t :inherit shadow))
   "Face used for the first summary line of Courier timeline entries.")
 
@@ -232,8 +264,8 @@ root."
   "Face used for Courier response URLs.")
 
 (defface courier-response-timeline-selected-face
-  '((((background dark)) :background "#2a313a")
-    (((background light)) :background "#dbe5f2")
+  '((((background dark)) :background "#2a313a" :extend t)
+    (((background light)) :background "#dbe5f2" :extend t)
     (t :inherit highlight))
   "Face used for the selected Courier timeline history entry summary line.")
 
@@ -1792,7 +1824,7 @@ Return the updated RESPONSE plist."
 
 (defconst courier--write-out-template
   "%{http_code}\n%{size_download}\n%{time_total}\n"
-  "curl --write-out template used by Courier.")
+  "Curl `--write-out' template used by Courier.")
 
 (defun courier--human-readable-size (size)
   "Return a human-readable string for SIZE bytes."
@@ -1823,7 +1855,7 @@ Return the updated RESPONSE plist."
 (defun courier--decode-body-file (body-file charset)
   "Decode BODY-FILE using CHARSET.
 
-Signal `user-error' when CHARSET is unsupported. Let decoding failures
+Signal `user-error' when CHARSET is unsupported.  Let decoding failures
 surface to the request boundary."
   (with-temp-buffer
     (set-buffer-multibyte nil)
@@ -1963,7 +1995,7 @@ Use HEADER-FILE, BODY-FILE, and META-FILE for curl output."
 
 ;;;###autoload
 (defun courier-parse-response (header-file body-file meta-file stderr exit-code request)
-  "Parse files HEADER-FILE BODY-FILE META-FILE and STDERR for REQUEST."
+  "Parse HEADER-FILE, BODY-FILE, META-FILE, STDERR, and EXIT-CODE for REQUEST."
   (let* ((header-data (courier--parse-header-block header-file))
          (meta (courier--parse-meta-file meta-file))
          (status-line (plist-get header-data :status-line))
@@ -2025,7 +2057,8 @@ Use HEADER-FILE, BODY-FILE, and META-FILE for curl output."
   response)
 
 (defun courier--request-error-response (request body-file exit-code command err)
-  "Return a response plist for REQUEST when ERR occurs."
+  "Return a response plist for REQUEST.
+Use BODY-FILE, EXIT-CODE, COMMAND, and ERR for error context."
   (list :request-path (plist-get request :path)
         :status-code 0
         :reason "Parse Error"
@@ -2141,6 +2174,15 @@ Use HEADER-FILE, BODY-FILE, and META-FILE for curl output."
     (process-put process 'courier-start-time (float-time))
     process))
 
+(defvar-local courier--request nil
+  "Resolved request plist associated with the current Courier response buffer.")
+
+(defvar-local courier--process nil
+  "In-flight curl process for the current Courier response buffer.")
+
+(defvar-local courier--temp-files nil
+  "Temp file paths associated with the current Courier response buffer.")
+
 (defun courier--handoff-process-to-response-buffer (from-process to-process request)
   "Move response-buffer ownership from FROM-PROCESS to TO-PROCESS.
 
@@ -2217,15 +2259,6 @@ REQUEST becomes the active request associated with TO-PROCESS."
 
 (defvar-local courier--response nil
   "Response plist displayed in the current Courier response buffer.")
-
-(defvar-local courier--request nil
-  "Resolved request plist associated with the current Courier response buffer.")
-
-(defvar-local courier--process nil
-  "In-flight curl process for the current Courier response buffer.")
-
-(defvar-local courier--temp-files nil
-  "Temp file paths associated with the current Courier response buffer.")
 
 (defvar-local courier--body-pretty t
   "Whether the current Courier response buffer pretty-prints JSON bodies.")
@@ -2896,17 +2929,17 @@ Each entry is a cons cell of the form `(TIMESTAMP . RESPONSE)'.")
          "\n")
       (concat
        (propertize status 'face `(,status-face ,summary-face))
-       (propertize (format "  %s" timestamp)
-                   'face `(shadow ,summary-face))
+      (propertize (format "  %s" timestamp)
+                  'face `(shadow ,summary-face))
        "\n"
        (propertize method
-                   'face 'courier-response-method-face)
-       " "
+                   'face `(courier-response-method-face ,summary-face))
+       (propertize " " 'face summary-face)
        (propertize url
-                   'face 'courier-response-url-face)
+                   'face `(courier-response-url-face ,summary-face))
        "\n"
        (propertize (concat duration courier--header-separator size)
-                   'face 'shadow)
+                   'face `(shadow ,summary-face))
        "\n"))))
 
 (defun courier--response-request-method (response)
@@ -3059,11 +3092,16 @@ Each entry is a cons cell of the form `(TIMESTAMP . RESPONSE)'.")
                (make-text-button
                 start (point)
                 'action #'courier--timeline-entry-button-action
-                'mouse-face 'highlight
-                'follow-link t
-                'courier-history-index index
+               'mouse-face 'highlight
+               'follow-link t
+               'courier-history-index index
                 'help-echo "RET, TAB, or mouse-1 to expand or collapse this response history entry")
-               (put-text-property start (point) 'face 'default)
+               (put-text-property
+                start (point) 'face
+                (if (and (numberp courier--history-index)
+                         (= index courier--history-index))
+                    'courier-response-timeline-selected-face
+                  'courier-response-timeline-entry-face))
                (courier--apply-string-face-properties text start))
              (insert "\n")
              (when (and (numberp courier--history-index)
@@ -3715,15 +3753,19 @@ ACTIVE controls whether the active navigation face is used."
      (pcase (courier--request-body-type courier--request-model)
        ('none "# No body.\n")
        ('binary
-        (concat "# Binary body metadata\n"
-                "# path = ./payload.bin\n"
-                "# content_type = application/octet-stream\n"))
+        (concat "# [body]\n"
+                "# type = \"binary\"\n"
+                "# path = \"./payload.bin\"\n"
+                "# content_type = \"application/octet-stream\"\n"))
        ('multipart
-        (concat "# Multipart body parts\n"
-                "# name = avatar\n"
-                "# kind = file\n"
-                "# path = ./avatar.png\n"
-                "# content_type = image/png\n"))
+        (concat "# [body]\n"
+                "# type = \"multipart\"\n"
+                "\n"
+                "# [[body.parts]]\n"
+                "# name = \"avatar\"\n"
+                "# kind = \"file\"\n"
+                "# path = \"./avatar.png\"\n"
+                "# content_type = \"image/png\"\n"))
        (_ "")))
     ('auth
      (concat "# [auth]\n"
@@ -3769,7 +3811,7 @@ ACTIVE controls whether the active navigation face is used."
 (defun courier--request-effective-params (request)
   "Return the effective params for REQUEST.
 
-Explicit Courier params win. When no explicit params exist, fall back to the
+Explicit Courier params win.  When no explicit params exist, fall back to the
 request URL query string."
   (or (plist-get request :params)
       (courier--parse-url-query-params (or (plist-get request :url) ""))))
@@ -3788,58 +3830,24 @@ request URL query string."
         (string-join (nreverse lines) "\n"))
     ""))
 
+(defun courier--request-body-toml-fragment (request keys)
+  "Return TOML fragment for body-related KEYS of REQUEST."
+  (let ((body-request (courier--empty-request)))
+    (dolist (key keys)
+      (plist-put body-request key (plist-get request key)))
+    (string-join
+     (courier--serialize-front-matter-body-sections body-request)
+     "\n\n")))
+
 (defun courier--request-binary-body-lines (request)
   "Return editable text for binary body REQUEST metadata."
-  (courier--format-request-kv-lines
-   (delq nil
-         (list (when-let* ((path (plist-get request :body-file-path)))
-                 (cons "path" path))
-               (when-let* ((content-type
-                            (plist-get request :body-file-content-type)))
-                 (cons "content_type" content-type))))))
+  (courier--request-body-toml-fragment
+   request '(:body-type :body-file-path :body-file-content-type)))
 
 (defun courier--request-multipart-body-lines (request)
   "Return editable text for multipart REQUEST body parts."
-  (if-let* ((parts (plist-get request :body-parts)))
-      (mapconcat
-       (lambda (part)
-         (courier--format-request-kv-lines
-          (delq nil
-                (list (cons "name" (or (plist-get part :name) ""))
-                      (cons "kind" (symbol-name (or (plist-get part :kind) 'text)))
-                      (when-let* ((value (plist-get part :value)))
-                        (cons "value" value))
-                      (when-let* ((path (plist-get part :path)))
-                        (cons "path" path))
-                      (when-let* ((content-type (plist-get part :content-type)))
-                        (cons "content_type" content-type))))))
-       parts
-       "\n\n")
-    ""))
-
-(defun courier--parse-request-multipart-body-lines (text)
-  "Parse multipart request body TEXT into body part plists."
-  (let ((trimmed (string-trim (or text ""))))
-    (if (or (string-empty-p trimmed)
-            (courier--comment-only-section-p trimmed))
-        nil
-      (mapcar
-       (lambda (block)
-         (let* ((pairs (courier--parse-request-kv-lines block "multipart part"))
-                (kind (cdr (assoc-string "kind" pairs nil))))
-           (unless kind
-             (user-error "Multipart part requires kind"))
-           (append
-            (list :name (or (cdr (assoc-string "name" pairs nil)) "")
-                  :kind (intern kind))
-            (when-let* ((value (cdr (assoc-string "value" pairs nil))))
-              (list :value value))
-            (when-let* ((path (cdr (assoc-string "path" pairs nil))))
-              (list :path path))
-            (when-let* ((content-type
-                         (cdr (assoc-string "content_type" pairs nil))))
-              (list :content-type content-type)))))
-       (split-string trimmed "\n[ \t]*\n+" t)))))
+  (courier--request-body-toml-fragment
+   request '(:body-type :body-parts)))
 
 (defun courier--request-body-section-text (request)
   "Return editable text for REQUEST body section."
@@ -3861,6 +3869,21 @@ request URL query string."
     (plist-put request (pop props) (pop props)))
   request)
 
+(defun courier--parse-request-body-fragment (text expected-type)
+  "Parse body section TEXT and require [body].type to equal EXPECTED-TYPE."
+  (let* ((trimmed (string-trim (or text "")))
+         (request (if (or (string-empty-p trimmed)
+                          (courier--comment-only-section-p trimmed))
+                      (courier--empty-request)
+                    (courier--parse-front-matter trimmed 1
+                                                 (courier--empty-request)))))
+    (when (and (not (string-empty-p trimmed))
+               (not (courier--comment-only-section-p trimmed))
+               (not (eq (plist-get request :body-type) expected-type)))
+      (user-error "Body section must declare [body].type = \"%s\""
+                  (symbol-name expected-type)))
+    request))
+
 (defun courier--request-body-state (body-type text)
   "Return request body plist updates for BODY-TYPE using section TEXT."
   (pcase body-type
@@ -3874,17 +3897,18 @@ request URL query string."
            :body-file-path nil
            :body-file-content-type nil))
     ('binary
-     (let ((pairs (courier--parse-request-kv-lines text "binary body")))
+     (let ((request (courier--parse-request-body-fragment text 'binary)))
        (list :body ""
              :body-parts nil
-             :body-file-path (cdr (assoc-string "path" pairs nil))
+             :body-file-path (plist-get request :body-file-path)
              :body-file-content-type
-             (cdr (assoc-string "content_type" pairs nil)))))
+             (plist-get request :body-file-content-type))))
     ('multipart
-     (list :body ""
-           :body-parts (courier--parse-request-multipart-body-lines text)
-           :body-file-path nil
-           :body-file-content-type nil))
+     (let ((request (courier--parse-request-body-fragment text 'multipart)))
+       (list :body ""
+             :body-parts (plist-get request :body-parts)
+             :body-file-path nil
+             :body-file-content-type nil)))
     (_
      (list :body text
            :body-parts nil
@@ -3900,17 +3924,57 @@ request URL query string."
   "Return default body plist updates for BODY-TYPE."
   (pcase body-type
     ('binary
-     '(:body ""
-       :body-parts nil
-       :body-file-path "./payload.bin"
-       :body-file-content-type "application/octet-stream"))
+     (courier--request-body-state
+      'binary
+      (concat "[body]\n"
+              "type = \"binary\"\n"
+              "path = \"./payload.bin\"\n"
+              "content_type = \"application/octet-stream\"")))
     ('multipart
-     '(:body ""
-       :body-file-path nil
-       :body-file-content-type nil
-       :body-parts ((:name "field" :kind text :value "{{value}}"))))
+     (courier--request-body-state
+      'multipart
+      (concat "[body]\n"
+              "type = \"multipart\"\n\n"
+              "[[body.parts]]\n"
+              "name = \"field\"\n"
+              "kind = \"text\"\n"
+              "value = \"{{value}}\"")))
     (_
      (courier--request-body-state body-type ""))))
+
+(defun courier--mime-type-for-extension (path)
+  "Return a MIME type inferred from PATH."
+  (or (when-let* ((extension (file-name-extension path))
+                  (mime-type (cdr (assoc-string extension
+                                                courier--mime-type-alist
+                                                t))))
+        mime-type)
+      "application/octet-stream"))
+
+(defun courier--request-attachment-base-directory ()
+  "Return the base directory used for request attachment relative paths."
+  (expand-file-name
+   (or (and buffer-file-name (file-name-directory buffer-file-name))
+       (courier--collection-root)
+       default-directory)))
+
+(defun courier--request-relative-attachment-path (path)
+  "Return PATH relative to the current request attachment base directory."
+  (file-relative-name (expand-file-name path)
+                      (courier--request-attachment-base-directory)))
+
+(defun courier--content-type-capf ()
+  "Return completion data for `content_type' values at point."
+  (let ((pos (point)))
+    (save-excursion
+      (goto-char (line-beginning-position))
+      (when (re-search-forward
+             "^[ \t#]*content_type[ \t]*=[ \t]*\"\\([^\"]*\\)\"?"
+             (line-end-position) t)
+        (let ((start (match-beginning 1))
+              (end (match-end 1)))
+          (when (<= start pos end)
+            (list start end courier--common-content-types)))))))
 
 (defun courier--ensure-request-layout ()
   "Ensure the current Courier request buffer has layout markers."
@@ -4304,12 +4368,12 @@ request URL query string."
         (when (and pre-request
                    (not (string-empty-p (string-trim pre-request))))
           (when (string-match-p "\"\"\"" pre-request)
-            (user-error "pre_request script contains unsupported triple quotes"))
+            (user-error "Pre-request script contains unsupported triple quotes"))
           (push (format "pre_request = \"\"\"\n%s\n\"\"\"" pre-request) lines))
         (when (and post-response
                    (not (string-empty-p (string-trim post-response))))
           (when (string-match-p "\"\"\"" post-response)
-            (user-error "post_response script contains unsupported triple quotes"))
+            (user-error "Post-response script contains unsupported triple quotes"))
           (push (format "post_response = \"\"\"\n%s\n\"\"\"" post-response) lines))
         (push (string-join (nreverse lines) "\n") sections)))
     (nreverse sections)))
@@ -4399,8 +4463,8 @@ request URL query string."
                         (plist-get parsed-scripts :post-response-script))))
           ('tests
            (plist-put courier--request-model :tests
-                      (courier--parse-request-tests-lines section-text)))
-          )))))
+                      (courier--parse-request-tests-lines section-text))))
+        nil))))
 
 (defun courier--render-request-buffer ()
   "Render the current Courier request buffer from `courier--request-model'."
@@ -4892,7 +4956,8 @@ METHOD, PATH, and COLLECTION-ROOT determine the generated file location."
     (expand-file-name file-name directory)))
 
 (defun courier--openapi-request-for-operation (collection-root spec path method operation)
-  "Return a Courier request plist for OpenAPI OPERATION."
+  "Return a Courier request plist for OpenAPI OPERATION.
+Use PATH, COLLECTION-ROOT, and SPEC to build the generated request."
   (let* ((method-name (upcase method))
          (operation-name (courier--openapi-operation-name method-name path operation))
          (request-path (courier--openapi-request-path operation-name method-name path collection-root))
@@ -4909,7 +4974,8 @@ METHOD, PATH, and COLLECTION-ROOT determine the generated file location."
     request))
 
 (defun courier--openapi-operation-report-lines (spec path method operation request)
-  "Return import report lines for OpenAPI OPERATION and generated REQUEST."
+  "Return import report lines for OpenAPI METHOD OPERATION and REQUEST.
+Use SPEC and PATH when describing unsupported import details."
   (let (lines)
     (when (and (courier--openapi-security-requirement operation spec)
                (not (plist-get request :auth)))
@@ -6053,6 +6119,7 @@ Signal `user-error' when the current request line has no URL."
   (setq-local outline-regexp "^[A-Z]+ ")
   (setq-local revert-buffer-function #'courier-request-revert-buffer)
   (add-hook 'xref-backend-functions #'courier--xref-backend nil t)
+  (add-hook 'completion-at-point-functions #'courier--content-type-capf nil t)
   (setq-local courier--request-path (and buffer-file-name (expand-file-name buffer-file-name)))
   (setq-local courier--collection-root-hint
               (or courier--collection-root-hint
@@ -6154,6 +6221,54 @@ Signal `user-error' when the current request line has no URL."
   (courier--refresh-request-content)
   (set-buffer-modified-p t)
   (message "Courier body type set to %s." (courier--body-type-label body-type)))
+
+;;;###autoload
+(defun courier-request-attach-file (path)
+  "Attach file PATH to the current request body."
+  (interactive
+   (list
+    (read-file-name "Attach file: "
+                    (courier--request-attachment-base-directory)
+                    nil t)))
+  (let ((absolute-path (expand-file-name path)))
+    (when (file-directory-p absolute-path)
+      (user-error "Cannot attach a directory"))
+    (courier--sync-request-model)
+    (let* ((current-body-type (courier--request-body-type courier--request-model))
+           (target-body-type
+            (if (memq current-body-type '(binary multipart))
+                current-body-type
+              (intern
+               (completing-read "Attach as body type: "
+                                '("binary" "multipart")
+                                nil t nil nil "binary"))))
+           (relative-path (courier--request-relative-attachment-path absolute-path))
+           (mime-type (courier--mime-type-for-extension absolute-path)))
+      (pcase target-body-type
+        ('binary
+         (plist-put courier--request-model :body-type 'binary)
+         (plist-put courier--request-model :body "")
+         (plist-put courier--request-model :body-parts nil)
+         (plist-put courier--request-model :body-file-path relative-path)
+         (plist-put courier--request-model :body-file-content-type mime-type))
+        ('multipart
+         (plist-put courier--request-model :body-type 'multipart)
+         (plist-put courier--request-model :body "")
+         (plist-put courier--request-model :body-file-path nil)
+         (plist-put courier--request-model :body-file-content-type nil)
+         (plist-put courier--request-model :body-parts
+                    (append (when (eq current-body-type 'multipart)
+                              (copy-tree (plist-get courier--request-model :body-parts) t))
+                            (list (list :name (file-name-base absolute-path)
+                                        :kind 'file
+                                        :path relative-path
+                                        :content-type mime-type)))))
+        (_
+         (user-error "Attach file requires binary or multipart body type")))
+      (setq courier--request-tab 'body)
+      (courier--refresh-request-content)
+      (set-buffer-modified-p t)
+      (message "Courier attached %s." (file-name-nondirectory absolute-path)))))
 
 ;;;###autoload
 (defun courier-request-set-auth-type (auth-type)
@@ -6264,7 +6379,7 @@ Unsaved request buffers choose a collection on first save."
   (let* ((resolved (courier--resolved-current-request))
          (path (plist-get resolved :path)))
     (when-let* ((process (courier--in-flight-process-for-path path)))
-      (unless (yes-or-no-p "Request in progress. Cancel and resend? ")
+      (unless (yes-or-no-p "Request in progress.  Cancel and resend? ")
         (user-error "Courier request aborted"))
       (courier-cancel-request process))
     (let ((response-buffer (courier--display-response-buffer resolved)))
@@ -6444,8 +6559,8 @@ This renames the request file and updates its front matter name."
    ["Edit"
     ("m" "Method" courier-request-set-method)
     ("B" "Body type" courier-request-set-body-type)
+    ("f" "Attach file" courier-request-attach-file)
     ("A" "Auth type" courier-request-set-auth-type)
-    ("j" "Jump section" courier-request-jump-section)
     ("e" "Environment" courier-request-switch-env)
     ("s" "Save" courier-request-save-buffer)]
    ["Navigate"
@@ -6491,6 +6606,7 @@ This renames the request file and updates its front matter name."
 (define-key courier-request-mode-map (kbd "C-c C-c") #'courier-request-send)
 (define-key courier-request-mode-map (kbd "C-c ?") #'courier-dispatch)
 (define-key courier-request-mode-map (kbd "C-c C-e") #'courier-request-switch-env)
+(define-key courier-request-mode-map (kbd "C-c C-f") #'courier-request-attach-file)
 (define-key courier-request-mode-map (kbd "C-c C-j") #'courier-request-jump-section)
 (define-key courier-request-mode-map (kbd "C-c C-l") #'courier-request-validate)
 (define-key courier-request-mode-map (kbd "C-c C-m") #'courier-request-set-method)

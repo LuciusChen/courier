@@ -2752,6 +2752,11 @@ When PROCESS is non-nil, prefer `accept-process-output' on PROCESS."
       (should (member 'courier-response-timeline-entry-face
                       (if (listp face) face (list face)))))))
 
+(ert-deftest courier-response-timeline-entry-face-extends-to-window-edge ()
+  (with-temp-buffer
+    (should (eq (face-attribute 'courier-response-timeline-entry-face :extend nil t) t))
+    (should (eq (face-attribute 'courier-response-timeline-selected-face :extend nil t) t))))
+
 (ert-deftest courier-response-timeline-selected-entry-summary-line-has-face ()
   (with-temp-buffer
     (courier--render-response
@@ -2763,6 +2768,18 @@ When PROCESS is non-nil, prefer `accept-process-output' on PROCESS."
     (search-forward "GET https://example.com")
     (let ((face (get-text-property (1- (point)) 'face)))
       (should (member 'courier-response-timeline-selected-face
+                      (if (listp face) face (list face)))))))
+
+(ert-deftest courier-response-timeline-entry-url-line-has-summary-face ()
+  (with-temp-buffer
+    (courier--render-response
+     (courier-test--make-response 200)
+     courier-test--request)
+    (courier-response-set-tab 'timeline)
+    (goto-char (point-min))
+    (search-forward "https://example.com")
+    (let ((face (get-text-property (1- (point)) 'face)))
+      (should (member 'courier-response-timeline-entry-face
                       (if (listp face) face (list face)))))))
 
 (ert-deftest courier-response-timeline-selected-entry-omits-summary-metadata ()
@@ -3204,6 +3221,8 @@ When PROCESS is non-nil, prefer `accept-process-output' on PROCESS."
 (ert-deftest courier-request-mode-binds-section-navigation ()
   (should (eq (lookup-key courier-request-mode-map (kbd "C-c C-j"))
               #'courier-request-jump-section))
+  (should (eq (lookup-key courier-request-mode-map (kbd "C-c C-f"))
+              #'courier-request-attach-file))
   (should-not (lookup-key courier-request-mode-map (kbd "C-c [")))
   (should-not (lookup-key courier-request-mode-map (kbd "C-c ]"))))
 
@@ -3407,8 +3426,10 @@ When PROCESS is non-nil, prefer `accept-process-output' on PROCESS."
        :body-file-content-type "application/octet-stream")
     (courier-request-mode)
     (courier-request-jump-section 'body)
-    (should (string-match-p "^path = \\./payload\\.bin$" (buffer-string)))
-    (should (string-match-p "^content_type = application/octet-stream$"
+    (should (string-match-p "^\\[body\\]$" (buffer-string)))
+    (should (string-match-p "^type = \"binary\"$" (buffer-string)))
+    (should (string-match-p "^path = \"\\./payload\\.bin\"$" (buffer-string)))
+    (should (string-match-p "^content_type = \"application/octet-stream\"$"
                             (buffer-string)))
     (courier--sync-request-model)
     (should (eq (plist-get courier--request-model :body-type) 'binary))
@@ -3432,9 +3453,12 @@ When PROCESS is non-nil, prefer `accept-process-output' on PROCESS."
                              :value "{{name}}")))
     (courier-request-mode)
     (courier-request-jump-section 'body)
-    (should (string-match-p "^name = avatar$" (buffer-string)))
-    (should (string-match-p "^kind = file$" (buffer-string)))
-    (should (string-match-p "^path = \\./avatar\\.png$" (buffer-string)))
+    (should (string-match-p "^\\[body\\]$" (buffer-string)))
+    (should (string-match-p "^type = \"multipart\"$" (buffer-string)))
+    (should (string-match-p "^\\[\\[body\\.parts\\]\\]$" (buffer-string)))
+    (should (string-match-p "^name = \"avatar\"$" (buffer-string)))
+    (should (string-match-p "^kind = \"file\"$" (buffer-string)))
+    (should (string-match-p "^path = \"\\./avatar\\.png\"$" (buffer-string)))
     (courier--sync-request-model)
     (should (eq (plist-get courier--request-model :body-type) 'multipart))
     (should (equal (plist-get courier--request-model :body-parts)
@@ -3445,6 +3469,92 @@ When PROCESS is non-nil, prefer `accept-process-output' on PROCESS."
                      (:name "display_name"
                             :kind text
                             :value "{{name}}"))))))
+
+(ert-deftest courier-request-attach-file-updates-binary-body ()
+  (courier-test--with-temp-dir (root)
+    (let* ((request-dir (expand-file-name "requests/upload" root))
+           (request-path (expand-file-name "upload.http" request-dir))
+           (payload-path (expand-file-name "fixtures/payload.bin" root)))
+      (make-directory request-dir t)
+      (make-directory (file-name-directory payload-path) t)
+      (write-region "payload" nil payload-path nil 'silent)
+      (courier-test--with-request
+          (courier-test--http-content
+           :path request-path
+           :method "POST"
+           :url "https://example.com/upload"
+           :body-type 'json
+           :body "{\n  \"ok\": true\n}\n")
+        (setq-local buffer-file-name request-path)
+        (courier-request-mode)
+        (cl-letf (((symbol-function 'read-file-name)
+                   (lambda (&rest _args) payload-path))
+                  ((symbol-function 'completing-read)
+                   (lambda (&rest _args) "binary")))
+          (call-interactively #'courier-request-attach-file))
+        (should (eq (plist-get courier--request-model :body-type) 'binary))
+        (should (equal (plist-get courier--request-model :body-file-path)
+                       "../../fixtures/payload.bin"))
+        (should (equal (plist-get courier--request-model :body-file-content-type)
+                       "application/octet-stream"))
+        (should (string-match-p
+                 "^path = \"\\.\\./\\.\\./fixtures/payload\\.bin\"$"
+                 (buffer-string)))))))
+
+(ert-deftest courier-request-attach-file-appends-multipart-file-part ()
+  (courier-test--with-temp-dir (root)
+    (let* ((request-dir (expand-file-name "requests/upload" root))
+           (request-path (expand-file-name "upload.http" request-dir))
+           (payload-path (expand-file-name "fixtures/upload-note.txt" root)))
+      (make-directory request-dir t)
+      (make-directory (file-name-directory payload-path) t)
+      (write-region "hello" nil payload-path nil 'silent)
+      (courier-test--with-request
+          (courier-test--http-content
+           :path request-path
+           :method "POST"
+           :url "https://example.com/upload"
+           :body-type 'multipart
+           :body-parts '((:name "meta" :kind text :value "{{upload_name}}")))
+        (setq-local buffer-file-name request-path)
+        (courier-request-mode)
+        (cl-letf (((symbol-function 'read-file-name)
+                   (lambda (&rest _args) payload-path)))
+          (call-interactively #'courier-request-attach-file))
+        (should (equal (plist-get courier--request-model :body-parts)
+                       '((:name "meta" :kind text :value "{{upload_name}}")
+                         (:name "upload-note"
+                          :kind file
+                          :path "../../fixtures/upload-note.txt"
+                          :content-type "text/plain"))))
+        (should (string-match-p
+                 "^name = \"upload-note\"$"
+                 (buffer-string)))))))
+
+(ert-deftest courier-request-content-type-capf-completes-mime-types ()
+  (courier-test--with-request
+      (courier-test--http-content
+       :method "POST"
+       :url "https://example.com/upload"
+       :body-type 'binary
+       :body-file-path "./payload.bin"
+       :body-file-content-type "application/octet-stream")
+    (courier-request-mode)
+    (courier-request-jump-section 'body)
+    (goto-char (point-min))
+    (search-forward "application/")
+    (let ((capf (run-hook-with-args-until-success 'completion-at-point-functions)))
+      (should capf)
+      (should (member "application/pdf" (all-completions "" (nth 2 capf))))
+      (should (member "image/png" (all-completions "" (nth 2 capf)))))))
+
+(ert-deftest courier-mime-type-for-extension-uses-built-in-mapping ()
+  (should (equal (courier--mime-type-for-extension "payload.bin")
+                 "application/octet-stream"))
+  (should (equal (courier--mime-type-for-extension "avatar.png")
+                 "image/png"))
+  (should (equal (courier--mime-type-for-extension "unknown.custom")
+                 "application/octet-stream")))
 
 (ert-deftest courier-request-script-section-round-trips-both-phases ()
   (courier-test--with-request

@@ -275,7 +275,13 @@ Send-time behavior:
 
 Use =M-x courier-request-set-body-type= or =C-c ?= in a request buffer to set
 the body type. In the request section view, the active body type is shown in
-the header line as =Body(JSON)=, =Body(XML)=, and so on.
+the header line as =Body(JSON)=, =Body(XML)=, and so on. For =binary= and
+=multipart= bodies, the body section itself is edited as a TOML fragment that
+matches the saved front matter, including =[body]= and =[[body.parts]]=
+headers. Use =C-c C-f= to attach a file into the current request body; Courier
+will choose a relative path, infer a MIME type from the extension, and update
+the body section. When point is inside a =content_type = "... "= field,
+=completion-at-point= offers common MIME types.
 
 ** Auth
 
@@ -381,6 +387,7 @@ token=abc123
 |-----------+--------------------------------+------------------------|
 | =C-c C-c= | =courier-request-send=         | Send request           |
 | =C-c C-e= | =courier-request-switch-env=   | Switch environment     |
+| =C-c C-f= | =courier-request-attach-file=  | Attach file to body    |
 | =C-c C-j= | =courier-request-jump-section= | Jump to request section |
 | =C-c C-m= | =courier-request-set-method=   | Change HTTP method     |
 | =C-c C-n= | =courier-new-request=          | Create request draft   |
