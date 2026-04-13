@@ -348,15 +348,6 @@ Signal `user-error' when KEY is present but not a string."
      (t
       (user-error "Courier config field %s must be an object" key)))))
 
-(defun courier--json-bool-field (data key)
-  "Return boolean KEY from DATA, or nil when KEY is absent."
-  (let ((value (alist-get key data 'courier--missing)))
-    (cond
-     ((eq value 'courier--missing) nil)
-     ((memq value '(t nil)) value)
-     (t
-      (user-error "Courier config field %s must be a boolean" key)))))
-
 (defun courier--json-positive-int-field (data key)
   "Return positive integer KEY from DATA, or nil when KEY is absent."
   (let ((value (alist-get key data 'courier--missing)))
@@ -424,38 +415,6 @@ When NORMALIZE-KEYS is non-nil, apply it to each key before storing the alist."
                            (user-error "Courier config auth scopes must be strings"))))))
         (_
          (user-error "Unsupported Courier config auth type %s" type-name))))))
-
-(defun courier--auth-config-data (auth)
-  "Return AUTH as JSON-serializable Courier config data."
-  (when auth
-    (pcase (plist-get auth :type)
-      ('none
-       '((type . "none")))
-      ('bearer
-       `((type . "bearer")
-         (token . ,(or (plist-get auth :token) ""))))
-      ('basic
-       `((type . "basic")
-         (username . ,(or (plist-get auth :username) ""))
-         (password . ,(or (plist-get auth :password) ""))))
-      ('header
-       `((type . "header")
-         (header . ,(or (plist-get auth :header) ""))
-         (value . ,(or (plist-get auth :value) ""))))
-      ('api_key
-       `((type . "api_key")
-         (in . ,(or (plist-get auth :in) "header"))
-         (name . ,(or (plist-get auth :name) ""))
-         (value . ,(or (plist-get auth :value) ""))))
-      ('oauth2
-       `((type . "oauth2")
-         (grant_type . ,(or (plist-get auth :grant-type) "client_credentials"))
-         (token_url . ,(or (plist-get auth :token-url) ""))
-         (client_id . ,(or (plist-get auth :client-id) ""))
-         (client_secret . ,(or (plist-get auth :client-secret) ""))
-         (scopes . ,(or (plist-get auth :scopes) nil))))
-      (_
-       (user-error "Unsupported auth type: %s" (plist-get auth :type))))))
 
 (defun courier--json-defaults-config (data)
   "Return parsed Courier defaults from DATA."
@@ -2373,14 +2332,6 @@ Each entry is a cons cell of the form `(TIMESTAMP . RESPONSE)'.")
         (courier--auto-body-view response)
       view)))
 
-(defun courier--body-view-label (response)
-  "Return a display label for the current body view of RESPONSE."
-  (let ((view (or courier--body-view
-                  (if courier--body-pretty 'auto 'raw))))
-    (if (eq view 'auto)
-        (format "auto:%s" (courier--auto-body-view response))
-      (symbol-name view))))
-
 (defun courier--response-body-bytes (response)
   "Return `(BYTES . TRUNCATEDP)' for RESPONSE body bytes."
   (let ((max-bytes (max 0 courier-body-view-max-bytes)))
@@ -2508,12 +2459,6 @@ Each entry is a cons cell of the form `(TIMESTAMP . RESPONSE)'.")
 (defun courier--current-history-response ()
   "Return the response displayed by the current history selection."
   (cdr-safe (courier--current-history-entry)))
-
-(defun courier--current-history-request ()
-  "Return the request snapshot displayed by the current history selection."
-  (when-let* ((response (courier--current-history-response)))
-    (or (plist-get response :request-snapshot)
-        courier--request)))
 
 (defun courier--response-tab-count (tab response)
   "Return a count for response TAB using RESPONSE when appropriate."
@@ -2652,10 +2597,6 @@ Each entry is a cons cell of the form `(TIMESTAMP . RESPONSE)'.")
                         (courier--timeline-tab-display-name tab)))
     (insert "\n")))
 
-(defun courier--response-header-line (response)
-  "Return a header line string for RESPONSE."
-  (courier--response-summary-string response))
-
 (defun courier--response-summary-string (response)
   "Return the status, duration, and size summary string for RESPONSE."
   (concat
@@ -2700,7 +2641,7 @@ Each entry is a cons cell of the form `(TIMESTAMP . RESPONSE)'.")
                 (courier--response-header-line-with-history
                  summary-response timestamp courier--history-index
                  (length courier--history)))
-            (courier--response-header-line summary-response))))
+            (courier--response-summary-string summary-response))))
     (concat " "
             (propertize "View:" 'face 'shadow)
             " "
@@ -2746,16 +2687,6 @@ Each entry is a cons cell of the form `(TIMESTAMP . RESPONSE)'.")
         (funcall mode)
         (font-lock-ensure)
         (buffer-substring (point-min) (point-max))))))
-
-(defun courier--format-summary (response)
-  "Return a summary section string for RESPONSE."
-  (format "Status: %s %s\nDuration: %d ms\nSize: %s\nContent-Type: %s\n"
-          (or (plist-get response :status-code) 0)
-          (or (plist-get response :reason) "")
-          (or (plist-get response :duration-ms) 0)
-          (courier--human-readable-size (or (plist-get response :size) 0))
-          (or (cdr (assoc-string "content-type" (plist-get response :headers) nil))
-              "unknown")))
 
 (defun courier--response-text-width ()
   "Return the preferred text width for the current Courier response buffer."
@@ -4685,11 +4616,6 @@ directory even when it does not exist yet."
                         (plist-get config :root))
     nil))
 
-(defun courier--request-search-root ()
-  "Return the root directory used to discover Courier request files."
-  (when-let* ((root (courier--active-collection-root)))
-    (courier--collection-requests-root root)))
-
 (defun courier--request-files (root)
   "Return Courier request files found under ROOT."
   (if (file-directory-p root)
@@ -4765,26 +4691,6 @@ directory even when it does not exist yet."
           "+++\n\n"
           courier-default-request-method " \n"
           "Accept: application/json\n"))
-
-(defun courier--unique-request-path (directory name)
-  "Return a unique request path for NAME under DIRECTORY."
-  (let* ((slug (courier--slugify-name name))
-         (base (if (string-empty-p slug) "untitled" slug))
-         (index 1)
-         candidate)
-    (while
-        (progn
-          (setq candidate
-                (expand-file-name
-                 (format "%s%s.http"
-                         base
-                         (if (= index 1)
-                             ""
-                           (format "-%d" index)))
-                 directory))
-          (setq index (1+ index))
-          (file-exists-p candidate)))
-    candidate))
 
 (defun courier--collection-template (root &optional name)
   "Return JSON text for a new Courier collection rooted at ROOT.
@@ -5410,22 +5316,6 @@ METADATA entries follow `completion-metadata'."
   (mapcar #'courier--collection-candidate
           (courier--open-collection-roots)))
 
-(defun courier--select-collection-root ()
-  "Return the active or selected Courier collection root."
-  (or (courier--active-collection-root)
-      (let ((candidates (courier--collection-candidates)))
-        (unless candidates
-          (user-error "No Courier collections found"))
-        (if (= (length candidates) 1)
-            (plist-get (cdar candidates) :root)
-          (let* ((table (courier--completion-table
-                         candidates
-                         '(category . courier-collection)
-                         '(group-function . courier--completion-group)
-                         '(affixation-function . courier--completion-affixation)))
-                 (selection (completing-read "Courier collection: " table nil t)))
-            (plist-get (cdr (assoc selection candidates)) :root))))))
-
 (defun courier--set-active-env (name)
   "Set the current request buffer environment to NAME."
   (setq courier--active-env name)
@@ -5556,14 +5446,6 @@ Entries are read from the configured env directory only."
               (courier-merge-vars merged
                                   (courier-parse-env-file (cdr entry))))))
     merged))
-
-(defun courier--current-env-vars ()
-  "Return merged environment variables for the current request buffer."
-  (let* ((entries (courier--available-env-entries))
-         (env-name (courier--selected-env-name entries)))
-    (if env-name
-        (courier--env-vars-for-name entries env-name)
-      nil)))
 
 (defun courier--current-env-selection ()
   "Return the current environment selection as `(ENV-NAME . VARS)'."

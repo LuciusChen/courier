@@ -2394,13 +2394,14 @@ When PROCESS is non-nil, prefer `accept-process-output' on PROCESS."
 
 (ert-deftest courier-response-header-line-uses-clutch-style-separator ()
   (let ((line (substring-no-properties
-               (courier--response-header-line (courier-test--make-response 200)))))
+               (courier--response-summary-string
+                (courier-test--make-response 200)))))
     (should (string-match-p "200 OK  •  42ms  •  5B" line))
     (should-not (string-match-p " | " line))))
 
 (ert-deftest courier-response-header-line-falls-back-to-standard-reason ()
   (let ((line (substring-no-properties
-               (courier--response-header-line
+               (courier--response-summary-string
                 '(:status-code 403
                   :reason ""
                   :headers nil
@@ -2877,49 +2878,6 @@ When PROCESS is non-nil, prefer `accept-process-output' on PROCESS."
       (should (= (length courier--history) 3))
       (should (= (plist-get (cdr (nth 0 courier--history)) :status-code) 204))
       (should (= (plist-get (cdr (nth 2 courier--history)) :status-code) 202)))))
-
-(ert-deftest courier-request-search-root-prefers-collection-root ()
-  (courier-test--with-temp-dir (root)
-    (let* ((collection-root (expand-file-name "api-collection" root))
-           (api-dir (expand-file-name "requests/users" collection-root))
-           (request-file (expand-file-name "get-user.http" api-dir)))
-      (make-directory (expand-file-name ".git" root))
-      (make-directory api-dir t)
-      (with-temp-file (expand-file-name "courier.json" collection-root)
-        (insert "{}\n"))
-      (with-temp-file request-file
-        (insert "GET https://example.com/users/42\n"))
-      (with-temp-buffer
-        (setq-local buffer-file-name request-file)
-        (should (equal (file-name-as-directory
-                        (expand-file-name "requests" collection-root))
-                       (courier--request-search-root)))))))
-
-(ert-deftest courier-request-search-root-respects-configured-requests-dir ()
-  (courier-test--with-temp-dir (root)
-    (let* ((collection-root (expand-file-name "api-collection" root))
-           (requests-root (expand-file-name "api-requests" collection-root))
-           (api-dir (expand-file-name "users" requests-root))
-           (request-file (expand-file-name "get-user.http" api-dir)))
-      (make-directory api-dir t)
-      (with-temp-file (expand-file-name "courier.json" collection-root)
-        (insert "{\n  \"requestsDir\": \"api-requests\"\n}\n"))
-      (with-temp-file request-file
-        (insert "GET https://example.com/users/42\n"))
-      (with-temp-buffer
-        (setq-local buffer-file-name request-file)
-        (should (equal (file-name-as-directory requests-root)
-                       (courier--request-search-root)))))))
-
-(ert-deftest courier-request-search-root-requires-collection ()
-  (courier-test--with-temp-dir (root)
-    (let ((request-file (expand-file-name "api/users/get-user.http" root)))
-      (make-directory (file-name-directory request-file) t)
-      (with-temp-file request-file
-        (insert "GET https://example.com/users/42\n"))
-      (with-temp-buffer
-        (setq-local buffer-file-name request-file)
-        (should-not (courier--request-search-root))))))
 
 (ert-deftest courier-available-env-entries-use-collection-env-dir ()
   (courier-test--with-temp-dir (root)
