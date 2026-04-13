@@ -25,6 +25,7 @@
 (require 'subr-x)
 (require 'transient)
 (require 'url-util)
+(require 'xref)
 
 (defconst courier--allowed-methods
   '("GET" "POST" "PUT" "PATCH" "DELETE" "HEAD" "OPTIONS")
@@ -5417,20 +5418,29 @@ Entries are read from the configured env directory only."
 
 (defun courier--selected-env-name (entries)
   "Return the selected environment name from ENTRIES."
+  (let ((names (courier--available-env-names entries))
+        (selected (courier--selected-env-name-no-prompt entries)))
+    (cond
+     ((null names) nil)
+     (selected
+      (setq courier--active-env selected)
+      (force-mode-line-update)
+      selected)
+     (t
+      (setq courier--active-env (courier--read-env-name names))
+      (force-mode-line-update)
+      courier--active-env))))
+
+(defun courier--selected-env-name-no-prompt (entries)
+  "Return the selected environment name from ENTRIES without prompting."
   (let ((names (courier--available-env-names entries)))
     (cond
      ((null names) nil)
      ((and courier--active-env
            (member courier--active-env names))
       courier--active-env)
-     ((courier--preferred-env-name entries)
-      (setq courier--active-env (courier--preferred-env-name entries))
-      (force-mode-line-update)
-      courier--active-env)
      (t
-      (setq courier--active-env (courier--read-env-name names))
-      (force-mode-line-update)
-      courier--active-env))))
+      (courier--preferred-env-name entries)))))
 
 (defun courier--env-vars-for-name (entries env-name)
   "Return merged environment variables from ENTRIES for ENV-NAME."
@@ -5462,6 +5472,203 @@ Entries are read from the configured env directory only."
                          (courier--read-runtime-vars collection-root env-name))))
     (cons env-name
           (courier-merge-vars env-vars runtime-vars))))
+
+(defun courier--placeholder-name-at-point ()
+  "Return the `{{name}}' placeholder under point, or nil."
+  (let ((position (point))
+        match)
+    (save-excursion
+      (goto-char (line-beginning-position))
+      (while (and (not match)
+                  (re-search-forward "{{\\([^{}[:space:]]+\\)}}" (line-end-position) t))
+        (when (and (<= (match-beginning 0) position)
+                   (<= position (match-end 0)))
+          (setq match (match-string-no-properties 1)))))
+    match))
+
+(defun courier--definition-key-at-point ()
+  "Return the `key = value' definition key at point, or nil."
+  (save-excursion
+    (beginning-of-line)
+    (when (looking-at "^\\([A-Za-z_][A-Za-z0-9_]*\\)\\s-*=\\s-*")
+      (when (and (<= (match-beginning 1) (point))
+                 (<= (point) (match-end 1)))
+        (match-string-no-properties 1)))))
+
+(defun courier--xref-identifier-at-point ()
+  "Return the Courier variable identifier under point, or nil."
+  (or (courier--placeholder-name-at-point)
+      (courier--definition-key-at-point)))
+
+(defun courier--xref-file-location (path regexp summary)
+  "Return an xref item for PATH matching REGEXP with SUMMARY, or nil."
+  (when (file-exists-p path)
+    (with-temp-buffer
+      (insert-file-contents path)
+      (goto-char (point-min))
+      (when (re-search-forward regexp nil t)
+        (let ((line (line-number-at-pos (match-beginning 0)))
+              (column (save-excursion
+                        (goto-char (match-beginning 0))
+                        (current-column))))
+          (xref-make summary
+                     (xref-make-file-location path line column)))))))
+
+(defun courier--request-local-var-section (name request)
+  "Return the request-local section symbol defining NAME in REQUEST, or nil."
+  (cond
+   ((assoc-string name (plist-get request :pre-request-vars) nil)
+    'pre-request-vars)
+   ((assoc-string name (plist-get request :vars) nil)
+    'vars)
+   (t
+    nil)))
+
+(defun courier--request-local-var-xref (name section)
+  "Return a request-buffer xref for NAME defined in SECTION, or nil."
+  (let ((buffer (current-buffer))
+        (heading (pcase section
+                   ('pre-request-vars "[vars.pre_request]")
+                   ('vars "[vars]")
+                   (_ (user-error "Unsupported request var section: %s" section)))))
+    (courier--request-jump-section 'vars)
+    (save-excursion
+      (goto-char (courier--request-content-start-position))
+      (when (re-search-forward (format "^%s$" (regexp-quote heading)) nil t)
+        (forward-line 1)
+        (let ((section-start (point))
+              (section-end (or (and (re-search-forward "^\\[" nil t)
+                                    (match-beginning 0))
+                               (point-max))))
+          (goto-char section-start)
+          (when (re-search-forward (format "^%s\\s-*="
+                                           (regexp-quote name))
+                                   section-end t)
+            (xref-make (format "%s (%s)"
+                               name
+                               (pcase section
+                                 ('pre-request-vars "request vars.pre_request")
+                                 ('vars "request vars")))
+                       (xref-make-buffer-location buffer (match-beginning 0)))))))))
+
+(defun courier--env-var-xref (entries env-name name)
+  "Return an env-file xref for NAME from ENTRIES and ENV-NAME, or nil."
+  (let ((regexp (format "^\\s-*%s\\s-*=" (regexp-quote name))))
+    (seq-some
+     (lambda (entry)
+       (when (string= (car entry) env-name)
+         (courier--xref-file-location
+          (cdr entry)
+          regexp
+          (format "%s (%s env)" name env-name))))
+     entries)))
+
+(defun courier--defaults-var-xref (path name summary)
+  "Return a defaults xref for NAME in config PATH with SUMMARY, or nil."
+  (when (assoc-string name
+                      (plist-get (courier--json-defaults-config
+                                  (courier--read-json-file path))
+                                 :vars)
+                      nil)
+    (courier--xref-file-location
+     path
+     (format "^[[:space:]]*\"%s\"[[:space:]]*:"
+             (regexp-quote name))
+     summary)))
+
+(defun courier--request-default-var-xref (name request)
+  "Return a defaults xref for NAME visible to REQUEST, or nil."
+  (let* ((request-path (plist-get request :path))
+         (collection-root
+          (or (and request-path (courier--collection-root request-path))
+              (courier--active-collection-root)))
+         (request-directory
+          (or (and request-path (file-name-directory request-path))
+              default-directory))
+         (directories (reverse
+                       (courier--request-default-directories
+                        collection-root
+                        request-directory))))
+    (or
+     (seq-some
+      (lambda (directory)
+        (let ((config-path (expand-file-name courier--collection-marker-file directory)))
+          (when (file-exists-p config-path)
+            (courier--defaults-var-xref
+             config-path
+             name
+             (format "%s (%s defaults)"
+                     name
+                     (abbreviate-file-name directory))))))
+      directories)
+     (when-let* ((config-path (and collection-root
+                                   (courier--collection-config-path collection-root))))
+       (courier--defaults-var-xref
+        config-path
+        name
+        (format "%s (%s defaults)"
+                name
+                (courier--collection-name collection-root)))))))
+
+(defun courier--request-xref-definitions (name)
+  "Return xref definitions for NAME from the current request buffer."
+  (courier--sync-request-model)
+  (let* ((request courier--request-model)
+         (local-section (courier--request-local-var-section name request)))
+    (cond
+     (local-section
+      (when-let* ((xref (courier--request-local-var-xref name local-section)))
+        (list xref)))
+     (t
+      (let* ((entries (courier--available-env-entries))
+             (env-name (courier--selected-env-name-no-prompt entries)))
+        (seq-filter
+         #'identity
+         (list (and env-name
+                    (courier--env-var-xref entries env-name name))
+               (courier--request-default-var-xref name request))))))))
+
+(defun courier--env-buffer-xref-definitions (name)
+  "Return xref definitions for NAME from the current env buffer."
+  (let* ((path (and buffer-file-name (expand-file-name buffer-file-name)))
+         (regexp (format "^\\s-*%s\\s-*=" (regexp-quote name)))
+         (self (and path
+                    (courier--xref-file-location
+                     path regexp
+                     (format "%s (%s)"
+                             name
+                             (file-name-nondirectory path)))))
+         (collection-root (and path (courier--collection-root path))))
+    (seq-filter
+     #'identity
+     (list self
+           (and collection-root
+                (courier--defaults-var-xref
+                 (courier--collection-config-path collection-root)
+                 name
+                 (format "%s (%s defaults)"
+                         name
+                         (courier--collection-name collection-root))))))))
+
+(defun courier--xref-backend ()
+  "Return the Courier xref backend when appropriate for the current buffer."
+  (when (or (derived-mode-p 'courier-request-mode)
+            (derived-mode-p 'courier-env-mode))
+    'courier))
+
+(cl-defmethod xref-backend-identifier-at-point ((_backend (eql courier)))
+  "Return the Courier identifier under point."
+  (courier--xref-identifier-at-point))
+
+(cl-defmethod xref-backend-definitions ((_backend (eql courier)) identifier)
+  "Return Courier xref definitions for IDENTIFIER."
+  (cond
+   ((derived-mode-p 'courier-request-mode)
+    (courier--request-xref-definitions identifier))
+   ((derived-mode-p 'courier-env-mode)
+    (courier--env-buffer-xref-definitions identifier))
+   (t
+    nil)))
 
 (defun courier--prepared-current-request ()
   "Return the current request after env selection and pre-request scripts."
@@ -5762,7 +5969,8 @@ Signal `user-error' when the current request line has no URL."
   "Major mode for editing Courier environment files."
   (setq-local font-lock-defaults '(courier-env-font-lock-keywords))
   (setq-local comment-start "#")
-  (setq-local comment-start-skip "#+\\s-*"))
+  (setq-local comment-start-skip "#+\\s-*")
+  (add-hook 'xref-backend-functions #'courier--xref-backend nil t))
 
 (defun courier--maybe-enable-env-mode ()
   "Enable `courier-env-mode' for Courier env files."
@@ -5844,6 +6052,7 @@ Signal `user-error' when the current request line has no URL."
   (setq-local header-line-format '(:eval (courier--request-header-line-format)))
   (setq-local outline-regexp "^[A-Z]+ ")
   (setq-local revert-buffer-function #'courier-request-revert-buffer)
+  (add-hook 'xref-backend-functions #'courier--xref-backend nil t)
   (setq-local courier--request-path (and buffer-file-name (expand-file-name buffer-file-name)))
   (setq-local courier--collection-root-hint
               (or courier--collection-root-hint

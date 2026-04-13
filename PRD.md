@@ -344,7 +344,7 @@ The current baseline already includes:
 - collection-bounded env discovery with `envDir` and `defaultEnv`
 - per-buffer env switching based on `.env` files
 - response history for repeated sends of the same request
-- grouped request and environment picker
+- split request and env pickers with collection-grouped display
 - unsaved request drafts with first-save collection placement
 - response view system with dedicated body viewer
 - basic response rendering, including image-aware views
@@ -393,6 +393,8 @@ Deliver:
 - one env picker that opens env files from anywhere
 - collection-grouped minibuffer display
 - request and env actions use distinct commands with distinct semantics
+- `xref-find-definitions` in request/env buffers jumps to the effective
+  source-backed variable definition
 
 Acceptance:
 

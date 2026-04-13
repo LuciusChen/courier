@@ -14,6 +14,7 @@
 (require 'cl-lib)
 (require 'ert)
 (require 'courier)
+(require 'xref)
 
 (defmacro courier-test--with-request (content &rest body)
   "Evaluate BODY in a temp buffer containing CONTENT."
@@ -221,6 +222,27 @@ When PROCESS is non-nil, prefer `accept-process-output' on PROCESS."
   (let ((copy (copy-keymap map)))
     (set-keymap-parent copy nil)
     (lookup-key copy (kbd key))))
+
+(defun courier-test--xref-definitions-at-point ()
+  "Return xref definitions for the Courier identifier at point."
+  (let* ((backend (run-hook-with-args-until-success 'xref-backend-functions))
+         (identifier (and backend
+                          (xref-backend-identifier-at-point backend))))
+    (unless backend
+      (ert-fail "No Courier xref backend available"))
+    (unless identifier
+      (ert-fail "No Courier xref identifier at point"))
+    (xref-backend-definitions backend identifier)))
+
+(defun courier-test--line-at-file-location (path line)
+  "Return line LINE from PATH as a string."
+  (with-temp-buffer
+    (insert-file-contents path)
+    (goto-char (point-min))
+    (forward-line (1- line))
+    (buffer-substring-no-properties
+     (line-beginning-position)
+     (line-end-position))))
 
 (defun courier-test--face-includes-p (face expected)
   "Return non-nil when FACE includes EXPECTED."
@@ -1933,6 +1955,159 @@ When PROCESS is non-nil, prefer `accept-process-output' on PROCESS."
     (search-forward "base_url")
     (let ((key-face (get-text-property (1- (point)) 'face)))
       (should (courier-test--face-includes-p key-face 'font-lock-variable-name-face)))))
+
+(ert-deftest courier-request-xref-prefers-pre-request-vars ()
+  (courier-test--with-temp-dir (root)
+    (let* ((courier-home-directory root)
+           (collection-root (expand-file-name "collections/api-collection" root))
+           (request-dir (expand-file-name "requests/demo" collection-root))
+           (request-file (expand-file-name "show.http" request-dir)))
+      (make-directory request-dir t)
+      (with-temp-file (expand-file-name "courier.json" collection-root)
+        (insert "{\n  \"name\": \"API Collection\"\n}\n"))
+      (with-temp-file request-file
+        (insert "+++\n"
+                "[body]\n"
+                "type = \"json\"\n\n"
+                "[vars]\n"
+                "token = \"request-token\"\n\n"
+                "[vars.pre_request]\n"
+                "token = \"pre-request-token\"\n"
+                "+++\n\n"
+                "POST https://example.com/demo\n"
+                "Content-Type: application/json\n\n"
+                "{\"token\":\"{{token}}\"}\n"))
+      (with-current-buffer (find-file-noselect request-file)
+        (unwind-protect
+            (progn
+              (goto-char (point-min))
+              (search-forward "{{token}}")
+              (let* ((definitions (courier-test--xref-definitions-at-point))
+                     (location (xref-item-location (car definitions)))
+                     (marker (xref-location-marker location)))
+                (should (= (length definitions) 1))
+                (should (eq (marker-buffer marker) (current-buffer)))
+                (should (eq courier--request-tab 'vars))
+                (goto-char marker)
+                (should (looking-at "token = \"pre-request-token\""))))
+          (kill-buffer (current-buffer)))))))
+
+(ert-deftest courier-request-xref-falls-back-to-selected-env ()
+  (courier-test--with-temp-dir (root)
+    (let* ((courier-home-directory root)
+           (collection-root (expand-file-name "collections/api-collection" root))
+           (request-dir (expand-file-name "requests/demo" collection-root))
+           (env-dir (expand-file-name "env" collection-root))
+           (request-file (expand-file-name "show.http" request-dir))
+           (env-file (expand-file-name "local.env" env-dir)))
+      (make-directory request-dir t)
+      (make-directory env-dir t)
+      (with-temp-file (expand-file-name "courier.json" collection-root)
+        (insert "{\n  \"name\": \"API Collection\",\n  \"defaultEnv\": \"local\"\n}\n"))
+      (with-temp-file env-file
+        (insert "token=env-token\n"))
+      (with-temp-file request-file
+        (insert "+++\n"
+                "[body]\n"
+                "type = \"json\"\n"
+                "+++\n\n"
+                "POST https://example.com/demo\n"
+                "Content-Type: application/json\n\n"
+                "{\"token\":\"{{token}}\"}\n"))
+      (with-current-buffer (find-file-noselect request-file)
+        (unwind-protect
+            (progn
+              (goto-char (point-min))
+              (search-forward "{{token}}")
+              (let* ((definitions (courier-test--xref-definitions-at-point))
+                     (location (xref-item-location (car definitions))))
+                (should (= (length definitions) 1))
+                (should (equal (expand-file-name (xref-file-location-file location))
+                               env-file))
+                (should (equal (courier-test--line-at-file-location
+                                env-file
+                                (xref-file-location-line location))
+                               "token=env-token"))))
+          (kill-buffer (current-buffer)))))))
+
+(ert-deftest courier-request-xref-prefers-nearest-folder-default ()
+  (courier-test--with-temp-dir (root)
+    (let* ((courier-home-directory root)
+           (collection-root (expand-file-name "collections/api-collection" root))
+           (request-dir (expand-file-name "requests/admin/tools" collection-root))
+           (folder-dir (expand-file-name "requests/admin" collection-root))
+           (request-file (expand-file-name "show.http" request-dir))
+           (folder-config (expand-file-name "courier.json" folder-dir)))
+      (make-directory request-dir t)
+      (with-temp-file (expand-file-name "courier.json" collection-root)
+        (insert "{\n"
+                "  \"name\": \"API Collection\",\n"
+                "  \"defaults\": {\n"
+                "    \"vars\": {\n"
+                "      \"base_url\": \"https://collection.example.com\"\n"
+                "    }\n"
+                "  }\n"
+                "}\n"))
+      (with-temp-file folder-config
+        (insert "{\n"
+                "  \"defaults\": {\n"
+                "    \"vars\": {\n"
+                "      \"base_url\": \"https://folder.example.com\"\n"
+                "    }\n"
+                "  }\n"
+                "}\n"))
+      (with-temp-file request-file
+        (insert "GET {{base_url}}/users\n"))
+      (with-current-buffer (find-file-noselect request-file)
+        (unwind-protect
+            (progn
+              (goto-char (point-min))
+              (search-forward "{{base_url}}")
+              (let* ((definitions (courier-test--xref-definitions-at-point))
+                     (location (xref-item-location (car definitions))))
+                (should (= (length definitions) 1))
+                (should (equal (expand-file-name (xref-file-location-file location))
+                               folder-config))
+                (should (string-match-p "\"base_url\""
+                                        (courier-test--line-at-file-location
+                                         folder-config
+                                         (xref-file-location-line location))))))
+          (kill-buffer (current-buffer)))))))
+
+(ert-deftest courier-env-xref-falls-back-to-collection-defaults ()
+  (courier-test--with-temp-dir (root)
+    (let* ((courier-home-directory root)
+           (collection-root (expand-file-name "collections/api-collection" root))
+           (env-dir (expand-file-name "env" collection-root))
+           (env-file (expand-file-name "local.env" env-dir))
+           (config-file (expand-file-name "courier.json" collection-root)))
+      (make-directory env-dir t)
+      (with-temp-file config-file
+        (insert "{\n"
+                "  \"name\": \"API Collection\",\n"
+                "  \"defaults\": {\n"
+                "    \"vars\": {\n"
+                "      \"base_url\": \"https://collection.example.com\"\n"
+                "    }\n"
+                "  }\n"
+                "}\n"))
+      (with-temp-file env-file
+        (insert "api_root={{base_url}}/v1\n"))
+      (with-current-buffer (find-file-noselect env-file)
+        (unwind-protect
+            (progn
+              (goto-char (point-min))
+              (search-forward "{{base_url}}")
+              (let* ((definitions (courier-test--xref-definitions-at-point))
+                     (location (xref-item-location (car definitions))))
+                (should (= (length definitions) 1))
+                (should (equal (expand-file-name (xref-file-location-file location))
+                               config-file))
+                (should (string-match-p "\"base_url\""
+                                        (courier-test--line-at-file-location
+                                         config-file
+                                         (xref-file-location-line location))))))
+          (kill-buffer (current-buffer)))))))
 
 (ert-deftest courier-collection-config-uses-defaults ()
   (courier-test--with-temp-dir (root)

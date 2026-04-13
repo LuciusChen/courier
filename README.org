@@ -389,6 +389,7 @@ token=abc123
 | =C-c C-l= | =courier-request-validate=     | Validate syntax        |
 | =C-c C-o= | =courier-open=                 | Open request           |
 | =C-c C-r= | =courier-rename-request=       | Rename current request |
+| =M-.=     | =xref-find-definitions=        | Jump to variable definition |
 | =C-x C-s= | =courier-request-save-buffer=  | Save draft or file     |
 
 Use =M-x courier-new-request= or =C-c C-n= to open an unsaved draft buffer. The
@@ -433,6 +434,10 @@ Use =C-c C-e= to switch the active environment for the current request buffer.
 Use =M-x courier-open-env= to open an environment file for editing from
 anywhere; env candidates are grouped by collection, keep the env name as the
 main label, and use the annotation for the env file path.
+Use =M-.= in request buffers and Courier env buffers to jump to the effective
+source-backed variable definition. Courier resolves definitions in request
+buffers in this order: request =vars.pre_request=, request =vars=, selected
+env, folder defaults, then collection defaults.
 Use =C-c ?= in a request buffer for request actions. Request content itself
 stays source-backed: Courier uses transient for actions, not as the primary
 editor for params, auth, or script content.
