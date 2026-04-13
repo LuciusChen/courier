@@ -114,21 +114,6 @@ from the relevant postmortem.
 - `cl-lib` functions require `(require 'cl-lib)`.
 - Avoid `eval-when-compile` for runtime-needed dependencies.
 
-## Pre-Commit Checklist
-
-### 1. Byte-compile with zero warnings
-
-```bash
-emacs -batch -L . -l courier.el -f batch-byte-compile *.el
-```
-
-### 2. Run all tests
-
-```bash
-emacs -batch -L . -l ert -l courier -l test/courier-test.el \
-  --eval '(ert-run-tests-batch-and-exit)'
-```
-
 ## Pre-Commit Checklist (Mandatory)
 
 Every commit must pass all of these steps.
@@ -154,7 +139,23 @@ emacs -batch -L . -l ert -l courier -l test/courier-test.el \
 emacs -batch -L . -f batch-byte-compile *.el
 ```
 
-### 4. Update tests when behavior changes
+### 4. checkdoc with zero warnings
+
+```bash
+emacs -batch -L . -l courier.el --eval '(checkdoc-file "courier.el")'
+```
+
+### 5. package-lint with zero warnings
+
+```bash
+emacs -batch -L . \
+  --eval '(require (quote package))' \
+  --eval '(package-initialize)' \
+  --eval '(require (quote package-lint))' \
+  --eval '(with-temp-buffer (insert-file-contents "courier.el") (emacs-lisp-mode) (dolist (w (package-lint-buffer)) (message "%s" w)))'
+```
+
+### 6. Update tests when behavior changes
 
 When a function's behavior changes intentionally, search all test files for existing tests of that function and update them before committing:
 
