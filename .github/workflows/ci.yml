@@ -9,7 +9,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Emacs
         run: |
@@ -30,7 +30,10 @@ jobs:
         run: emacs --batch -L . -l courier.el -f batch-byte-compile courier.el
 
       - name: Checkdoc
-        run: emacs --batch -L . -l courier.el --eval '(checkdoc-file "courier.el")'
+        run: |
+          emacs --batch -L . -l courier.el \
+            --eval '(require (quote checkdoc))' \
+            --eval '(let (warnings) (with-current-buffer (find-file-noselect "courier.el") (let ((checkdoc-create-error-function (lambda (text _start _end &optional _unfixable) (push text warnings)))) (checkdoc-current-buffer t))) (if warnings (progn (dolist (warning (nreverse warnings)) (message "%s" warning)) (kill-emacs 1)) (message "checkdoc OK")))'
 
       - name: Package-lint
         run: |
@@ -38,6 +41,8 @@ jobs:
             --eval '(require (quote package))' \
             --eval '(package-initialize)' \
             --eval '(dolist (entry package--builtins) (let ((name (car entry)) (meta (cdr entry))) (unless (assq name package-alist) (push (cons name (list (package-desc-create :name name :version (append (aref meta 0) nil) :summary (aref meta 2) :reqs (aref meta 1) :kind (quote builtin)))) package-alist))))' \
+            --eval '(require (quote transient))' \
+            --eval '(let* ((raw (or (and (boundp (quote transient-version)) transient-version) (and (fboundp (quote transient-version)) (transient-version)) "0.0.0")) (clean (car (split-string (replace-regexp-in-string "\\`v" "" raw) "-"))) (version (version-to-list clean)) (desc (package-desc-create :name (quote transient) :version version :summary "Transient menu framework." :reqs nil :kind (quote builtin)))) (setq package-alist (assq-delete-all (quote transient) package-alist)) (push (cons (quote transient) (list desc)) package-alist))' \
             --eval '(require (quote package-lint))' \
             --eval '(with-temp-buffer (insert-file-contents "courier.el") (emacs-lisp-mode) (let ((warnings (package-lint-buffer))) (if warnings (progn (dolist (w warnings) (message "%s" w)) (kill-emacs 1)) (message "package-lint OK"))))'
 

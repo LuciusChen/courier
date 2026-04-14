@@ -2392,6 +2392,9 @@ skipping."
     (cl-letf (((symbol-function 'display-images-p) (lambda () t))
               ((symbol-function 'create-image)
                (lambda (&rest _args)
+                 'fake-image))
+              ((symbol-function 'insert-image)
+               (lambda (&rest _args)
                  (error "broken image decoder"))))
       (courier--insert-response-body
        '(:content-type "image/png"
@@ -2500,12 +2503,39 @@ skipping."
                 ((symbol-function 'display-images-p) (lambda () t))
                 ((symbol-function 'create-image)
                  (lambda (&rest _args)
+                   'fake-image))
+                ((symbol-function 'insert-image)
+                 (lambda (&rest _args)
                    (error "broken image decoder"))))
         (courier-response-open-body))
       (with-current-buffer viewer-buffer
         (should (string-match-p "\\[Failed to render image: broken image decoder\\]"
                                 (buffer-string)))
         (should (string-match-p "/tmp/demo.png" (buffer-string)))))))
+
+(ert-deftest courier-body-view-major-mode-falls-back-without-json-treesit-grammar ()
+  (skip-unless (and (fboundp 'json-ts-mode)
+                    (fboundp 'treesit-ready-p)
+                    (or (fboundp 'js-json-mode)
+                        (fboundp 'js-mode))))
+  (cl-letf (((symbol-function 'treesit-ready-p)
+             (lambda (&rest _args)
+               nil)))
+    (should-not (eq (courier--body-view-major-mode 'json)
+                    #'json-ts-mode))))
+
+(ert-deftest courier-body-view-major-mode-falls-back-without-treesit-ready-p ()
+  (skip-unless (and (fboundp 'json-ts-mode)
+                    (or (fboundp 'js-json-mode)
+                        (fboundp 'js-mode))))
+  (cl-letf (((symbol-function 'fboundp)
+             (let ((orig (symbol-function 'fboundp)))
+               (lambda (symbol)
+                 (if (eq symbol 'treesit-ready-p)
+                     nil
+                   (funcall orig symbol))))))
+    (should-not (eq (courier--body-view-major-mode 'json)
+                    #'json-ts-mode))))
 
 (ert-deftest courier-response-open-body-opens-document-file ()
   (let ((response '(:status-code 200

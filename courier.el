@@ -3,7 +3,7 @@
 ;; Author: Lucius Chen <chenyh572@gmail.com>
 ;; URL: https://github.com/LuciusChen/courier
 ;; Version: 0.2.0
-;; Package-Requires: ((emacs "29.1") (transient "0.4.0"))
+;; Package-Requires: ((emacs "29.1") (transient "0.0.0"))
 
 ;;; Commentary:
 
@@ -26,6 +26,8 @@
 (require 'transient)
 (require 'url-util)
 (require 'xref)
+
+(declare-function treesit-ready-p "treesit" (language &optional quiet))
 
 (defconst courier--allowed-methods
   '("GET" "POST" "PUT" "PATCH" "DELETE" "HEAD" "OPTIONS")
@@ -1598,7 +1600,7 @@ Signal `user-error' when RESPONSE does not contain a valid token payload."
   "Current Courier script phase symbol.")
 
 (defun courier--plist-like-p (value)
-  "Return non-nil when VALUE looks like a plist."
+  "Check whether VALUE resembles a plist."
   (and (listp value)
        (or (null value)
            (keywordp (car value)))))
@@ -1781,7 +1783,9 @@ Return the updated RESPONSE plist."
 
 ;;;###autoload
 (defun courier-run-tests (response tests)
-  "Run TESTS against RESPONSE and return result plists."
+  "Return test result plists for RESPONSE.
+
+TESTS supplies the assertions to evaluate."
   (mapcar (lambda (expr) (courier-run-test response expr)) tests))
 
 ;;;; HTTP transport
@@ -2545,7 +2549,8 @@ Each entry is a cons cell of the form `(TIMESTAMP . RESPONSE)'.")
     (courier--restore-response-window-state state)))
 
 (defun courier--reset-response-window-state ()
-  "Reset point and window starts to the top of the current response buffer."
+  "Reset point and window start positions.
+Move them to the top of the current response buffer."
   (goto-char (point-min))
   (dolist (window (get-buffer-window-list (current-buffer) nil t))
     (when (window-live-p window)
@@ -2646,7 +2651,10 @@ Each entry is a cons cell of the form `(TIMESTAMP . RESPONSE)'.")
   (pcase view
     ('json
      (cond
-      ((fboundp 'json-ts-mode) #'json-ts-mode)
+      ((and (fboundp 'json-ts-mode)
+            (fboundp 'treesit-ready-p)
+            (treesit-ready-p 'json t))
+       #'json-ts-mode)
       ((fboundp 'js-json-mode) #'js-json-mode)
       ((fboundp 'js-mode) #'js-mode)
       (t #'fundamental-mode)))
@@ -3303,6 +3311,26 @@ Each entry is a cons cell of the form `(TIMESTAMP . RESPONSE)'.")
     (user-error "No Courier response is available"))
   (courier--set-response-tab tab))
 
+(defun courier-response-view-response ()
+  "Switch to the Response view."
+  (interactive)
+  (courier--set-response-tab 'response))
+
+(defun courier-response-view-headers ()
+  "Switch to the Headers view."
+  (interactive)
+  (courier--set-response-tab 'headers))
+
+(defun courier-response-view-timeline ()
+  "Switch to the Timeline view."
+  (interactive)
+  (courier--set-response-tab 'timeline))
+
+(defun courier-response-view-tests ()
+  "Switch to the test results view."
+  (interactive)
+  (courier--set-response-tab 'tests))
+
 (defun courier--timeline-index-at-point ()
   "Return the timeline history index stored at point, or nil."
   (or (button-get (button-at (point)) 'courier-history-index)
@@ -3354,7 +3382,7 @@ The return value is one of:
     (cons 'history (courier--timeline-index-at-point)))))
 
 (defun courier--goto-button-matching (predicate)
-  "Move point to the first button for which PREDICATE returns non-nil."
+  "Move point to the first button for which PREDICATE is non-nil."
   (goto-char (point-min))
   (let ((button (next-button (point-min) t)))
     (while (and button
@@ -3766,7 +3794,7 @@ request URL query string."
   (string-join (courier--serialize-front-matter-auth-sections request) "\n\n"))
 
 (defun courier--request-tests-lines (request)
-  "Return editable plain-text assertions for REQUEST tests."
+  "Return editable plain-text assertions for REQUEST."
   (string-join (or (plist-get request :tests) nil) "\n"))
 
 (defun courier--request-body-toml-fragment (request keys)
@@ -3824,7 +3852,7 @@ request URL query string."
     request))
 
 (defun courier--request-body-state (body-type text)
-  "Return request body plist updates for BODY-TYPE using section TEXT."
+  "Return request body plist entries for BODY-TYPE from section TEXT."
   (pcase body-type
     ('none
      '(:body "" :body-parts nil :body-file-path nil :body-file-content-type nil))
@@ -3860,7 +3888,7 @@ request URL query string."
                                 (courier--request-body-state body-type text)))
 
 (defun courier--request-default-body-state (body-type)
-  "Return default body plist updates for BODY-TYPE."
+  "Return default request body plist entries for BODY-TYPE."
   (pcase body-type
     ('binary
      (courier--request-body-state
@@ -3929,7 +3957,9 @@ REGEXP must place the editable string contents in capture group 1."
       (list (car bounds) (cdr bounds) courier--post-response-var-sources))))
 
 (defun courier--tests-line-bounds ()
-  "Return editable bounds for the current tests line, or nil for comments."
+  "Return editable bounds for the current assertion line.
+
+Return nil for comments."
   (when (eq (courier--request-current-section) 'tests)
     (let ((start (save-excursion
                    (back-to-indentation)
@@ -3940,7 +3970,7 @@ REGEXP must place the editable string contents in capture group 1."
         (cons start end)))))
 
 (defun courier--tests-dsl-capf ()
-  "Return completion data for tests section assertion lines."
+  "Return completion data for assertion lines in the current test section."
   (when-let* ((bounds (courier--tests-line-bounds)))
     (list (car bounds) (cdr bounds) courier--tests-dsl-completions)))
 
@@ -4006,7 +4036,7 @@ REGEXP must place the editable string contents in capture group 1."
   (replace-regexp-in-string "\n*\\'" "" (or string "")))
 
 (defun courier--comment-only-section-p (text)
-  "Return non-nil when TEXT only contains comments or blank lines."
+  "Return non-nil when TEXT consists only of comments or blank lines."
   (cl-every
    (lambda (line)
      (let ((trimmed (string-trim line)))
@@ -4053,7 +4083,7 @@ REGEXP must place the editable string contents in capture group 1."
     (plist-get request :auth)))
 
 (defun courier--parse-request-tests-lines (text)
-  "Parse tests section TEXT into a list of Courier test expressions."
+  "Parse TEXT from the current test section into Courier test expressions."
   (let* ((trimmed (string-trim (or text "")))
          (request (when (and (not (string-empty-p trimmed))
                              (not (courier--comment-only-section-p trimmed))
@@ -4538,17 +4568,17 @@ START defaults to the current buffer directory."
   (file-name-as-directory (expand-file-name courier-home-directory)))
 
 (defun courier--collections-directory ()
-  "Return the directory under Courier home that stores collections."
+  "Return the directory under Courier home for collections."
   (expand-file-name courier--collections-directory-name
                     (courier--home-directory)))
 
 (defun courier--specs-directory ()
-  "Return the directory under Courier home that stores copied API specs."
+  "Return the directory under Courier home for copied API specs."
   (expand-file-name courier--specs-directory-name
                     (courier--home-directory)))
 
 (defun courier--runtime-vars-root ()
-  "Return the directory under Courier home that stores runtime variables."
+  "Return the directory under Courier home for runtime variables."
   (expand-file-name courier--runtime-vars-directory-name
                     (expand-file-name courier--state-directory-name
                                       (courier--home-directory))))
@@ -5157,7 +5187,7 @@ Return a plist containing at least `:collection-root' and `:spec-path'."
     (expand-file-name file-name request-root)))
 
 (defun courier--write-request-name (buffer name)
-  "Ensure BUFFER contains Courier request NAME in its active model."
+  "Ensure BUFFER has Courier request NAME in its active model."
   (with-current-buffer buffer
     (if courier--request-model
         (progn
@@ -5819,7 +5849,7 @@ Entries are read from the configured env directory only."
           (cons (match-beginning 1) (match-end 1)))))))
 
 (defun courier--after-change-refresh-method-overlay (&rest _args)
-  "Refresh the Courier request method overlay after buffer changes."
+  "Refresh the Courier request method overlay."
   (when (derived-mode-p 'courier-request-mode)
     (courier--refresh-method-overlay)))
 
@@ -6037,7 +6067,7 @@ Signal `user-error' when the current request line has no URL."
 
 ;;;###autoload
 (defun courier-request-params-cancel ()
-  "Close the current Courier params editor without applying changes."
+  "Close the current Courier params editor without applying edits."
   (interactive)
   (unless (derived-mode-p 'courier-request-params-mode)
     (user-error "Not in a Courier params editor"))
@@ -6230,7 +6260,7 @@ Signal `user-error' when the current request line has no URL."
       (message "Courier attached %s." (file-name-nondirectory absolute-path)))))
 
 (defun courier--read-response-var-rule ()
-  "Read one response var rule from minibuffer prompts."
+  "Read a response var rule from the minibuffer."
   (let* ((source (completing-read "Response var source: "
                                   courier--post-response-var-sources
                                   nil t nil nil "json"))
@@ -6591,10 +6621,10 @@ This renames the request file and updates its front matter name."
 (transient-define-prefix courier-response-menu ()
   "Show response actions for the current Courier buffer."
   [["View"
-    ("r" "Response" (lambda () (interactive) (courier--set-response-tab 'response)))
-    ("h" "Headers" (lambda () (interactive) (courier--set-response-tab 'headers)))
-    ("t" "Timeline" (lambda () (interactive) (courier--set-response-tab 'timeline)))
-    ("T" "Tests" (lambda () (interactive) (courier--set-response-tab 'tests)))
+    ("r" "Response" courier-response-view-response)
+    ("h" "Headers" courier-response-view-headers)
+    ("t" "Timeline" courier-response-view-timeline)
+    ("T" "Tests" courier-response-view-tests)
     ("j" "Jump view" courier-response-jump-tab)]
    ["Body"
     ("v" "Body view" courier-response-set-view)
