@@ -1053,6 +1053,14 @@ skipping."
    (courier-expand-template "token={{missing}}" '(("present" . "1")))
    :type 'user-error))
 
+(ert-deftest courier-expand-ignores-unreferenced-bad-variable ()
+  (should
+   (equal (courier-expand-template
+           "https://example.com/{{good}}"
+           '(("good" . "ok")
+             ("bad" . "{{missing}}")))
+          "https://example.com/ok")))
+
 (ert-deftest courier-expand-errors-on-circular-variable ()
   (should-error
    (courier-expand-template "{{a}}" '(("a" . "{{b}}") ("b" . "{{a}}")))
@@ -2212,6 +2220,24 @@ skipping."
     (should (equal (plist-get resolved :headers)
                    '(("authorization" . "Bearer request-token"))))))
 
+(ert-deftest courier-resolve-request-ignores-unused-bad-env-vars ()
+  (let* ((request (list :path "/tmp/demo.http"
+                        :name "Demo"
+                        :method "GET"
+                        :url "https://example.com/{{user_id}}"
+                        :headers '(("accept" . "application/json"))
+                        :body ""
+                        :vars nil
+                        :tests nil
+                        :settings nil))
+         (resolved (courier-resolve-request
+                    request
+                    '(("user_id" . "42")
+                      ("last_url" . "https://example.com/{{missing}}")))))
+    (should (equal (plist-get resolved :url) "https://example.com/42"))
+    (should (equal (plist-get resolved :headers)
+                   '(("accept" . "application/json"))))))
+
 (ert-deftest courier-resolved-current-request-uses-runtime-and-pre-request-vars ()
   (courier-test--with-temp-dir (root)
     (let* ((courier-home-directory root)
@@ -3217,6 +3243,32 @@ skipping."
     (let ((line (substring-no-properties
                  (courier--request-header-line-format))))
       (should (string-match-p "\\` Section: Body: XML" line)))))
+
+(ert-deftest courier-request-mode-resets-state-when-buffer-visits-new-file ()
+  (with-temp-buffer
+    (setq-local buffer-file-name "/tmp/first.http")
+    (insert (courier-test--http-content
+             :url "https://example.com/anything?tool={{tool}}"
+             :vars '(("tool" . "courier"))))
+    (courier-request-mode)
+    (should (equal (plist-get courier--request-model :vars)
+                   '(("tool" . "courier"))))
+    (let ((inhibit-read-only t))
+      (erase-buffer)
+      (insert (courier-test--http-content
+               :name "Response PDF"
+               :url "https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf"
+               :tests '("status == 200")))
+      (setq-local buffer-file-name "/tmp/second.http")
+      (courier-request-mode))
+    (let ((resolved (courier--resolved-current-request)))
+      (should (equal (plist-get courier--request-model :url)
+                     "https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf"))
+      (should-not (plist-get courier--request-model :vars))
+      (should (equal (plist-get courier--request-model :tests)
+                     '("status == 200")))
+      (should (equal (plist-get resolved :url)
+                     "https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf")))))
 
 (ert-deftest courier-dispatch-routes-request-mode ()
   (courier-test--with-request

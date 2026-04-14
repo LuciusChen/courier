@@ -1301,12 +1301,10 @@ When RELAXED is non-nil, allow incomplete draft request lines."
 ;;;###autoload
 (defun courier-expand-template (string vars)
   "Expand placeholders in STRING using VARS."
-  (let ((resolved-vars (courier--resolve-vars vars)))
-    (courier--expand-string
-     string
-     (lambda (name)
-       (or (cdr (assoc-string name resolved-vars nil))
-           (user-error "Unresolved variable: %s" name))))))
+  (courier--expand-string
+   string
+   (lambda (name)
+     (courier--resolve-var name vars nil 0))))
 
 (defun courier--request-body-type (request)
   "Return the effective body type for REQUEST."
@@ -1485,7 +1483,7 @@ Signal `user-error' when RESPONSE does not contain a valid token payload."
 (defun courier-resolve-request (request &optional env-vars)
   "Resolve variables in REQUEST with optional ENV-VARS and return a new plist."
   (let* ((vars (courier-merge-vars env-vars (plist-get request :vars)))
-         (resolved-vars (courier--resolve-vars vars))
+         (resolved-vars (copy-tree vars t))
          (resolved (copy-sequence request))
          (body-type (courier--request-body-type request))
          (resolved-params
@@ -3793,6 +3791,15 @@ request URL query string."
   "Return editable TOML fragment for REQUEST auth."
   (string-join (courier--serialize-front-matter-auth-sections request) "\n\n"))
 
+(defun courier--reset-request-buffer-state-for-path (path)
+  "Reset request-local editor state when visiting a new request PATH."
+  (unless (equal courier--request-path path)
+    (setq-local courier--request-model nil)
+    (setq-local courier--request-tab nil)
+    (setq-local courier--request-content-start nil)
+    (setq-local courier--active-env nil)
+    (setq-local courier--collection-root-hint nil)))
+
 (defun courier--request-tests-lines (request)
   "Return editable TOML fragment for REQUEST test rules."
   (let ((tests-request (courier--empty-request)))
@@ -6080,6 +6087,9 @@ Signal `user-error' when the current request line has no URL."
 ;;;###autoload
 (define-derived-mode courier-request-mode text-mode "Courier"
   "Major mode for editing Courier request files."
+  (let ((current-path (and buffer-file-name (expand-file-name buffer-file-name))))
+    (courier--reset-request-buffer-state-for-path current-path)
+    (setq-local courier--request-path current-path))
   (setq-local mode-name '(:eval (courier--mode-line-lighter)))
   (setq-local font-lock-defaults '(courier-request-font-lock-keywords))
   (setq-local header-line-format '(:eval (courier--request-header-line-format)))
@@ -6089,7 +6099,6 @@ Signal `user-error' when the current request line has no URL."
   (add-hook 'completion-at-point-functions #'courier--tests-dsl-capf nil t)
   (add-hook 'completion-at-point-functions #'courier--post-response-var-from-capf nil t)
   (add-hook 'completion-at-point-functions #'courier--content-type-capf nil t)
-  (setq-local courier--request-path (and buffer-file-name (expand-file-name buffer-file-name)))
   (setq-local courier--collection-root-hint
               (or courier--collection-root-hint
                   (courier--collection-root)))
