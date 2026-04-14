@@ -3363,8 +3363,10 @@ skipping."
     (should (string-match-p "^# Pre-request Script$" (buffer-string)))
     (should (string-match-p "^# Post-response Script$" (buffer-string)))
     (courier-request-jump-section 'tests)
-    (should (string-match-p "^# Test Assertions$" (buffer-string)))
-    (should (string-match-p "^# status == 200$" (buffer-string)))))
+    (should (string-match-p "^# tests = \\[$" (buffer-string)))
+    (should (string-match-p "^#   \"status == 200\",$" (buffer-string)))
+    (should (string-match-p "^#   \"header content-type contains json\",$"
+                            (buffer-string)))))
 
 (ert-deftest courier-request-render-establishes-content-start-marker ()
   (courier-test--with-request
@@ -3681,7 +3683,7 @@ skipping."
     (courier-request-mode)
     (courier-request-jump-section 'tests)
     (goto-char (point-min))
-    (search-forward "status")
+    (search-forward "\"status")
     (let ((capf (run-hook-with-args-until-success 'completion-at-point-functions)))
       (should capf)
       (should (member "status == 200" (all-completions "" (nth 2 capf))))
@@ -3714,7 +3716,7 @@ skipping."
     (should (equal (plist-get courier--request-model :post-response-script)
                    "(message \"after\")"))))
 
-(ert-deftest courier-request-tests-section-round-trips-plain-lines ()
+(ert-deftest courier-request-tests-section-round-trips-toml-fragment ()
   (courier-test--with-request
       (courier-test--http-content
        :method "GET"
@@ -3722,8 +3724,9 @@ skipping."
        :tests '("status == 200" "body contains hello"))
     (courier-request-mode)
     (courier-request-jump-section 'tests)
-    (should (string-match-p "^status == 200$" (buffer-string)))
-    (should (string-match-p "^body contains hello$" (buffer-string)))
+    (should (string-match-p "^tests = \\[$" (buffer-string)))
+    (should (string-match-p "^  \"status == 200\",$" (buffer-string)))
+    (should (string-match-p "^  \"body contains hello\",$" (buffer-string)))
     (courier--sync-request-model)
     (should (equal (plist-get courier--request-model :tests)
                    '("status == 200" "body contains hello")))

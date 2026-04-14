@@ -3766,10 +3766,10 @@ The return value is one of:
              "# (message \"after response\")\n"
              "# \"\"\"\n"))
     ('tests
-     (concat "# Test Assertions\n"
-             "# status == 200\n"
-             "# header content-type contains json\n"
-             "# size < 102400\n"))
+     (concat "# tests = [\n"
+             "#   \"status == 200\",\n"
+             "#   \"header content-type contains json\",\n"
+             "# ]\n"))
     (_ "")))
 
 (defun courier--format-request-kv-lines (pairs)
@@ -3794,8 +3794,12 @@ request URL query string."
   (string-join (courier--serialize-front-matter-auth-sections request) "\n\n"))
 
 (defun courier--request-tests-lines (request)
-  "Return editable plain-text assertions for REQUEST."
-  (string-join (or (plist-get request :tests) nil) "\n"))
+  "Return editable TOML fragment for REQUEST test rules."
+  (let ((tests-request (courier--empty-request)))
+    (plist-put tests-request :tests (plist-get request :tests))
+    (string-join
+     (courier--serialize-front-matter-root-sections tests-request)
+     "\n\n")))
 
 (defun courier--request-body-toml-fragment (request keys)
   "Return TOML fragment for body-related KEYS of REQUEST."
@@ -3956,23 +3960,12 @@ REGEXP must place the editable string contents in capture group 1."
                          "^[ \t#]*from[ \t]*=[ \t]*\"\\([^\"]*\\)\"?")))
       (list (car bounds) (cdr bounds) courier--post-response-var-sources))))
 
-(defun courier--tests-line-bounds ()
-  "Return editable bounds for the current assertion line.
-
-Return nil for comments."
-  (when (eq (courier--request-current-section) 'tests)
-    (let ((start (save-excursion
-                   (back-to-indentation)
-                   (point)))
-          (end (line-end-position)))
-      (unless (string-prefix-p "#"
-                               (buffer-substring-no-properties start end))
-        (cons start end)))))
-
 (defun courier--tests-dsl-capf ()
-  "Return completion data for assertion lines in the current test section."
-  (when-let* ((bounds (courier--tests-line-bounds)))
-    (list (car bounds) (cdr bounds) courier--tests-dsl-completions)))
+  "Return completion data for test DSL strings in the current test section."
+  (when (eq (courier--request-current-section) 'tests)
+    (when-let* ((bounds (courier--capf-quoted-value-bounds
+                         "^[ \t#]*\"\\([^\"]*\\)\"?\\(?:,[ \t]*\\)?$")))
+      (list (car bounds) (cdr bounds) courier--tests-dsl-completions))))
 
 (defun courier--ensure-request-layout ()
   "Ensure the current Courier request buffer has layout markers."
@@ -4083,27 +4076,14 @@ Return nil for comments."
     (plist-get request :auth)))
 
 (defun courier--parse-request-tests-lines (text)
-  "Parse TEXT from the current test section into Courier test expressions."
+  "Parse test section TEXT into Courier test expressions."
   (let* ((trimmed (string-trim (or text "")))
-         (request (when (and (not (string-empty-p trimmed))
-                             (not (courier--comment-only-section-p trimmed))
-                             (string-match-p "\\`tests\\s-*=" trimmed))
+         (request (if (or (string-empty-p trimmed)
+                          (courier--comment-only-section-p trimmed))
+                      (courier--empty-request)
                     (courier--parse-front-matter trimmed 1
                                                  (courier--empty-request)))))
-    (cond
-     ((or (string-empty-p trimmed)
-          (courier--comment-only-section-p trimmed))
-      nil)
-     (request
-      (plist-get request :tests))
-     (t
-      (let (tests)
-        (dolist (line (split-string trimmed "\n"))
-          (let ((assertion (string-trim line)))
-            (unless (or (string-empty-p assertion)
-                        (string-prefix-p "#" assertion))
-              (push assertion tests))))
-        (nreverse tests))))))
+    (plist-get request :tests)))
 
 (defun courier--request-vars-lines (request)
   "Return editable TOML fragment for REQUEST vars."

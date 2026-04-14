@@ -436,15 +436,13 @@ jump target into raw source text, and the current section is indicated in the
 line always shows the effective URL, including query params edited through the
 structured params view.
 
-=Authentication= is edited as a TOML-backed fragment. =Variables= and =Scripts=
-stay TOML-backed too, but the request editor adds comment headings so request,
-pre-request, and post-response groups are easier to scan while still saving
-back to the same front matter tables. =Tests= stays text-first: edit one
-assertion per line in the section view, and Courier serializes those lines back
-into the front matter =tests = [...]= array on save. =Variables= keeps one
-small scaffold command in the request action menu for appending
-=[[vars.post_response]]= blocks; =Tests= relies on =completion-at-point=
-instead of a form-like insert command.
+=Authentication= is edited as a TOML-backed fragment. =Variables=, =Scripts=,
+and =Tests= stay TOML-backed too, with the request editor adding comment
+headings where that improves scanability. =Tests= now edits the same
+=tests = [...]= fragment shape that Courier writes to front matter, while
+=completion-at-point= still offers common assertion snippets inside the quoted
+test strings. =Variables= keeps one small scaffold command in the request
+action menu for appending =[[vars.post_response]]= blocks.
 =C-c C-t= only applies where a section has a concrete action:
 =Body= changes body type, =Authentication= changes auth type, and =Variables= appends a
 =[[vars.post_response]]= rule. In =Tests= it points you back to
