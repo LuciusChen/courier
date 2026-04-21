@@ -240,6 +240,16 @@ skipping."
       (ert-fail "Timed out waiting for Courier integration request"))
     response))
 
+(defun courier-test--send-current-request-and-capture-response-buffer ()
+  "Send the current request buffer and return the displayed response buffer."
+  (let (response-buffer)
+    (cl-letf (((symbol-function 'display-buffer)
+               (lambda (buffer &rest _args)
+                 (setq response-buffer buffer)
+                 buffer)))
+      (courier-request-send))
+    response-buffer))
+
 (defun courier-test--argv-flag-value (argv flag)
   "Return the value immediately after FLAG in ARGV."
   (when-let* ((position (cl-position flag argv :test #'string=)))
@@ -1167,16 +1177,23 @@ skipping."
       (should (equal (car (last argv)) "https://example.com")))))
 
 (ert-deftest courier-build-curl-command-post-with-body ()
-  (courier-test--with-temp-files ((header ".headers") (body ".body") (meta ".meta"))
+  (courier-test--with-temp-files ((header ".headers")
+                                  (body ".body")
+                                  (request-body ".request-body")
+                                  (meta ".meta"))
     (let ((argv (courier-build-curl-command
                  '(:method "POST"
                    :url "https://example.com"
                    :headers nil
                    :body "{\"a\":1}"
                    :settings nil)
-                 header body meta)))
+                 header body meta request-body)))
+      (should (string= (courier-test--argv-flag-value argv "-o") body))
       (should (string= (courier-test--argv-flag-value argv "--data-binary")
-                       (format "@%s" body))))))
+                       (format "@%s" request-body)))
+      (with-temp-buffer
+        (insert-file-contents request-body)
+        (should (equal (buffer-string) "{\"a\":1}"))))))
 
 (ert-deftest courier-build-curl-command-includes-timeout ()
   (courier-test--with-temp-files ((header ".headers") (body ".body") (meta ".meta"))
@@ -1473,6 +1490,67 @@ skipping."
                    (length "courier-binary-payload")))
         (should (equal (courier-test--json-get payload "body_sha256")
                        (secure-hash 'sha256 "courier-binary-payload")))))))
+
+(ert-deftest courier-integration-transport-error-does-not-reuse-request-body ()
+  (courier-test--with-integration-server (server)
+    (let* ((cipher-body "{\"cipher\":\"courier-test\"}")
+           (response
+            (courier-test--send-sync
+             (list :path "/tmp/transport-error.http"
+                   :name "Transport Error"
+                   :method "POST"
+                   :url (format "https://127.0.0.1:%d/echo"
+                                (plist-get server :port))
+                   :headers (list (cons "content-type" "application/json"))
+                   :body cipher-body
+                   :body-type 'json
+                   :params nil
+                   :vars nil
+                   :tests nil
+                   :settings '(:timeout 5))))
+           (body-file (plist-get response :body-file)))
+      (should (/= (plist-get response :exit-code) 0))
+      (should (= (plist-get response :status-code) 0))
+      (should (file-exists-p body-file))
+      (should (= (file-attribute-size (file-attributes body-file)) 0))
+      (should-not (plist-get response :body-text)))))
+
+(ert-deftest courier-integration-response-processing-errors-surface ()
+  (courier-test--with-integration-server (server)
+    (let (done response process)
+      (unwind-protect
+          (progn
+            (setq process
+                  (courier-send-request
+                   (courier-resolve-request
+                    (list :path "/tmp/response-processing-error.http"
+                          :name "Response Processing Error"
+                          :method "GET"
+                          :url (concat (plist-get server :base-url) "/html")
+                          :headers nil
+                          :body nil
+                          :body-type 'none
+                          :params nil
+                          :vars nil
+                          :tests nil
+                          :post-response-vars
+                          '((:name "trace_id" :from header :expr "x-trace-id"))
+                          :settings '(:timeout 5))
+                    nil)
+                   (lambda (value)
+                     (setq response value
+                           done t))))
+            (should (courier-test--wait-until (lambda () done) 2.0 process))
+            (should (equal (plist-get response :reason)
+                           "Response Processing Error"))
+            (should (= (plist-get response :status-code) 200))
+            (should (eq (courier--response-status-face response)
+                        'courier-response-status-error-face))
+            (should (string-match-p
+                     "Response processing error: Response header x-trace-id not found"
+                     (courier--format-body response))))
+        (when (and process (process-live-p process))
+          (delete-process process))))))
 
 (ert-deftest courier-integration-oauth2-client-credentials-round-trips ()
   (courier-test--with-integration-server (server)
@@ -1902,6 +1980,16 @@ skipping."
                                             '(:path "/tmp/test.http" :tests nil))))
       (should (= (plist-get response :exit-code) 7))
       (should (string-match-p "could not connect" (plist-get response :stderr))))))
+
+(ert-deftest courier-parse-response-transport-error-with-empty-write-out-fields ()
+  (courier-test--with-temp-files ((header ".headers") (body ".body") (meta ".meta"))
+    (with-temp-file meta
+      (insert "\n\n0.001\n"))
+    (let ((response (courier-parse-response header body meta "curl: tls error" 35
+                                            '(:path "/tmp/test.http" :tests nil))))
+      (should (= (plist-get response :status-code) 0))
+      (should (= (plist-get response :duration-ms) 1))
+      (should (= (plist-get response :exit-code) 35)))))
 
 (ert-deftest courier-parse-response-empty-header-file ()
   (courier-test--with-temp-files ((header ".headers") (body ".body") (meta ".meta"))
@@ -2385,6 +2473,77 @@ skipping."
       (should (equal (courier--read-runtime-vars collection-root nil)
                      '(("token" . "abc123")))))))
 
+(ert-deftest courier-post-response-vars-skip-unsuccessful-responses ()
+  (courier-test--with-temp-dir (root)
+    (let* ((courier-home-directory root)
+           (collection-root (expand-file-name "collections/api-collection" root))
+           (request-dir (expand-file-name "requests" collection-root))
+           (request-file (expand-file-name "login.http" request-dir))
+           request
+           response
+           result)
+      (make-directory request-dir t)
+      (with-temp-file (expand-file-name "courier.json" collection-root)
+        (insert "{\n  \"name\": \"API Collection\"\n}\n"))
+      (with-temp-file request-file
+        (insert "+++\n"
+                "[[vars.post_response]]\n"
+                "name = \"token\"\n"
+                "from = \"json\"\n"
+                "expr = \"$.token\"\n"
+                "+++\n\n"
+                "POST https://example.com/login\n"))
+      (setq request (courier-parse-file request-file))
+      (setq request (plist-put request :path request-file))
+      (setq response (courier-test--response
+                      :status-code 401
+                      :reason "Unauthorized"
+                      :content-type "application/json"
+                      :body-text "{\"token\":\"bad-token\"}"
+                      :exit-code 0))
+      (setq result (courier--apply-post-response-vars request response nil))
+      (should-not (plist-get result :post-response-vars))
+      (should-not (courier--read-runtime-vars collection-root nil)))))
+
+(ert-deftest courier-runtime-vars-use-distinct-paths-for-same-name-collections ()
+  (courier-test--with-temp-dir (root)
+    (let* ((courier-home-directory root)
+           (collection-a (expand-file-name "collections/alpha" root))
+           (collection-b (expand-file-name "collections/beta" root))
+           (config-a (expand-file-name "courier.json" collection-a))
+           (config-b (expand-file-name "courier.json" collection-b)))
+      (make-directory collection-a t)
+      (make-directory collection-b t)
+      (with-temp-file config-a
+        (insert "{\n  \"name\": \"Shared Name\"\n}\n"))
+      (with-temp-file config-b
+        (insert "{\n  \"name\": \"Shared Name\"\n}\n"))
+      (courier--write-runtime-vars collection-a "local" '(("token" . "alpha-token")))
+      (courier--write-runtime-vars collection-b "local" '(("token" . "beta-token")))
+      (should-not (equal (courier--runtime-vars-directory collection-a)
+                         (courier--runtime-vars-directory collection-b)))
+      (should (equal (courier--read-runtime-vars collection-a "local")
+                     '(("token" . "alpha-token"))))
+      (should (equal (courier--read-runtime-vars collection-b "local")
+                     '(("token" . "beta-token")))))))
+
+(ert-deftest courier-runtime-vars-round-trip-multiline-values ()
+  (courier-test--with-temp-dir (root)
+    (let* ((courier-home-directory root)
+           (collection-root (expand-file-name "collections/api-collection" root))
+           (config-path (expand-file-name "courier.json" collection-root)))
+      (make-directory collection-root t)
+      (with-temp-file config-path
+        (insert "{\n  \"name\": \"API Collection\"\n}\n"))
+      (courier--write-runtime-vars
+       collection-root
+       "local"
+       '(("note" . "line one\nline two")
+         ("token" . "alpha-token")))
+      (should (equal (courier--read-runtime-vars collection-root "local")
+                     '(("note" . "line one\nline two")
+                       ("token" . "alpha-token")))))))
+
 ;; Response formatting tests.
 
 (ert-deftest courier-format-body-pretty-prints-json ()
@@ -2412,6 +2571,65 @@ skipping."
                  '(:content-type "text/plain"
                    :body-text "{\"foo\":1}"))))
       (should (equal body "{\"foo\":1}\n")))))
+
+(ert-deftest courier-format-body-surfaces-request-errors ()
+  (courier-test--with-temp-files ((body ".body"))
+    (with-temp-file body
+      (insert ""))
+    (with-temp-buffer
+      (let ((rendered
+             (courier--format-body
+              `(:status-code 0
+                :reason ""
+                :headers nil
+                :duration-ms 89
+                :size 0
+                :body-file ,body
+                :body-text nil
+                :content-type nil
+                :stderr "curl: (7) Failed to connect to localhost port 8080 after 0 ms: Couldn't connect to server\n\nProcess courier-curl stderr finished\n"
+                :exit-code 7))))
+        (should (string-match-p
+                 "Request error: Failed to connect to localhost port 8080"
+                 rendered))
+        (should-not (string-match-p
+                     "Process courier-curl stderr finished"
+                     rendered))))))
+
+(ert-deftest courier-format-body-explains-https-to-http-mismatch ()
+  (courier-test--with-temp-files ((body ".body"))
+    (with-temp-file body
+      (insert ""))
+    (with-temp-buffer
+      (let ((rendered
+             (courier--format-body
+              `(:status-code 0
+                :reason ""
+                :headers nil
+                :duration-ms 89
+                :size 0
+                :body-file ,body
+                :body-text nil
+                :content-type nil
+                :stderr "curl: (35) LibreSSL/3.3.6: error:1404B42E:SSL routines:ST_CONNECT:tlsv1 alert protocol version"
+                :exit-code 35))))
+        (should (string-match-p "TLS handshake failed" rendered))
+        (should (string-match-p "uses https:// but the target port only serves http://" rendered))))))
+
+(ert-deftest courier-format-body-surfaces-oauth2-token-errors ()
+  (with-temp-buffer
+    (let ((rendered
+           (courier--format-body
+            '(:status-code 200
+              :reason "OAuth2 Token Error"
+              :headers (("content-type" . "application/json"))
+              :content-type "application/json"
+              :body-text "{\"token_type\":\"bearer\"}"
+              :stderr "OAuth2 token response is missing access_token"
+              :exit-code 0))))
+      (should (string-match-p
+               "OAuth2 token error: OAuth2 token response is missing access_token"
+               rendered)))))
 
 (ert-deftest courier-insert-response-body-surfaces-image-render-errors ()
   (with-temp-buffer
@@ -2483,6 +2701,31 @@ skipping."
                   :size 5
                   :content-type "text/plain")))))
     (should (string-match-p "403 Forbidden" line))))
+
+(ert-deftest courier-response-header-line-labels-request-errors ()
+  (let ((line (substring-no-properties
+               (courier--response-summary-string
+                '(:status-code 0
+                  :reason ""
+                  :headers nil
+                  :duration-ms 89
+                  :size 0
+                  :content-type nil
+                  :stderr "curl: (7) Failed to connect to localhost port 8080 after 0 ms: Couldn't connect to server"
+                  :exit-code 7)))))
+    (should (string-match-p "Request Error  •  89ms  •  0B" line))
+    (should-not (string-match-p "\\`0\\b" line))))
+
+(ert-deftest courier-response-status-face-treats-local-errors-as-error ()
+  (should (eq (courier--response-status-face
+               '(:status-code 0 :reason "Parse Error" :exit-code 0))
+              'courier-response-status-error-face))
+  (should (eq (courier--response-status-face
+               '(:status-code 200 :reason "OAuth2 Token Error" :exit-code 0))
+              'courier-response-status-error-face))
+  (should (eq (courier--response-status-face
+               '(:status-code 200 :reason "Response Processing Error" :exit-code 0))
+              'courier-response-status-error-face)))
 
 (ert-deftest courier-response-open-body-opens-viewer-buffer ()
   (with-temp-buffer
@@ -2980,6 +3223,77 @@ skipping."
       (should (= (plist-get (cdr (nth 0 courier--history)) :status-code) 204))
       (should (= (plist-get (cdr (nth 2 courier--history)) :status-code) 202)))))
 
+(ert-deftest courier-history-trim-deletes-dropped-body-files ()
+  (courier-test--with-temp-files ((body-a ".body") (body-b ".body"))
+    (with-temp-file body-a
+      (insert "old"))
+    (with-temp-file body-b
+      (insert "new"))
+    (let ((courier-history-max 1))
+      (with-temp-buffer
+        (courier--render-response
+         `(:status-code 200
+           :reason "OK"
+           :headers (("content-type" . "text/plain"))
+           :duration-ms 10
+           :size 3
+           :body-file ,body-a
+           :content-type "text/plain"
+           :tests nil
+           :stderr ""
+           :exit-code 0)
+         courier-test--request)
+        (should (file-exists-p body-a))
+        (courier--render-response
+         `(:status-code 201
+           :reason "Created"
+           :headers (("content-type" . "text/plain"))
+           :duration-ms 11
+           :size 3
+           :body-file ,body-b
+           :content-type "text/plain"
+           :tests nil
+           :stderr ""
+           :exit-code 0)
+         courier-test--request)
+        (should-not (file-exists-p body-a))
+        (should (file-exists-p body-b))))))
+
+(ert-deftest courier-response-cleanup-deletes-history-body-files ()
+  (courier-test--with-temp-files ((body-a ".body") (body-b ".body"))
+    (with-temp-file body-a
+      (insert "one"))
+    (with-temp-file body-b
+      (insert "two"))
+    (with-temp-buffer
+      (courier--render-response
+       `(:status-code 200
+         :reason "OK"
+         :headers (("content-type" . "text/plain"))
+         :duration-ms 10
+         :size 3
+         :body-file ,body-a
+         :content-type "text/plain"
+         :tests nil
+         :stderr ""
+         :exit-code 0)
+       courier-test--request)
+      (courier--render-response
+       `(:status-code 201
+         :reason "Created"
+         :headers (("content-type" . "text/plain"))
+         :duration-ms 11
+         :size 3
+         :body-file ,body-b
+         :content-type "text/plain"
+         :tests nil
+         :stderr ""
+         :exit-code 0)
+       courier-test--request)
+      (courier--response-cleanup)
+      (should-not (file-exists-p body-a))
+      (should-not (file-exists-p body-b)))))
+
 (ert-deftest courier-available-env-entries-use-collection-env-dir ()
   (courier-test--with-temp-dir (root)
     (let* ((collection-root (expand-file-name "api-collection" root))
@@ -3308,6 +3622,68 @@ skipping."
               #'courier-request-section-type))
   (should-not (lookup-key courier-request-mode-map (kbd "C-c [")))
   (should-not (lookup-key courier-request-mode-map (kbd "C-c ]"))))
+
+(ert-deftest courier-request-send-surfaces-sync-parse-errors-in-response-buffer ()
+  (courier-test--with-request
+      (courier-test--http-content
+       :method "GET"
+       :url "https://example.com")
+    (courier-request-mode)
+    (courier-request-jump-section 'headers)
+    (let ((response-buffer nil)
+          (content-start (courier--request-content-start-position)))
+      (let ((inhibit-read-only t))
+        (delete-region content-start (point-max))
+        (goto-char content-start)
+        (insert "Bad Header"))
+      (setq response-buffer
+            (courier-test--send-current-request-and-capture-response-buffer))
+      (unwind-protect
+          (with-current-buffer response-buffer
+            (should (equal (plist-get courier--response :reason)
+                           "Request Preparation Error"))
+            (should (eq (courier--response-status-face courier--response)
+                        'courier-response-status-error-face))
+            (should (string-match-p
+                     "Request preparation error: Malformed header: Bad Header"
+                     (courier--format-body courier--response))))
+        (when (buffer-live-p response-buffer)
+          (kill-buffer response-buffer))))))
+
+(ert-deftest courier-request-send-surfaces-validation-errors-in-response-buffer ()
+  (courier-test--with-request
+      "GET \n"
+    (courier-request-mode)
+    (let ((response-buffer
+           (courier-test--send-current-request-and-capture-response-buffer)))
+      (unwind-protect
+          (with-current-buffer response-buffer
+            (should (equal (plist-get courier--response :reason)
+                           "Request Preparation Error"))
+            (should (string-match-p
+                     "Request preparation error: Request URL must be present"
+                     (courier--format-body courier--response))))
+        (when (buffer-live-p response-buffer)
+          (kill-buffer response-buffer))))))
+
+(ert-deftest courier-request-send-surfaces-pre-request-errors-in-response-buffer ()
+  (courier-test--with-request
+      (courier-test--http-content
+       :method "GET"
+       :url "https://example.com"
+       :pre-request-script "(error \"boom\")")
+    (courier-request-mode)
+    (let ((response-buffer
+           (courier-test--send-current-request-and-capture-response-buffer)))
+      (unwind-protect
+          (with-current-buffer response-buffer
+            (should (equal (plist-get courier--response :reason)
+                           "Request Preparation Error"))
+            (should (string-match-p
+                     "Request preparation error: Courier pre-request script failed: boom"
+                     (courier--format-body courier--response))))
+        (when (buffer-live-p response-buffer)
+          (kill-buffer response-buffer))))))
 
 (ert-deftest courier-request-section-type-routes-vars-to-response-var ()
   (courier-test--with-request

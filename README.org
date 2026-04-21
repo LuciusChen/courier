@@ -65,6 +65,9 @@ Accept: application/json
 #+end_src
 
 Open it in Emacs. Press =C-c C-c= to send.
+If Courier fails before =curl= starts, such as while syncing section edits,
+validating the request, or running a pre-request script, =C-c C-c= still opens
+the response buffer and shows a =Request Preparation Error= state.
 
 * Collections
 
@@ -422,6 +425,10 @@ current request name; =.http= is added automatically unless you typed it
 yourself.
 The request-line method token is highlighted with a lightweight overlay so
 =GET=/=POST=/etc. remain visually obvious while editing.
+Sending from request mode uses one response workflow for both send-time and
+pre-send failures: transport errors, response-processing errors, and request
+preparation errors all surface in the response buffer instead of splitting
+between a response window and transient echo-area errors.
 The request buffer uses a section view model with a status header line:
 
 #+begin_example
@@ -502,6 +509,9 @@ by the response status summary. Use =C-c C-j= to jump directly to a response
 view.
 Use =C-c ?= in request and response buffers to open a transient menu for the
 actions that make sense in the current Courier context.
+The response summary can therefore describe both remote and local failure
+states, including =Request Error=, =Request Preparation Error=, and
+=Response Processing Error=.
 
 * Response Buffer
 

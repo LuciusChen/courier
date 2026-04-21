@@ -1095,28 +1095,11 @@ When RELAXED is non-nil, allow incomplete draft request lines."
 ;;;###autoload
 (defun courier-parse-env-file (path)
   "Parse environment file at PATH and return an alist."
-  (with-temp-buffer
-    (insert-file-contents path)
-    (let (vars)
-      (while (not (eobp))
-        (let* ((line-number (line-number-at-pos))
-               (line (string-trim (buffer-substring-no-properties
-                                   (line-beginning-position)
-                                   (line-end-position)))))
-          (cond
-           ((or (string-empty-p line)
-                (string-prefix-p "#" line))
-            nil)
-           ((string-match courier--env-line-regexp line)
-            (setq vars
-                  (append vars
-                          (list (cons (match-string 1 line)
-                                      (string-trim (match-string 2 line)))))))
-           (t
-            (user-error "Parse error in %s on line %d: malformed env line"
-                        path line-number))))
-        (forward-line 1))
-      vars)))
+  (courier--read-env-like-file
+   path
+   (lambda (raw _path _line-number)
+     (string-trim raw))
+   "env"))
 
 ;;;###autoload
 (defun courier-merge-vars (env-vars request-vars)
@@ -1699,11 +1682,20 @@ Supported paths look like `$.foo.bar'."
      (user-error "Unsupported post-response var source: %s"
                  (plist-get rule :from)))))
 
+(defun courier--response-success-p (response)
+  "Return non-nil when RESPONSE completed successfully."
+  (let ((status (or (plist-get response :status-code) 0))
+        (exit-code (or (plist-get response :exit-code) 0)))
+    (and (= exit-code 0)
+         (>= status 200)
+         (< status 300))))
+
 (defun courier--apply-post-response-vars (request response env-name)
   "Apply post-response vars from REQUEST to RESPONSE for ENV-NAME.
 Return the updated RESPONSE plist."
   (let ((rules (plist-get request :post-response-vars)))
     (if (or (null rules)
+            (not (courier--response-success-p response))
             (null (plist-get request :path)))
         response
       (let* ((collection-root (courier--collection-root (plist-get request :path)))
@@ -1857,13 +1849,19 @@ surface to the request boundary."
   "Parse META-FILE and return a plist."
   (let* ((lines (with-temp-buffer
                   (insert-file-contents meta-file)
-                  (split-string (buffer-string) "\n" t)))
-         (status (if lines (string-to-number (nth 0 lines)) 0))
-         (size (if (> (length lines) 1)
-                   (truncate (string-to-number (nth 1 lines)))
+                  (split-string (buffer-string) "\n")))
+         (status-raw (or (nth 0 lines) ""))
+         (size-raw (or (nth 1 lines) ""))
+         (seconds-raw (or (nth 2 lines) ""))
+         (status (if (string-match-p "\\`[0-9]+\\'" status-raw)
+                     (string-to-number status-raw)
+                   0))
+         (size (if (string-match-p "\\`[0-9]+\\'" size-raw)
+                   (truncate (string-to-number size-raw))
                  0))
-         (seconds (if (> (length lines) 2)
-                      (string-to-number (nth 2 lines))
+         (seconds (if (string-match-p
+                       "\\`[0-9]+\\(?:\\.[0-9]+\\)?\\'" seconds-raw)
+                      (string-to-number seconds-raw)
                     0.0)))
     (list :status status
           :size size
@@ -1895,6 +1893,7 @@ surface to the request boundary."
   "Return Courier temp file paths for one request."
   (list :header (make-temp-file "courier-" nil ".headers")
         :body (make-temp-file "courier-" nil ".body")
+        :request-body (make-temp-file "courier-" nil ".request-body")
         :meta (make-temp-file "courier-" nil ".meta")
         :stdout (generate-new-buffer " *courier-stdout*")
         :stderr (generate-new-buffer " *courier-stderr*")))
@@ -1905,9 +1904,13 @@ surface to the request boundary."
     (delete-file path)))
 
 ;;;###autoload
-(defun courier-build-curl-command (resolved-request header-file body-file meta-file)
+(defun courier-build-curl-command (resolved-request header-file body-file meta-file
+                                                    &optional request-body-file)
   "Build curl argv for RESOLVED-REQUEST.
-Use HEADER-FILE, BODY-FILE, and META-FILE for curl output."
+Use HEADER-FILE, BODY-FILE, and META-FILE for curl output.
+
+When REQUEST-BODY-FILE is non-nil, stage non-binary request bodies there so
+transport failures do not leave the outgoing payload in BODY-FILE."
   (with-temp-file meta-file
     (insert courier--write-out-template))
   (let* ((settings (plist-get resolved-request :settings))
@@ -1953,10 +1956,12 @@ Use HEADER-FILE, BODY-FILE, and META-FILE for curl output."
       (_
        (when-let* ((body (plist-get resolved-request :body)))
          (unless (string-empty-p body)
-           (with-temp-file body-file
+           (with-temp-file (or request-body-file body-file)
              (insert body))
            (setq command
-                 (append command (list "--data-binary" (format "@%s" body-file))))))))
+                 (append command
+                         (list "--data-binary"
+                               (format "@%s" (or request-body-file body-file)))))))))
     (append command (list (plist-get resolved-request :url)))))
 
 ;;;###autoload
@@ -2057,6 +2062,32 @@ Use BODY-FILE, EXIT-CODE, COMMAND, and ERR for error context."
         :tests nil
         :command (plist-get token-response :command)))
 
+(defun courier--response-processing-error-response (response command err)
+  "Return RESPONSE annotated with a local processing error from ERR.
+COMMAND becomes the recorded curl command for the returned response."
+  (let ((updated (copy-tree response t)))
+    (plist-put updated :reason "Response Processing Error")
+    (plist-put updated :stderr (error-message-string err))
+    (plist-put updated :tests nil)
+    (plist-put updated :command command)))
+
+(defun courier--request-preparation-error-response (request err)
+  "Return a response plist for REQUEST preparation failure ERR."
+  (list :request-path (plist-get request :path)
+        :status-code 0
+        :reason "Request Preparation Error"
+        :headers nil
+        :content-type nil
+        :charset nil
+        :duration-ms 0
+        :size 0
+        :body-file nil
+        :body-text nil
+        :stderr (error-message-string err)
+        :exit-code 0
+        :tests nil
+        :command nil))
+
 (defun courier--finish-request (process _event)
   "Finish Courier PROCESS after _EVENT."
   (unless (process-live-p process)
@@ -2088,25 +2119,37 @@ Use BODY-FILE, EXIT-CODE, COMMAND, and ERR for error context."
                        request)
                     (error
                      (courier--request-error-response
-                      request body-file exit-code command err))))
+                     request body-file exit-code command err))))
             (courier--apply-response-fallbacks
              response
              (process-get process 'courier-start-time))
-            (setq response
-                  (courier--apply-post-response-vars
-                   request
-                   response
-                   (plist-get request :env-name)))
-            (setq response
-                  (courier--run-post-response-script
-                   request
-                   response
-                   (plist-get request :env-vars)))
-            (plist-put response :tests
-                       (courier-run-tests response (plist-get request :tests)))
-            (plist-put response :command command)
+            (condition-case err
+                (progn
+                  (setq response
+                        (courier--apply-post-response-vars
+                         request
+                         response
+                         (plist-get request :env-name)))
+                  (setq response
+                        (courier--run-post-response-script
+                         request
+                         response
+                         (plist-get request :env-vars)))
+                  (plist-put response :tests
+                             (courier-run-tests
+                              response
+                              (plist-get request :tests)))
+                  (plist-put response :command command))
+              (error
+               (setq response
+                     (courier--response-processing-error-response
+                      response command err))))
             (when callback
               (funcall callback response)))
+        (courier--delete-temp-path header-file)
+        (courier--delete-temp-path meta-file)
+        (courier--delete-temp-path
+         (process-get process 'courier-request-body-file))
         (when (buffer-live-p stdout-buffer)
           (kill-buffer stdout-buffer))
         (when (buffer-live-p stderr-buffer)
@@ -2117,11 +2160,16 @@ Use BODY-FILE, EXIT-CODE, COMMAND, and ERR for error context."
   (let* ((temps (courier--temp-files-for-request))
          (header-file (plist-get temps :header))
          (body-file (plist-get temps :body))
+         (request-body-file (plist-get temps :request-body))
          (meta-file (plist-get temps :meta))
          (stdout-buffer (plist-get temps :stdout))
          (stderr-buffer (plist-get temps :stderr))
          (command (courier-build-curl-command
-                   resolved-request header-file body-file meta-file))
+                   resolved-request
+                   header-file
+                   body-file
+                   meta-file
+                   request-body-file))
          (process (make-process :name "courier-curl"
                                 :buffer stdout-buffer
                                 :command command
@@ -2133,6 +2181,7 @@ Use BODY-FILE, EXIT-CODE, COMMAND, and ERR for error context."
     (process-put process 'courier-command command)
     (process-put process 'courier-header-file header-file)
     (process-put process 'courier-body-file body-file)
+    (process-put process 'courier-request-body-file request-body-file)
     (process-put process 'courier-meta-file meta-file)
     (process-put process 'courier-temp-files (list header-file body-file meta-file))
     (process-put process 'courier-stdout-buffer stdout-buffer)
@@ -2206,6 +2255,7 @@ REQUEST becomes the active request associated with TO-PROCESS."
     (delete-process process))
   (dolist (path (process-get process 'courier-temp-files))
     (courier--delete-temp-path path))
+  (courier--delete-temp-path (process-get process 'courier-request-body-file))
   (when-let* ((buffer (process-get process 'courier-response-buffer)))
     (when (buffer-live-p buffer)
       (with-current-buffer buffer
@@ -2399,13 +2449,75 @@ Each entry is a cons cell of the form `(TIMESTAMP . RESPONSE)'.")
            ""))
       "(empty)\n")))
 
+(defun courier--response-display-stderr (response)
+  "Return RESPONSE stderr trimmed for user-facing display."
+  (let ((stderr (string-trim (or (plist-get response :stderr) ""))))
+    (setq stderr
+          (replace-regexp-in-string
+           "\n*Process [^\n]+ stderr finished\\'" ""
+           stderr))
+    (cond
+     ((string-match
+       (rx string-start "curl: (" (+ digit) ") " (group (* anychar)) string-end)
+       stderr)
+      (match-string 1 stderr))
+     ((string-prefix-p "curl: " stderr)
+      (string-remove-prefix "curl: " stderr))
+     (t
+      stderr))))
+
+(defun courier--response-error-hint (response)
+  "Return a user-facing hint for RESPONSE transport failures, or nil."
+  (let ((stderr (downcase (courier--response-display-stderr response))))
+    (when (or (string-match-p "tlsv1 alert protocol version" stderr)
+              (string-match-p "wrong version number" stderr)
+              (string-match-p "server gave http response to https client" stderr))
+      "TLS handshake failed. This often means the URL uses https:// but the target port only serves http://.\n")))
+
+(defconst courier--response-local-error-prefixes
+  '(("OAuth2 Token Error" . "OAuth2 token error")
+    ("Request Preparation Error" . "Request preparation error")
+    ("Response Processing Error" . "Response processing error")
+    ("Parse Error" . "Parse error"))
+  "User-facing message prefixes for local Courier response errors.")
+
+(defun courier--response-local-error-prefix (reason)
+  "Return the message prefix for local response error REASON, or nil."
+  (cdr (assoc-string reason courier--response-local-error-prefixes t)))
+
+(defun courier--response-display-error (response)
+  "Return a user-facing error string for RESPONSE, or nil."
+  (let* ((status (or (plist-get response :status-code) 0))
+         (exit-code (or (plist-get response :exit-code) 0))
+         (reason (string-trim (or (plist-get response :reason) "")))
+         (stderr (courier--response-display-stderr response))
+         (hint (courier--response-error-hint response))
+         (prefix (courier--response-local-error-prefix reason)))
+    (cond
+     ((or (string-empty-p stderr)
+          (and (= status 0) (= exit-code 0) (string-empty-p reason)))
+      nil)
+     (prefix
+      (format "%s: %s\n" prefix stderr))
+     ((and (= status 0) (/= exit-code 0))
+      (concat
+       (format "Request error: %s\n" stderr)
+        hint))
+     (t
+      nil))))
+
 (defun courier--response-reason (response)
   "Return the best available reason phrase for RESPONSE."
   (let* ((status (or (plist-get response :status-code) 0))
+         (exit-code (or (plist-get response :exit-code) 0))
          (reason (string-trim (or (plist-get response :reason) ""))))
-    (if (string-empty-p reason)
-        (or (alist-get status courier--status-reason-phrases) "")
-      reason)))
+    (cond
+     ((not (string-empty-p reason))
+      reason)
+     ((and (= status 0) (/= exit-code 0))
+      "Request Error")
+     (t
+      (or (alist-get status courier--status-reason-phrases) "")))))
 
 (defun courier--response-status-label (response)
   "Return a status label for RESPONSE."
@@ -2413,7 +2525,9 @@ Each entry is a cons cell of the form `(TIMESTAMP . RESPONSE)'.")
          (reason (courier--response-reason response)))
     (if (string-empty-p reason)
         (number-to-string status)
-      (format "%d %s" status reason))))
+      (if (= status 0)
+          reason
+        (format "%d %s" status reason)))))
 
 (defun courier--response-tab-display-name (tab)
   "Return a display name for response TAB."
@@ -2434,8 +2548,13 @@ Each entry is a cons cell of the form `(TIMESTAMP . RESPONSE)'.")
 
 (defun courier--response-status-face (response)
   "Return a face appropriate for RESPONSE status."
-  (let ((status (or (plist-get response :status-code) 0)))
+  (let ((status (or (plist-get response :status-code) 0))
+        (exit-code (or (plist-get response :exit-code) 0))
+        (reason (string-trim (or (plist-get response :reason) ""))))
     (cond
+     ((or (/= exit-code 0)
+          (courier--response-local-error-prefix reason))
+      'courier-response-status-error-face)
      ((and (>= status 200) (< status 300))
       'courier-response-status-success-face)
      ((and (>= status 300) (< status 400))
@@ -2754,40 +2873,41 @@ Move them to the top of the current response buffer."
   "Return formatted body text for RESPONSE."
   (let* ((view (courier--effective-body-view response))
          (body
-          (pcase view
-            ('json
-             (if-let* ((body-text (plist-get response :body-text)))
-                 (condition-case err
-                     (concat (courier--pretty-json-body body-text) "\n")
-                   (error
-                    (concat
-                     (format "[Invalid JSON body: %s]\n"
-                             (error-message-string err))
-                     body-text
-                     "\n")))
-               (format "Body saved to %s\n" (plist-get response :body-file))))
-            ((or 'html 'xml 'javascript 'raw)
-             (cond
-              ((plist-get response :body-text)
-               (concat (plist-get response :body-text) "\n"))
-              ((plist-get response :body-file)
-               (format "Body saved to %s\n" (plist-get response :body-file)))
-              (t
-               "(empty)\n")))
-            ('base64
-             (courier--base64-body-string response))
-            ('hex
-             (courier--hex-body-string response))
-            ('image
-             (if-let* ((body-file (plist-get response :body-file)))
-                 (format "Image body saved to %s\n" body-file)
-               "(empty)\n"))
-            ('document
-             (if-let* ((body-file (plist-get response :body-file)))
-                 (format "Document body saved to %s\n" body-file)
-               "(empty)\n"))
-            (_
-             "(empty)\n"))))
+          (or (courier--response-display-error response)
+              (pcase view
+                ('json
+                 (if-let* ((body-text (plist-get response :body-text)))
+                     (condition-case err
+                         (concat (courier--pretty-json-body body-text) "\n")
+                       (error
+                        (concat
+                         (format "[Invalid JSON body: %s]\n"
+                                 (error-message-string err))
+                         body-text
+                         "\n")))
+                   (format "Body saved to %s\n" (plist-get response :body-file))))
+                ((or 'html 'xml 'javascript 'raw)
+                 (cond
+                  ((plist-get response :body-text)
+                   (concat (plist-get response :body-text) "\n"))
+                  ((plist-get response :body-file)
+                   (format "Body saved to %s\n" (plist-get response :body-file)))
+                  (t
+                   "(empty)\n")))
+                ('base64
+                 (courier--base64-body-string response))
+                ('hex
+                 (courier--hex-body-string response))
+                ('image
+                 (if-let* ((body-file (plist-get response :body-file)))
+                     (format "Image body saved to %s\n" body-file)
+                   "(empty)\n"))
+                ('document
+                 (if-let* ((body-file (plist-get response :body-file)))
+                     (format "Document body saved to %s\n" body-file)
+                   "(empty)\n"))
+                (_
+                 "(empty)\n")))))
     (if (memq view '(json html xml javascript))
         (courier--fontify-string-for-view body view)
       body)))
@@ -3095,7 +3215,11 @@ Move them to the top of the current response buffer."
         courier--history)
   (let ((max (max 0 courier-history-max)))
     (when (> (length courier--history) max)
-      (setq courier--history (seq-take courier--history max))))
+      (let ((dropped (nthcdr max courier--history)))
+        (setq courier--history (seq-take courier--history max))
+        (dolist (entry dropped)
+          (when-let* ((body-file (plist-get (cdr entry) :body-file)))
+            (courier--delete-temp-path body-file))))))
   (setq courier--history-index nil))
 
 (defun courier--history-render-current ()
@@ -3111,7 +3235,12 @@ Move them to the top of the current response buffer."
     (courier-cancel-request courier--process))
   (dolist (path courier--temp-files)
     (when (and path (stringp path) (file-exists-p path))
-      (delete-file path))))
+      (delete-file path)))
+  (dolist (entry courier--history)
+    (when-let* ((body-file (plist-get (cdr entry) :body-file)))
+      (courier--delete-temp-path body-file)))
+  (when-let* ((body-file (plist-get courier--response :body-file)))
+    (courier--delete-temp-path body-file)))
 
 (define-derived-mode courier--response-mode special-mode "Courier-Response"
   "Major mode used for Courier response buffers."
@@ -4572,12 +4701,16 @@ START defaults to the current buffer directory."
 
 (defun courier--runtime-vars-collection-key (collection-root)
   "Return a stable directory key for COLLECTION-ROOT."
-  (courier--slugify
-   (or (and collection-root (courier--collection-name collection-root))
-       (and collection-root
-            (file-name-nondirectory
-             (directory-file-name collection-root)))
-       "default")))
+  (if collection-root
+      (let* ((normalized-root
+              (file-name-as-directory (expand-file-name collection-root)))
+             (name
+              (or (courier--collection-name collection-root)
+                  (file-name-nondirectory
+                   (directory-file-name collection-root))))
+             (digest (substring (secure-hash 'sha1 normalized-root) 0 12)))
+        (format "%s-%s" (courier--slugify name) digest))
+    "default"))
 
 (defun courier--runtime-vars-directory (collection-root)
   "Return the runtime vars directory for COLLECTION-ROOT."
@@ -4590,11 +4723,65 @@ START defaults to the current buffer directory."
    (format "%s.env" (or env-name "default"))
    (courier--runtime-vars-directory collection-root)))
 
+(defun courier--decode-runtime-var-value (raw path line-number)
+  "Decode runtime var RAW from PATH on LINE-NUMBER."
+  (let ((trimmed (string-trim-left raw)))
+    (if (string-prefix-p "\"" trimmed)
+        (condition-case err
+            (pcase-let ((`(,value . ,end) (read-from-string trimmed)))
+              (unless (stringp value)
+                (user-error
+                 "Parse error in %s on line %d: runtime var value must be a string"
+                 path line-number))
+              (unless (string-empty-p (string-trim (substring trimmed end)))
+                (user-error
+                 "Parse error in %s on line %d: trailing characters after runtime var value"
+                 path line-number))
+              value)
+          (error
+           (user-error
+            "Parse error in %s on line %d: invalid runtime var value (%s)"
+            path line-number
+            (error-message-string err))))
+      (string-trim raw))))
+
+(defun courier--read-env-like-file (path value-reader line-kind)
+  "Read PATH as an env-like file using VALUE-READER for matched values.
+LINE-KIND names the line type in malformed-line errors."
+  (with-temp-buffer
+    (insert-file-contents path)
+    (let (vars)
+      (while (not (eobp))
+        (let* ((line-number (line-number-at-pos))
+               (raw-line (buffer-substring-no-properties
+                          (line-beginning-position)
+                          (line-end-position)))
+               (trimmed (string-trim raw-line)))
+          (cond
+           ((or (string-empty-p trimmed)
+                (string-prefix-p "#" trimmed))
+            nil)
+           ((string-match courier--env-line-regexp raw-line)
+            (push (cons (match-string 1 raw-line)
+                        (funcall value-reader
+                                 (match-string 2 raw-line)
+                                 path
+                                 line-number))
+                  vars))
+           (t
+            (user-error "Parse error in %s on line %d: malformed %s line"
+                        path line-number line-kind))))
+        (forward-line 1))
+      (nreverse vars))))
+
 (defun courier--read-runtime-vars (collection-root env-name)
   "Return runtime vars for COLLECTION-ROOT and ENV-NAME."
   (let ((path (courier--runtime-vars-file collection-root env-name)))
     (if (file-exists-p path)
-        (courier-parse-env-file path)
+        (courier--read-env-like-file
+         path
+         #'courier--decode-runtime-var-value
+         "runtime var")
       nil)))
 
 (defun courier--write-runtime-vars (collection-root env-name vars)
@@ -4604,12 +4791,42 @@ START defaults to the current buffer directory."
     (make-directory directory t)
     (with-temp-file path
       (dolist (pair vars)
-        (insert (car pair) "=" (cdr pair) "\n")))))
+        (insert (car pair)
+                "="
+                (let ((print-escape-newlines t)
+                      (print-escape-control-characters t))
+                  (prin1-to-string (cdr pair)))
+                "\n")))))
 
 (defun courier--active-collection-root ()
   "Return the active Courier collection root for the current context, or nil."
   (or courier--collection-root-hint
       (courier--collection-root)))
+
+(defun courier--current-request-error-snapshot ()
+  "Return a best-effort current request snapshot for local error rendering."
+  (let* ((path (and buffer-file-name (expand-file-name buffer-file-name)))
+         (request (if courier--request-model
+                      (copy-tree courier--request-model t)
+                    (courier--empty-request path)))
+         (line (save-excursion
+                 (goto-char (point-min))
+                 (buffer-substring-no-properties
+                  (line-beginning-position)
+                  (line-end-position))))
+         (method (or (plist-get request :method) courier-default-request-method))
+         (url (or (plist-get request :url) "")))
+    (plist-put request :path path)
+    (plist-put request :name (courier--buffer-request-name))
+    (cond
+     ((string-match "^\\([A-Z]+\\)\\(?:\\s-+\\(\\S-+\\)\\)?\\s-*$" line)
+      (setq method (match-string 1 line)
+            url (or (match-string 2 line) "")))
+     ((string-match "^\\([A-Z]+\\)" line)
+      (setq method (match-string 1 line))))
+    (plist-put request :method method)
+    (plist-put request :url url)
+    request))
 
 (defun courier--collection-config-path (&optional start)
   "Return the Courier config path for START, or nil."
@@ -6142,12 +6359,14 @@ Signal `user-error' when the current request line has no URL."
   (let* ((resolved (courier--resolved-current-request))
          (header-file (make-temp-file "courier-preview-" nil ".headers"))
          (body-file (make-temp-file "courier-preview-" nil ".body"))
+         (request-body-file (make-temp-file "courier-preview-" nil ".request-body"))
          (meta-file (make-temp-file "courier-preview-" nil ".meta")))
     (unwind-protect
         (courier--preview-request
          resolved
-         (courier-build-curl-command resolved header-file body-file meta-file))
-      (dolist (path (list header-file body-file meta-file))
+         (courier-build-curl-command
+          resolved header-file body-file meta-file request-body-file))
+      (dolist (path (list header-file body-file request-body-file meta-file))
         (when (file-exists-p path)
           (delete-file path))))))
 
@@ -6411,29 +6630,41 @@ Unsaved request buffers choose a collection on first save."
 (defun courier-request-send ()
   "Send the current Courier request buffer with curl."
   (interactive)
-  (let* ((resolved (courier--resolved-current-request))
-         (path (plist-get resolved :path)))
-    (when-let* ((process (courier--in-flight-process-for-path path)))
-      (unless (yes-or-no-p "Request in progress.  Cancel and resend? ")
-        (user-error "Courier request aborted"))
-      (courier-cancel-request process))
-    (let ((response-buffer (courier--display-response-buffer resolved)))
-      (with-current-buffer response-buffer
-        (courier--response-show-sending resolved))
-      (let ((process
-             (courier-send-request
-              resolved
-              (lambda (response)
-                (when (buffer-live-p response-buffer)
-                  (with-current-buffer response-buffer
-                    (setq courier--process nil
-                          courier--response response)
-                    (courier--render-response response resolved)))))))
-        (process-put process 'courier-response-buffer response-buffer)
-        (with-current-buffer response-buffer
-          (setq courier--request resolved
-                courier--process process
-                courier--temp-files (process-get process 'courier-temp-files)))))))
+  (let ((resolved
+         (condition-case err
+             (courier--resolved-current-request)
+           (error
+            (let* ((request (courier--current-request-error-snapshot))
+                   (response (courier--request-preparation-error-response
+                              request err))
+                   (response-buffer (courier--display-response-buffer request)))
+              (with-current-buffer response-buffer
+                (courier--render-response response request)))
+            nil))))
+    (when resolved
+      (let ((path (plist-get resolved :path)))
+        (when-let* ((process (courier--in-flight-process-for-path path)))
+          (unless (yes-or-no-p "Request in progress.  Cancel and resend? ")
+            (user-error "Courier request aborted"))
+          (courier-cancel-request process))
+        (let ((response-buffer (courier--display-response-buffer resolved)))
+          (with-current-buffer response-buffer
+            (courier--response-show-sending resolved))
+          (let ((process
+                 (courier-send-request
+                  resolved
+                  (lambda (response)
+                    (when (buffer-live-p response-buffer)
+                      (with-current-buffer response-buffer
+                        (setq courier--process nil
+                              courier--response response)
+                        (courier--render-response response resolved)))))))
+            (process-put process 'courier-response-buffer response-buffer)
+            (with-current-buffer response-buffer
+              (setq courier--request resolved
+                    courier--process process
+                    courier--temp-files
+                    (process-get process 'courier-temp-files)))))))))
 
 ;;;###autoload
 (defun courier-open ()
