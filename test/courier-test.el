@@ -250,6 +250,34 @@ skipping."
       (courier-request-send))
     response-buffer))
 
+(defun courier-test--current-request-divider-line ()
+  "Return the divider line from the current request buffer."
+  (save-excursion
+    (goto-char (point-min))
+    (forward-line 1)
+    (buffer-substring-no-properties (line-beginning-position)
+                                    (line-end-position))))
+
+(defun courier-test--request-divider-matches-p (label line)
+  "Return non-nil when LINE is a divider containing LABEL."
+  (string-match-p
+   (format "\\`-+ %s -+\\'" (regexp-quote label))
+   line))
+
+(defun courier-test--request-divider-padding-widths (label line)
+  "Return left/right padding widths for LABEL in divider LINE."
+  (when (string-match
+         (format "\\`\\(-+\\) %s \\(-+\\)\\'" (regexp-quote label))
+         line)
+    (cons (length (match-string 1 line))
+          (length (match-string 2 line)))))
+
+(defun courier-test--face-includes-p (value face)
+  "Return non-nil when VALUE includes FACE."
+  (if (listp value)
+      (memq face value)
+    (eq value face)))
+
 (defun courier-test--argv-flag-value (argv flag)
   "Return the value immediately after FLAG in ARGV."
   (when-let* ((position (cl-position flag argv :test #'string=)))
@@ -3513,7 +3541,7 @@ skipping."
                     (overlay-end courier--method-overlay))
                    "GET"))))
 
-(ert-deftest courier-request-header-line-shows-primary-navigation ()
+(ert-deftest courier-request-divider-line-shows-primary-navigation ()
   (courier-test--with-request
       (courier-test--http-content
        :name "Demo"
@@ -3521,32 +3549,32 @@ skipping."
        :headers '(("accept" . "application/json"))
        :body "{\"name\":\"Lucy\"}\n")
     (courier-request-mode)
-    (let ((line (substring-no-properties
-                 (courier--request-header-line-format))))
-      (should (string-match-p "\\` Section: Body: JSON" line)))))
+    (should (courier-test--request-divider-matches-p
+             "Body: JSON"
+             (courier-test--current-request-divider-line)))))
 
-(ert-deftest courier-request-header-line-shows-current-secondary-section ()
+(ert-deftest courier-request-divider-line-shows-current-secondary-section ()
   (courier-test--with-request
       (courier-test--http-content
        :url "https://example.com/users/42"
        :auth '(:type bearer :token "{{token}}"))
     (courier-request-mode)
     (courier-request-jump-section 'auth)
-    (let ((line (substring-no-properties
-                 (courier--request-header-line-format))))
-      (should (string-match-p "\\` Section: Authentication: Bearer" line)))))
+    (should (courier-test--request-divider-matches-p
+             "Authentication: Bearer"
+             (courier-test--current-request-divider-line)))))
 
-(ert-deftest courier-request-header-line-shows-none-auth-label ()
+(ert-deftest courier-request-divider-line-shows-none-auth-label ()
   (courier-test--with-request
       (courier-test--http-content
        :url "https://example.com/users/42")
     (courier-request-mode)
     (courier-request-jump-section 'auth)
-    (let ((line (substring-no-properties
-                 (courier--request-header-line-format))))
-      (should (string-match-p "\\` Section: Authentication: None" line)))))
+    (should (courier-test--request-divider-matches-p
+             "Authentication: None"
+             (courier-test--current-request-divider-line)))))
 
-(ert-deftest courier-request-header-line-shows-body-type-label ()
+(ert-deftest courier-request-divider-line-shows-body-type-label ()
   (courier-test--with-request
       (courier-test--http-content
        :url "https://example.com/users/42"
@@ -3554,9 +3582,109 @@ skipping."
        :body "<ok/>\n")
     (courier-request-mode)
     (courier-request-jump-section 'body)
-    (let ((line (substring-no-properties
-                 (courier--request-header-line-format))))
-      (should (string-match-p "\\` Section: Body: XML" line)))))
+    (should (courier-test--request-divider-matches-p
+             "Body: XML"
+             (courier-test--current-request-divider-line)))))
+
+(ert-deftest courier-request-divider-line-adapts-to-target-width ()
+  (courier-test--with-request
+      (courier-test--http-content
+       :url "https://example.com/users/42")
+    (courier-request-mode)
+    (cl-letf (((symbol-function 'courier--request-divider-target-width)
+               (lambda () 60)))
+      (let ((divider (courier--request-divider-line)))
+        (should (= (string-width divider) 60))
+        (should (courier-test--request-divider-matches-p "Body: JSON" divider))))))
+
+(ert-deftest courier-request-divider-line-prefers-left-biased-label ()
+  (courier-test--with-request
+      (courier-test--http-content
+       :url "https://example.com/users/42")
+    (courier-request-mode)
+    (cl-letf (((symbol-function 'courier--request-divider-target-width)
+               (lambda () 60)))
+      (pcase-let ((`(,left . ,right)
+                   (courier-test--request-divider-padding-widths
+                    "Body: JSON"
+                    (courier--request-divider-line))))
+        (should (< left right))))))
+
+(ert-deftest courier-request-divider-line-refreshes-after-window-change ()
+  (courier-test--with-request
+      (courier-test--http-content
+       :url "https://example.com/users/42")
+    (courier-request-mode)
+    (let ((original (courier-test--current-request-divider-line)))
+      (cl-letf (((symbol-function 'get-buffer-window)
+                 (lambda (&rest _args)
+                   (selected-window)))
+                ((symbol-function 'courier--request-divider-target-width)
+                 (lambda () 60)))
+        (courier--refresh-request-divider-after-window-change))
+      (let ((updated (courier-test--current-request-divider-line)))
+        (should (courier-test--request-divider-matches-p "Body: JSON" updated))
+        (should (= (string-width updated) 60))
+        (should-not (equal updated original))))))
+
+(ert-deftest courier-request-mode-clears-header-line ()
+  (courier-test--with-request
+      (courier-test--http-content
+       :url "https://example.com/users/42")
+    (setq-local header-line-format "stale")
+    (courier-request-mode)
+    (should-not header-line-format)))
+
+(ert-deftest courier-request-method-prefix-is-read-only ()
+  (courier-test--with-request
+      (courier-test--http-content
+       :url "https://example.com/users/42")
+    (courier-request-mode)
+    (goto-char (point-min))
+    (should-error (insert "X") :type 'text-read-only)))
+
+(ert-deftest courier-request-divider-region-is-read-only ()
+  (courier-test--with-request
+      (courier-test--http-content
+       :url "https://example.com/users/42")
+    (courier-request-mode)
+    (goto-char (point-min))
+    (forward-line 1)
+    (should-error (insert "X") :type 'text-read-only)))
+
+(ert-deftest courier-request-url-remains-editable ()
+  (courier-test--with-request
+      (courier-test--http-content
+       :url "https://example.com/users/42")
+    (courier-request-mode)
+    (goto-char (point-min))
+    (search-forward " ")
+    (insert "http+")
+    (should (string-prefix-p "GET http+https://example.com/users/42"
+                             (buffer-string)))))
+
+(ert-deftest courier-request-divider-line-keeps-face-after-url-edit ()
+  (courier-test--with-request
+      (courier-test--http-content
+       :url "https://example.com/users/42")
+    (courier-request-mode)
+    (goto-char (point-min))
+    (search-forward " ")
+    (insert "http+")
+    (font-lock-ensure)
+    (goto-char (point-min))
+    (forward-line 1)
+    (search-forward "Body")
+    (let ((label-pos (match-beginning 0))
+          (divider-pos (line-beginning-position)))
+      (should (courier-test--face-includes-p
+               (get-char-property label-pos 'face)
+               'courier-request-nav-active-face))
+      (should (courier-test--face-includes-p
+               (get-char-property divider-pos 'face)
+               'courier-request-divider-face))
+      (should-not (get-text-property label-pos 'font-lock-face))
+      (should-not (get-text-property divider-pos 'font-lock-face)))))
 
 (ert-deftest courier-request-mode-resets-state-when-buffer-visits-new-file ()
   (with-temp-buffer
@@ -3895,9 +4023,9 @@ skipping."
     (courier-request-set-method "POST")
     (should (equal (plist-get courier--request-model :method) "POST"))
     (should (string-match-p "^POST $" (buffer-string)))
-    (should (string-match-p "Body: JSON"
-                            (substring-no-properties
-                             (courier--request-header-line-format))))))
+    (should (courier-test--request-divider-matches-p
+             "Body: JSON"
+             (courier-test--current-request-divider-line)))))
 
 (ert-deftest courier-request-section-type-updates-request-body-model ()
   (courier-test--with-request
@@ -3914,7 +4042,7 @@ skipping."
     (should (eq (plist-get courier--request-model :body-type) 'none))
     (should (equal (plist-get courier--request-model :body) ""))))
 
-(ert-deftest courier-request-section-type-refreshes-body-header-line ()
+(ert-deftest courier-request-section-type-refreshes-body-divider-line ()
   (courier-test--with-request
       (courier-test--http-content
        :method "POST"
@@ -3926,9 +4054,9 @@ skipping."
     (cl-letf (((symbol-function 'courier--read-request-body-type)
                (lambda () 'form-urlencoded)))
       (courier-request-section-type))
-    (let ((line (substring-no-properties
-                 (courier--request-header-line-format))))
-      (should (string-match-p "Body: Form" line)))))
+    (should (courier-test--request-divider-matches-p
+             "Body: Form"
+             (courier-test--current-request-divider-line)))))
 
 (ert-deftest courier-request-body-section-round-trips-binary-metadata ()
   (courier-test--with-request
@@ -4177,7 +4305,7 @@ skipping."
                      :username "{{user}}"
                      :password "{{password}}")))))
 
-(ert-deftest courier-request-section-type-refreshes-auth-header-line ()
+(ert-deftest courier-request-section-type-refreshes-auth-divider-line ()
   (courier-test--with-request
       (courier-test--http-content
        :method "GET"
@@ -4187,9 +4315,9 @@ skipping."
     (cl-letf (((symbol-function 'courier--read-request-auth-type)
                (lambda () 'header)))
       (courier-request-section-type))
-    (let ((line (substring-no-properties
-                 (courier--request-header-line-format))))
-      (should (string-match-p "Authentication: Header" line)))))
+    (should (courier-test--request-divider-matches-p
+             "Authentication: Header"
+             (courier-test--current-request-divider-line)))))
 
 (ert-deftest courier-request-section-helpers-are-not-standalone-commands ()
   (should-not (commandp 'courier--request-set-body-type))
@@ -4699,11 +4827,10 @@ skipping."
         (should (derived-mode-p 'courier-request-mode))
         (should-not buffer-file-name)
         (should (string-prefix-p "GET \n" (buffer-string)))
-        (should (string-match-p "^----------------------------------------$"
-                                (nth 1 (split-string (buffer-string) "\n"))))
-        (should (string-match-p "Section: Body: JSON"
-                                (substring-no-properties
-                                 (courier--request-header-line-format))))
+        (should (courier-test--request-divider-matches-p
+                 "Body: JSON"
+                 (courier-test--current-request-divider-line)))
+        (should-not header-line-format)
         (should (= (line-number-at-pos) 1))
         (should (= (point) (line-end-position)))
         (should (equal (plist-get courier--request-model :name) "Untitled 1"))
@@ -4722,11 +4849,10 @@ skipping."
         (should (derived-mode-p 'courier-request-mode))
         (should-not buffer-file-name)
         (should (string-prefix-p "POST \n" (buffer-string)))
-        (should (string-match-p "^----------------------------------------$"
-                                (nth 1 (split-string (buffer-string) "\n"))))
-        (should (string-match-p "Section: Body: JSON"
-                                (substring-no-properties
-                                 (courier--request-header-line-format))))
+        (should (courier-test--request-divider-matches-p
+                 "Body: JSON"
+                 (courier-test--current-request-divider-line)))
+        (should-not header-line-format)
         (should (= (line-number-at-pos) 1))
         (should (= (point) (line-end-position)))
         (should (equal (plist-get courier--request-model :method) "POST"))))

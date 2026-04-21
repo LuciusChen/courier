@@ -3668,6 +3668,12 @@ The return value is one of:
 (defvar-local courier--method-overlay nil
   "Overlay highlighting the current Courier request method.")
 
+(defvar-local courier--request-divider-overlay nil
+  "Overlay highlighting the current Courier request divider line.")
+
+(defvar-local courier--request-divider-label-overlay nil
+  "Overlay highlighting the active request section label in the divider.")
+
 (defvar-local courier--params-source-buffer nil
   "Request buffer associated with the current Courier params editor.")
 
@@ -3682,6 +3688,9 @@ The return value is one of:
 
 (defvar-local courier--request-content-start nil
   "Marker for the start of the editable Courier request content region.")
+
+(defvar-local courier--request-divider-width nil
+  "Last rendered width for the current request divider line.")
 
 (put 'courier--request-path 'permanent-local t)
 (put 'courier--active-env 'permanent-local t)
@@ -3715,19 +3724,27 @@ The return value is one of:
   "Fallback face used for Courier request method overlays.")
 
 (defface courier-request-nav-active-face
-  '((t :inherit bold :underline t))
+  '((t :inherit bold))
   "Face used for the active Courier request navigation section.")
 
 (defface courier-request-divider-face
   '((t :inherit shadow))
   "Face used for the subtle divider between request header and editor area.")
 
+(defconst courier--request-method-read-only-message
+  "Courier manages the HTTP method token. Use C-c C-m to change it."
+  "Read-only message shown when editing the request method token.")
+
+(defconst courier--request-divider-read-only-message
+  "Courier manages the request divider."
+  "Read-only message shown when editing the request divider.")
+
 (defconst courier-request-font-lock-keywords
   '(("^#.*$" . font-lock-comment-face)
     ("^\\([A-Z]+\\)\\s-+\\(\\S-+.*\\)$"
      (1 font-lock-keyword-face)
      (2 font-lock-string-face))
-    ("^\\([^:# \t][^:]*\\):\\s-*\\(.*\\)$"
+    ("^\\([[:alnum:]_][^: \t]*\\):\\s-*\\(.*\\)$"
      (1 font-lock-variable-name-face)
      (2 font-lock-string-face))
     ("^\\([A-Za-z_][A-Za-z0-9_]*\\)\\s-*=\\s-*\\(.*\\)$"
@@ -3799,15 +3816,6 @@ The return value is one of:
   "Return the logical request section at point."
   (or courier--request-tab 'body))
 
-(defun courier--request-header-line-format ()
-  "Return the request navigation header line for the current buffer."
-  (let ((current (courier--request-current-section)))
-    (concat " "
-            (propertize "Section:" 'face 'shadow)
-            " "
-            (propertize (courier--request-section-label current)
-                        'face 'courier-request-nav-active-face))))
-
 (defun courier--request-effective-url (request)
   "Return REQUEST URL with structured params projected into the query string."
   (let ((url (or (plist-get request :url) "")))
@@ -3831,10 +3839,137 @@ The return value is one of:
           (or (plist-get request :method) courier-default-request-method)
           (courier--request-effective-url request)))
 
+(defun courier--request-divider-target-width ()
+  "Return the target width for the current request divider line."
+  (or (when-let* ((window (get-buffer-window (current-buffer) t)))
+        (window-body-width window))
+      44))
+
 (defun courier--request-divider-line ()
-  "Return the subtle divider line between request header and section view."
-  (propertize "----------------------------------------"
-              'face 'courier-request-divider-face))
+  "Return the divider line showing the active request section."
+  (let* ((label (courier--request-section-label
+                 (courier--request-current-section)))
+         (target-width (max (+ (string-width label) 4)
+                            (courier--request-divider-target-width)))
+         (padding-width (- target-width (string-width label) 2))
+         (left-width (max 1
+                          (min 12
+                               (/ padding-width 4))))
+         (right-width (max 1 (- padding-width left-width)))
+         (left-padding (make-string left-width ?-))
+         (right-padding (make-string right-width ?-)))
+    (concat (propertize left-padding 'face 'courier-request-divider-face)
+            " "
+            (propertize label 'face 'courier-request-nav-active-face)
+            " "
+            (propertize right-padding 'face 'courier-request-divider-face))))
+
+(defun courier--set-request-read-only-region (start end message)
+  "Protect buffer region from START to END with read-only MESSAGE."
+  (when (< start end)
+    (let ((inhibit-read-only t))
+      (add-text-properties
+       start end
+       `(read-only ,message
+         front-sticky (read-only)
+         rear-nonsticky (read-only)
+         help-echo ,message)))))
+
+(defun courier--protect-request-method-prefix ()
+  "Protect the request method token in the current buffer."
+  (when-let* ((bounds (courier--current-method-bounds)))
+    (pcase-let ((`(,start . ,method-end) bounds))
+      (save-excursion
+        (goto-char method-end)
+        (courier--set-request-read-only-region
+         start
+         (if (eq (char-after) ?\s)
+             (1+ method-end)
+           method-end)
+         courier--request-method-read-only-message)))))
+
+(defun courier--protect-request-divider-region ()
+  "Protect the request divider and spacer region in the current buffer."
+  (when (markerp courier--request-content-start)
+    (save-excursion
+      (goto-char (point-min))
+      (forward-line 1)
+      (courier--set-request-read-only-region
+       (line-beginning-position)
+       (marker-position courier--request-content-start)
+       courier--request-divider-read-only-message))))
+
+(defun courier--protect-request-scaffold ()
+  "Protect non-editable request scaffold lines in the current buffer."
+  (courier--protect-request-method-prefix)
+  (courier--protect-request-divider-region))
+
+(defun courier--delete-request-divider-overlays ()
+  "Delete the current request divider overlays."
+  (dolist (overlay (list courier--request-divider-overlay
+                         courier--request-divider-label-overlay))
+    (when (overlayp overlay)
+      (delete-overlay overlay)))
+  (setq courier--request-divider-overlay nil
+        courier--request-divider-label-overlay nil))
+
+(defun courier--refresh-request-divider-overlays ()
+  "Refresh the request divider overlays in the current buffer."
+  (save-excursion
+    (goto-char (point-min))
+    (forward-line 1)
+    (let* ((line-start (line-beginning-position))
+           (line-end (line-end-position))
+           (line (buffer-substring-no-properties line-start line-end))
+           (label (courier--request-section-label
+                   (courier--request-current-section)))
+           (label-index (string-match (regexp-quote label) line))
+           (divider-overlay
+            (or courier--request-divider-overlay
+                (make-overlay line-start line-end nil t t))))
+      (setq courier--request-divider-overlay divider-overlay)
+      (move-overlay divider-overlay line-start line-end)
+      (overlay-put divider-overlay 'evaporate t)
+      (overlay-put divider-overlay 'priority 900)
+      (overlay-put divider-overlay 'face 'courier-request-divider-face)
+      (if label-index
+          (let* ((label-start (+ line-start label-index))
+                 (label-end (+ label-start (length label)))
+                 (label-overlay
+                  (or courier--request-divider-label-overlay
+                      (make-overlay label-start label-end nil t t))))
+            (setq courier--request-divider-label-overlay label-overlay)
+            (move-overlay label-overlay label-start label-end)
+            (overlay-put label-overlay 'evaporate t)
+            (overlay-put label-overlay 'priority 901)
+            (overlay-put label-overlay 'face 'courier-request-nav-active-face))
+        (when (overlayp courier--request-divider-label-overlay)
+          (delete-overlay courier--request-divider-label-overlay)
+          (setq courier--request-divider-label-overlay nil))))))
+
+(defun courier--refresh-request-divider-line ()
+  "Refresh the request divider line in the current request buffer."
+  (let ((divider (courier--request-divider-line))
+        (inhibit-read-only t))
+    (setq courier--request-divider-width (string-width divider))
+    (save-excursion
+      (goto-char (point-min))
+      (forward-line 1)
+      (delete-region (line-beginning-position) (line-end-position))
+      (insert divider)))
+  (courier--refresh-request-divider-overlays)
+  (courier--protect-request-divider-region))
+
+(defun courier--refresh-request-divider-after-window-change ()
+  "Refresh the request divider after a current buffer window resize."
+  (when (and (derived-mode-p 'courier-request-mode)
+             (not courier--request-rendering-p)
+             (get-buffer-window (current-buffer) t))
+    (let ((target-width (courier--request-divider-target-width)))
+      (unless (= target-width courier--request-divider-width)
+        (let ((modified (buffer-modified-p)))
+          (courier--refresh-request-divider-line)
+          (set-buffer-modified-p modified))))))
 
 (defun courier--request-section-placeholder (section)
   "Return placeholder text for empty request SECTION."
@@ -4613,12 +4748,17 @@ REGEXP must place the editable string contents in capture group 1."
     (setq courier--request-rendering-p t)
     (unwind-protect
         (progn
+          (setq courier--request-divider-width nil)
           (courier--ensure-request-layout)
           (erase-buffer)
           (insert (courier--request-view-request-line request) "\n")
-          (insert (courier--request-divider-line) "\n")
+          (let ((divider (courier--request-divider-line)))
+            (setq courier--request-divider-width (string-width divider))
+            (insert divider "\n"))
           (insert "\n")
           (set-marker courier--request-content-start (point))
+          (courier--protect-request-scaffold)
+          (courier--refresh-request-divider-overlays)
           (insert (courier--request-section-text request courier--request-tab))
           (goto-char (marker-position courier--request-content-start))
           (courier--refresh-method-overlay))
@@ -4635,11 +4775,11 @@ REGEXP must place the editable string contents in capture group 1."
     (setq courier--request-rendering-p t)
     (unwind-protect
         (progn
+          (courier--refresh-request-divider-line)
           (delete-region (marker-position courier--request-content-start) (point-max))
           (goto-char (marker-position courier--request-content-start))
           (insert (courier--request-section-text courier--request-model courier--request-tab))
           (goto-char (marker-position courier--request-content-start))
-          (force-mode-line-update)
           (courier--refresh-method-overlay))
       (setq courier--request-rendering-p nil)
       (set-buffer-modified-p modified))))
@@ -6074,7 +6214,9 @@ Entries are read from the configured env directory only."
         (overlay-put overlay 'evaporate t)
         (overlay-put overlay 'priority 1000)
         (overlay-put overlay 'face (courier--method-overlay-face method))
-        (overlay-put overlay 'help-echo (format "Courier method: %s" method)))
+        (overlay-put overlay 'help-echo
+                     (format "Courier method: %s. Use C-c C-m to change it."
+                             method)))
     (courier--delete-method-overlay)))
 
 (defun courier--current-request-url-bounds ()
@@ -6307,12 +6449,15 @@ Signal `user-error' when the current request line has no URL."
   (let ((current-path (and buffer-file-name (expand-file-name buffer-file-name))))
     (courier--reset-request-buffer-state-for-path current-path)
     (setq-local courier--request-path current-path))
+  (setq-local courier--request-divider-width nil)
   (setq-local mode-name '(:eval (courier--mode-line-lighter)))
   (setq-local font-lock-defaults '(courier-request-font-lock-keywords))
-  (setq-local header-line-format '(:eval (courier--request-header-line-format)))
+  (setq-local header-line-format nil)
   (setq-local outline-regexp "^[A-Z]+ ")
   (setq-local revert-buffer-function #'courier-request-revert-buffer)
   (add-hook 'xref-backend-functions #'courier--xref-backend nil t)
+  (add-hook 'window-configuration-change-hook
+            #'courier--refresh-request-divider-after-window-change nil t)
   (add-hook 'completion-at-point-functions #'courier--tests-dsl-capf nil t)
   (add-hook 'completion-at-point-functions #'courier--post-response-var-from-capf nil t)
   (add-hook 'completion-at-point-functions #'courier--content-type-capf nil t)
@@ -6322,6 +6467,7 @@ Signal `user-error' when the current request line has no URL."
   (add-hook 'after-change-functions
             #'courier--after-change-refresh-method-overlay nil t)
   (add-hook 'change-major-mode-hook #'courier--delete-method-overlay nil t)
+  (add-hook 'change-major-mode-hook #'courier--delete-request-divider-overlays nil t)
   (courier--refresh-method-overlay)
   (unless courier--active-env
     (when-let* ((preferred-env (courier--preferred-env-name
