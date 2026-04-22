@@ -437,6 +437,7 @@ snippets such as =status == 200= and =header content-type contains json=.
 | Key       | Command                        | Description            |
 |-----------+--------------------------------+------------------------|
 | =C-c C-c= | =courier-request-send=         | Send request           |
+| =C-c C-b= | =courier-request-format-body=  | Format current body    |
 | =C-c C-e= | =courier-request-switch-env=   | Switch environment     |
 | =C-c C-f= | =courier-request-attach-file=  | Attach file to body    |
 | =C-c C-j= | =courier-request-jump-section= | Jump to request section |
@@ -488,6 +489,11 @@ mode line mirrors the active collection, selected environment, and current
 section in a compact form such as =Courier[My API/local] Body: JSON=. The
 request line always shows the effective URL, including query params edited
 through the structured params view.
+When =Body= is the active section, Courier also treats structured text bodies
+as editor content instead of inert raw text: JSON and XML bodies get syntax
+highlighting in place, and =C-c C-b= formats the current body section. For
+=text= bodies, Courier infers the formatter and syntax highlighter from the
+=Content-Type= header when it identifies JSON, HTML, XML, or JavaScript.
 
 =Authentication= is edited as a TOML-backed fragment. =Variables=, =Scripts=,
 and =Tests= stay TOML-backed too, with the request editor adding comment

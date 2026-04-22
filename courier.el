@@ -4020,6 +4020,9 @@ The return value is one of:
 (defvar-local courier--request-divider-label-overlay nil
   "Overlay highlighting the active request section label in the divider.")
 
+(defvar-local courier--request-body-face-overlays nil
+  "Overlays used to syntax-highlight the current request body section.")
+
 (defvar-local courier--params-source-buffer nil
   "Request buffer associated with the current Courier params editor.")
 
@@ -4321,6 +4324,13 @@ The return value is one of:
   (setq courier--request-divider-overlay nil
         courier--request-divider-label-overlay nil))
 
+(defun courier--delete-request-body-overlays ()
+  "Delete the current request body syntax overlays."
+  (dolist (overlay courier--request-body-face-overlays)
+    (when (overlayp overlay)
+      (delete-overlay overlay)))
+  (setq courier--request-body-face-overlays nil))
+
 (defun courier--refresh-request-divider-overlays ()
   "Refresh the request divider overlays in the current buffer."
   (save-excursion
@@ -4520,6 +4530,94 @@ request URL query string."
     ('none "")
     (_
      (or (plist-get request :body) ""))))
+
+(defun courier--request-content-type (request)
+  "Return the normalized request Content-Type for REQUEST, or nil."
+  (car (courier--parse-content-type
+        (cdr (assoc-string "content-type" (plist-get request :headers) nil)))))
+
+(defun courier--request-body-view (request)
+  "Return the body view used to edit REQUEST, or nil for plain text."
+  (let ((body-type (courier--request-body-type request))
+        (content-type (courier--request-content-type request)))
+    (pcase body-type
+      ('json 'json)
+      ('xml 'xml)
+      ('text
+       (cond
+        ((courier--json-content-type-p content-type) 'json)
+        ((courier--html-content-type-p content-type) 'html)
+        ((courier--xml-content-type-p content-type) 'xml)
+        ((courier--javascript-content-type-p content-type) 'javascript)
+        (t nil)))
+      (_ nil))))
+
+(defun courier--request-body-bounds ()
+  "Return the editable bounds of the current request body section, or nil."
+  (when (and (derived-mode-p 'courier-request-mode)
+             (eq courier--request-tab 'body)
+             (markerp courier--request-content-start))
+    (cons (marker-position courier--request-content-start)
+          (point-max))))
+
+(defun courier--indent-string-for-view (string view)
+  "Return STRING re-indented using the major mode associated with VIEW."
+  (let ((mode (courier--body-view-major-mode view)))
+    (if (or (null string)
+            (string-empty-p string)
+            (eq mode #'fundamental-mode))
+        string
+      (with-temp-buffer
+        (insert string)
+        (funcall mode)
+        (indent-region (point-min) (point-max))
+        (buffer-string)))))
+
+(defun courier--format-request-body-string (request body-text)
+  "Return BODY-TEXT formatted for REQUEST."
+  (let ((body-type (courier--request-body-type request))
+        (view (courier--request-body-view request)))
+    (pcase body-type
+      ('form-urlencoded
+       (courier--form-body-string-from-pairs
+        (courier--parse-request-kv-lines body-text "form body")))
+      (_
+       (pcase view
+         ('json
+          (courier--pretty-json-body body-text))
+         ((or 'html 'xml 'javascript)
+          (courier--indent-string-for-view body-text view))
+         (_
+          (user-error "Current request body does not support formatting")))))))
+
+(defun courier--refresh-request-body-visuals ()
+  "Refresh syntax highlighting for the current request body section."
+  (courier--delete-request-body-overlays)
+  (when-let* ((request courier--request-model)
+              (bounds (courier--request-body-bounds))
+              (view (courier--request-body-view request)))
+    (pcase-let ((`(,start . ,end) bounds))
+      (let* ((text (buffer-substring-no-properties start end))
+             (fontified (courier--fontify-string-for-view text view))
+             (position 0)
+             (length (length fontified))
+             overlays)
+        (with-silent-modifications
+          (remove-text-properties start end '(face nil font-lock-face nil)))
+        (while (< position length)
+          (let* ((next (or (next-single-property-change position 'face fontified)
+                           length))
+                 (face (get-text-property position 'face fontified)))
+            (when face
+              (let ((overlay (make-overlay (+ start position)
+                                           (+ start next)
+                                           nil t t)))
+                (overlay-put overlay 'evaporate t)
+                (overlay-put overlay 'priority 850)
+                (overlay-put overlay 'face face)
+                (push overlay overlays)))
+            (setq position next)))
+        (setq courier--request-body-face-overlays (nreverse overlays))))))
 
 (defun courier--request-apply-plist (request props)
   "Apply PROPS plist entries onto REQUEST and return REQUEST."
@@ -5154,6 +5252,14 @@ REGEXP must place the editable string contents in capture group 1."
                       (courier--parse-request-tests-lines section-text))))
         nil))))
 
+(defun courier--after-change-refresh-request-body (_beg end _length)
+  "Refresh body syntax highlighting after request buffer edits ending at END."
+  (when (and courier--request-model
+             (not courier--request-rendering-p)
+             (eq courier--request-tab 'body)
+             (<= (courier--request-content-start-position) end))
+    (courier--refresh-request-body-visuals)))
+
 (defun courier--render-request-buffer ()
   "Render the current Courier request buffer from `courier--request-model'."
   (unless courier--request-model
@@ -5177,7 +5283,8 @@ REGEXP must place the editable string contents in capture group 1."
           (courier--refresh-request-divider-overlays)
           (insert (courier--request-section-text request courier--request-tab))
           (goto-char (marker-position courier--request-content-start))
-          (courier--refresh-method-overlay))
+          (courier--refresh-method-overlay)
+          (courier--refresh-request-body-visuals))
       (setq courier--request-rendering-p nil)
       (set-buffer-modified-p modified)
       (force-mode-line-update))))
@@ -5197,7 +5304,8 @@ REGEXP must place the editable string contents in capture group 1."
           (goto-char (marker-position courier--request-content-start))
           (insert (courier--request-section-text courier--request-model courier--request-tab))
           (goto-char (marker-position courier--request-content-start))
-          (courier--refresh-method-overlay))
+          (courier--refresh-method-overlay)
+          (courier--refresh-request-body-visuals))
       (setq courier--request-rendering-p nil)
       (set-buffer-modified-p modified)
       (force-mode-line-update))))
@@ -6906,8 +7014,11 @@ Signal `user-error' when the current request line has no URL."
                   (courier--collection-root)))
   (add-hook 'after-change-functions
             #'courier--after-change-refresh-method-overlay nil t)
+  (add-hook 'after-change-functions
+            #'courier--after-change-refresh-request-body nil t)
   (add-hook 'change-major-mode-hook #'courier--delete-method-overlay nil t)
   (add-hook 'change-major-mode-hook #'courier--delete-request-divider-overlays nil t)
+  (add-hook 'change-major-mode-hook #'courier--delete-request-body-overlays nil t)
   (courier--refresh-method-overlay)
   (unless courier--active-env
     (when-let* ((preferred-env (courier--preferred-env-name
@@ -6937,6 +7048,38 @@ Signal `user-error' when the current request line has no URL."
   (let ((request (copy-tree courier--request-model t)))
     (courier-validate-request request)
     (message "Courier request is valid.")))
+
+;;;###autoload
+(defun courier-request-format-body ()
+  "Format the current Courier request body section."
+  (interactive)
+  (unless (eq (courier--request-current-section) 'body)
+    (user-error "Current Courier section is not Body"))
+  (courier--sync-request-model)
+  (let* ((request courier--request-model)
+         (body-type (courier--request-body-type request))
+         (bounds (or (courier--request-body-bounds)
+                     (user-error "Current Courier body section is unavailable")))
+         (body-text (buffer-substring-no-properties (car bounds) (cdr bounds)))
+         (trimmed (courier--trim-trailing-empty-lines body-text)))
+    (when (or (string-empty-p trimmed)
+              (courier--comment-only-section-p trimmed))
+      (user-error "Current request body is empty"))
+    (let ((formatted (courier--format-request-body-string request trimmed)))
+      (if (string= formatted trimmed)
+          (message "Courier request body is already formatted.")
+        (let ((inhibit-read-only t)
+              (offset (max 0 (- (point) (car bounds)))))
+          (delete-region (car bounds) (cdr bounds))
+          (goto-char (car bounds))
+          (insert formatted)
+          (goto-char (+ (car bounds)
+                        (min offset (length formatted))))
+          (courier--sync-request-model)
+          (courier--refresh-request-body-visuals)
+          (set-buffer-modified-p t)
+          (message "Courier request body formatted as %s."
+                   (courier--body-type-label body-type)))))))
 
 ;;;###autoload
 (defun courier-request-preview ()
@@ -7419,6 +7562,7 @@ This renames the request file and updates its front matter name."
    ("l" "Validate" courier-request-validate)]
    ["Edit"
     ("m" "Method" courier-request-set-method)
+    ("b" "Format body" courier-request-format-body)
     ("t" "Section action" courier-request-section-type)
     ("f" "Attach file" courier-request-attach-file)
     ("e" "Environment" courier-request-switch-env)
@@ -7464,6 +7608,7 @@ This renames the request file and updates its front matter name."
     (user-error "No Courier action menu is available in this buffer"))))
 
 (define-key courier-request-mode-map (kbd "C-c C-c") #'courier-request-send)
+(define-key courier-request-mode-map (kbd "C-c C-b") #'courier-request-format-body)
 (define-key courier-request-mode-map (kbd "C-c ?") #'courier-dispatch)
 (define-key courier-request-mode-map (kbd "C-c C-e") #'courier-request-switch-env)
 (define-key courier-request-mode-map (kbd "C-c C-f") #'courier-request-attach-file)

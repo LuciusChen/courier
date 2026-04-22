@@ -1946,6 +1946,31 @@ skipping."
       (should (equal (plist-get response :content-type) "image/svg+xml"))
       (should (eq (courier--auto-body-view response) 'image)))))
 
+(ert-deftest courier-integration-cyberpunk-image-response-serves-screenshot-fixture ()
+  (courier-test--with-integration-server (server)
+    (let* ((response
+            (courier-test--send-sync
+             (list :path "/tmp/cyberpunk.http"
+                   :name "Cyberpunk Image"
+                   :method "GET"
+                   :url (concat (plist-get server :base-url) "/image/cyberpunk")
+                   :headers nil
+                   :body ""
+                   :body-type 'none
+                   :params nil
+                   :vars nil
+                   :tests nil
+                   :settings nil)))
+           (body-file (plist-get response :body-file)))
+      (should (= (plist-get response :status-code) 200))
+      (should (equal (plist-get response :content-type) "image/svg+xml"))
+      (should (eq (courier--auto-body-view response) 'image))
+      (should (file-exists-p body-file))
+      (with-temp-buffer
+        (insert-file-contents body-file)
+        (should (search-forward "Courier Demo // Neon Shell" nil t))
+        (should (search-forward "Original cyberpunk SVG" nil t))))))
+
 (ert-deftest courier-integration-bad-charset-surfaces-parse-error ()
   (courier-test--with-integration-server (server)
     (let ((response
@@ -4221,6 +4246,49 @@ skipping."
     (search-forward "# [vars]" nil t)
     (let ((face (get-text-property (line-beginning-position) 'face)))
       (should (courier-test--face-includes-p face 'font-lock-comment-face)))))
+
+(ert-deftest courier-request-body-json-paste-refreshes-syntax-highlighting ()
+  (let* ((body "{\"status\":\"ok\",\"count\":2}")
+         (fontified (courier--fontify-string-for-view body 'json))
+         (offset 0))
+    (while (and (< offset (length fontified))
+                (null (get-text-property offset 'face fontified)))
+      (setq offset (1+ offset)))
+    (should (< offset (length fontified)))
+    (courier-test--with-request
+        (courier-test--http-content
+         :headers '(("content-type" . "application/json"))
+         :body-type 'json
+         :body "")
+      (courier-request-mode)
+      (goto-char (marker-position courier--request-content-start))
+      (insert body)
+      (font-lock-ensure)
+      (let ((expected-face (get-text-property offset 'face fontified))
+            (actual-face (get-char-property
+                          (+ (marker-position courier--request-content-start) offset)
+                          'face)))
+        (if (listp expected-face)
+            (dolist (face expected-face)
+              (should (courier-test--face-includes-p actual-face face)))
+          (should (courier-test--face-includes-p actual-face expected-face)))))))
+
+(ert-deftest courier-request-format-body-pretty-prints-json-section ()
+  (let* ((body "{\"status\":\"ok\",\"items\":[1,2],\"meta\":{\"city\":\"shanghai\"}}")
+         (expected (courier--pretty-json-body body)))
+    (courier-test--with-request
+        (courier-test--http-content
+         :headers '(("content-type" . "application/json"))
+         :body-type 'json
+         :body body)
+      (courier-request-mode)
+      (courier-request-format-body)
+      (should (equal (buffer-substring-no-properties
+                      (marker-position courier--request-content-start)
+                      (point-max))
+                     expected))
+      (should (equal (plist-get courier--request-model :body)
+                     expected)))))
 
 (ert-deftest courier-request-edit-params-loads-query-into-editor ()
   (courier-test--with-request
