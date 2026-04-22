@@ -69,6 +69,8 @@ If Courier fails before =curl= starts, such as while syncing section edits,
 validating the request, or running a pre-request script, =C-c C-c= still opens
 the response buffer and shows a =Request Preparation Error= state.
 
+[[file:docs/images/request-response-json-ui.png]]
+
 * Collections
 
 A Courier collection is a directory marked by =courier.json=. Courier stores
