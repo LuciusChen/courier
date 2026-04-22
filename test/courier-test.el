@@ -4897,6 +4897,31 @@ skipping."
         (when (buffer-live-p draft-buffer)
           (kill-buffer draft-buffer))))))
 
+(ert-deftest courier-create-collection-writes-default-gitignore ()
+  (courier-test--with-temp-dir (root)
+    (let* ((collection-root (expand-file-name "collections/api-collection" root))
+           (gitignore-path (expand-file-name ".gitignore" collection-root)))
+      (courier--create-collection collection-root "api-collection")
+      (should (file-exists-p gitignore-path))
+      (should (string= (with-temp-buffer
+                         (insert-file-contents gitignore-path)
+                         (buffer-string))
+                       courier--collection-gitignore-template)))))
+
+(ert-deftest courier-create-collection-preserves-existing-gitignore ()
+  (courier-test--with-temp-dir (root)
+    (let* ((collection-root (expand-file-name "collections/api-collection" root))
+           (gitignore-path (expand-file-name ".gitignore" collection-root))
+           (existing "# Existing ignore rules\ncustom.file\n"))
+      (make-directory collection-root t)
+      (with-temp-file gitignore-path
+        (insert existing))
+      (courier--create-collection collection-root "api-collection")
+      (should (string= (with-temp-buffer
+                         (insert-file-contents gitignore-path)
+                         (buffer-string))
+                       existing)))))
+
 (ert-deftest courier-request-save-buffer-creates-collection-when-needed ()
   (courier-test--with-temp-dir (root)
     (let* ((courier-home-directory root)
@@ -4917,6 +4942,7 @@ skipping."
                           (t initial)))))
               (courier-request-save-buffer))
             (should (file-exists-p (expand-file-name "courier.json" collection-root)))
+            (should (file-exists-p (expand-file-name ".gitignore" collection-root)))
             (should (file-exists-p (expand-file-name "requests/untitled-1.http"
                                                      collection-root))))
         (when (buffer-live-p draft-buffer)

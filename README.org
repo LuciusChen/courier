@@ -88,6 +88,39 @@ Example home layout:
       env/
 #+end_example
 
+Courier collections are plain files and directories, so the recommended
+version-control model is to keep each collection in its own private Git
+repository. Commit request files and =courier.json=. Keep real secrets out of
+Git, and do not treat Courier-managed runtime state as source material.
+
+Recommended collection-root =.gitignore=:
+
+#+begin_example
+# Real secrets
+env/*.env
+!env/.env.example
+!env/*.env.example
+!env/*.example.env
+
+# Editor noise
+.dir-locals.el
+*~
+\#*\#
+.#*
+
+# OS noise
+.DS_Store
+#+end_example
+
+=M-x courier-create-collection= and first-save collection creation both seed
+that =.gitignore= template automatically when the collection does not already
+define one.
+
+If you choose to version the entire =courier-home-directory= instead of a
+single collection, also ignore Courier-managed state such as =state/=.
+Consider ignoring =specs/= as well when imported OpenAPI specs are regenerated
+from an upstream source instead of curated inside the repo.
+
 Minimal =courier.json= example:
 
 #+begin_src json

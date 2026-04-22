@@ -5101,6 +5101,24 @@ When NAME is non-nil, use it as the collection display name."
         (envDir . "env")))
      "\n")))
 
+(defconst courier--collection-gitignore-template
+  (concat
+   "# Real secrets\n"
+   "env/*.env\n"
+   "!env/.env.example\n"
+   "!env/*.env.example\n"
+   "!env/*.example.env\n"
+   "\n"
+   "# Editor noise\n"
+   ".dir-locals.el\n"
+   "*~\n"
+   "\\#*\\#\n"
+   ".#*\n"
+   "\n"
+   "# OS noise\n"
+   ".DS_Store\n")
+  "Default .gitignore template for new Courier collections.")
+
 (defun courier--create-collection (root &optional name)
   "Create a new Courier collection rooted at ROOT and return it.
 
@@ -5108,7 +5126,8 @@ When NAME is non-nil, store it in `courier.json' as the collection display
 name."
   (let* ((collection-root (file-name-as-directory (expand-file-name root)))
          (existing-root (courier--collection-root collection-root))
-         (config-path (expand-file-name courier--collection-marker-file collection-root)))
+         (config-path (expand-file-name courier--collection-marker-file collection-root))
+         (gitignore-path (expand-file-name ".gitignore" collection-root)))
     (when (and existing-root
                (not (file-equal-p existing-root collection-root)))
       (user-error "Directory %s is already inside Courier collection %s"
@@ -5120,6 +5139,9 @@ name."
     (make-directory (expand-file-name "env" collection-root) t)
     (with-temp-file config-path
       (insert (courier--collection-template collection-root name)))
+    (unless (file-exists-p gitignore-path)
+      (with-temp-file gitignore-path
+        (insert courier--collection-gitignore-template)))
     collection-root))
 
 (defun courier--read-collection-name ()
