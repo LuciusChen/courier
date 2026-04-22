@@ -9,7 +9,7 @@ buffers.
 
 - Edit HTTP requests as plain text in =.http= files
 - Send requests with =C-c C-c= without blocking Emacs
-- View responses in a single buffer with a header-line current-view indicator and an Emacs-native timeline inspector
+- View responses in a single buffer with an in-buffer summary/view scaffold and an Emacs-native timeline inspector
 - Variable interpolation with ={{name}}= syntax
 - Built-in test assertions for status, headers, body, timing, and size
 - Preview resolved requests before sending
@@ -468,7 +468,9 @@ typing.
 Sending from request mode uses one response workflow for both send-time and
 pre-send failures: transport errors, response-processing errors, and request
 preparation errors all surface in the response buffer instead of splitting
-between a response window and transient echo-area errors.
+between a response window and transient echo-area errors. If Courier cannot
+even launch the curl process, that startup failure is rendered there too
+instead of leaving the buffer stuck on =Sending...=.
 The request buffer uses a section view model with a status divider:
 
 #+begin_example
@@ -482,8 +484,10 @@ jump target into raw source text, and the current section is repeated in the
 second-line divider immediately below the request line. That divider adapts to
 the active request window width, keeps its label left-biased rather than
 centered, and is managed by Courier instead of edited directly. The request
-line always shows the effective URL, including query params edited through the
-structured params view.
+mode line mirrors the active collection, selected environment, and current
+section in a compact form such as =Courier[My API/local] Body: JSON=. The
+request line always shows the effective URL, including query params edited
+through the structured params view.
 
 =Authentication= is edited as a TOML-backed fragment. =Variables=, =Scripts=,
 and =Tests= stay TOML-backed too, with the request editor adding comment
@@ -545,10 +549,10 @@ current body in a dedicated viewer buffer; text-like views use an appropriate
 major mode, image views display the image when Emacs can render it, and PDF
 documents open as file-backed viewers with =doc-view-mode= when available. The
 main response buffer also applies syntax highlighting to =json=, =html=,
-=xml=, and =javascript= body views. The =header-line= shows the current view as
-=View: Response=, =View: Headers=, =View: Timeline=, or =View: Tests=, followed
-by the response status summary. Use =C-c C-j= to jump directly to a response
-view.
+=xml=, and =javascript= body views. The top of the response buffer starts with
+a primary summary line for status, duration, size, and content type, followed
+by a request-style divider that shows the current response view. Use =C-c C-j=
+to jump directly to a response view.
 Use =C-c ?= in request and response buffers to open a transient menu for the
 actions that make sense in the current Courier context.
 The response summary can therefore describe both remote and local failure
@@ -569,18 +573,20 @@ The response buffer has four top-level views:
   - *Request* shows the request URL, headers, and body snapshot that produced
     the selected history entry.
   - *Response* shows the selected historical response headers and body.
-- *Network Logs* shows curl-level diagnostics such as argv, stderr, and exit
-  code.
+- *Network Logs* shows a structured transport summary first, then keeps the
+  raw curl command and raw stderr below it for copy-paste debugging.
   Those section headings are buttons: use =RET= or mouse-1 on them to toggle
   sections open and closed. Use =M-x courier-response-clear-timeline= or the
   response transient menu to clear the current response buffer's timeline
   history, or press =RET= on the same history entry again to collapse the
   expanded view.
-- *Tests* shows pass/fail indicators for all request =tests=.
+- *Tests* shows pass/fail badges for all request =tests=, and keeps failure
+  messages visually subordinate to the test expression itself.
 
-The header line shows =Response= first, then the current secondary response
-view when applicable, then status, duration, and size; when visiting an older
-timeline entry it also shows the history position (for example =2/5=).
+The response scaffold keeps a clear information hierarchy: the first line says
+what response you are looking at, and the divider line says which response view
+is active. When visiting an older timeline entry, the divider also includes the
+history position (for example =Timeline: 2/5=).
 
 * Customization
 

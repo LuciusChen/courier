@@ -258,6 +258,21 @@ skipping."
     (buffer-substring-no-properties (line-beginning-position)
                                     (line-end-position))))
 
+(defun courier-test--current-response-summary-line ()
+  "Return the summary line from the current response buffer."
+  (save-excursion
+    (goto-char (point-min))
+    (buffer-substring-no-properties (line-beginning-position)
+                                    (line-end-position))))
+
+(defun courier-test--current-response-divider-line ()
+  "Return the divider line from the current response buffer."
+  (save-excursion
+    (goto-char (point-min))
+    (forward-line 1)
+    (buffer-substring-no-properties (line-beginning-position)
+                                    (line-end-position))))
+
 (defun courier-test--request-divider-matches-p (label line)
   "Return non-nil when LINE is a divider containing LABEL."
   (string-match-p
@@ -292,6 +307,30 @@ skipping."
             start (match-end 0)))
     count))
 
+(defun courier-test--first-property-position (property)
+  "Return the first buffer position carrying PROPERTY, or nil."
+  (let ((pos (point-min)))
+    (while (and (< pos (point-max))
+                (not (get-text-property pos property)))
+      (setq pos (or (next-single-property-change pos property nil (point-max))
+                    (point-max))))
+    (and (< pos (point-max)) pos)))
+
+(defun courier-test--goto-response-history-entry (index)
+  "Move point to the first rendered timeline entry carrying history INDEX."
+  (let ((pos (text-property-any (point-min) (point-max)
+                                'courier-history-index index)))
+    (unless pos
+      (ert-fail (format "No rendered timeline entry for history index %s" index)))
+    (goto-char pos)
+    pos))
+
+(defun courier-test--response-history-string ()
+  "Return the rendered timeline area without the response top bar."
+  (let ((start (or (courier-test--first-property-position 'courier-history-index)
+                   (point-min))))
+    (buffer-substring-no-properties start (point-max))))
+
 (defun courier-test--local-map-binding (map key)
   "Return MAP's local binding for KEY without inherited parent bindings."
   (let ((copy (copy-keymap map)))
@@ -318,12 +357,6 @@ skipping."
     (buffer-substring-no-properties
      (line-beginning-position)
      (line-end-position))))
-
-(defun courier-test--face-includes-p (face expected)
-  "Return non-nil when FACE includes EXPECTED."
-  (if (listp face)
-      (memq expected face)
-    (eq face expected)))
 
 (defun courier-test--pick-match (pattern collection)
   "Return the first completion candidate in COLLECTION matching PATTERN."
@@ -2709,17 +2742,21 @@ skipping."
     (courier-response-set-view 'raw)
     (should (eq courier--body-view 'raw))
     (should (eq courier--response-tab 'response))
-    (should (string-match-p "\\` View: Response  200 OK  •  42ms  •  5B"
-                            (substring-no-properties header-line-format)))))
+    (should (equal (courier-test--current-response-summary-line)
+                   "200 OK  •  42ms  •  5B  •  text/plain"))
+    (should (courier-test--request-divider-matches-p
+             "Response: Raw"
+             (courier-test--current-response-divider-line)))
+    (should-not header-line-format)))
 
-(ert-deftest courier-response-header-line-uses-clutch-style-separator ()
+(ert-deftest courier-response-summary-uses-clutch-style-separator ()
   (let ((line (substring-no-properties
                (courier--response-summary-string
                 (courier-test--make-response 200)))))
     (should (string-match-p "200 OK  •  42ms  •  5B" line))
     (should-not (string-match-p " | " line))))
 
-(ert-deftest courier-response-header-line-falls-back-to-standard-reason ()
+(ert-deftest courier-response-summary-falls-back-to-standard-reason ()
   (let ((line (substring-no-properties
                (courier--response-summary-string
                 '(:status-code 403
@@ -2730,7 +2767,7 @@ skipping."
                   :content-type "text/plain")))))
     (should (string-match-p "403 Forbidden" line))))
 
-(ert-deftest courier-response-header-line-labels-request-errors ()
+(ert-deftest courier-response-summary-labels-request-errors ()
   (let ((line (substring-no-properties
                (courier--response-summary-string
                 '(:status-code 0
@@ -2743,6 +2780,56 @@ skipping."
                   :exit-code 7)))))
     (should (string-match-p "Request Error  •  89ms  •  0B" line))
     (should-not (string-match-p "\\`0\\b" line))))
+
+(ert-deftest courier-format-network-logs-groups-summary-and-raw-details ()
+  (let* ((response
+          (list :status-code 0
+                :reason ""
+                :headers nil
+                :duration-ms 0
+                :size 0
+                :content-type nil
+                :stderr "curl: (7) Failed to connect to localhost port 8080 after 0 ms: Couldn't connect to server\n\nProcess courier-curl stderr finished\n"
+                :exit-code 7
+                :started-at nil
+                :command '("curl" "-H" "X-Name: hello world" "http://localhost:8080/demo")))
+         (request '(:method "POST"
+                    :url "http://localhost:8080/demo"))
+         (expected-command
+          (courier--shell-quoted-command
+           '("curl" "-H" "X-Name: hello world" "http://localhost:8080/demo")))
+         (logs
+          (substring-no-properties
+           (courier--format-network-logs
+            (plist-put response :started-at
+                       (date-to-time "2026-04-22T08:50:39Z"))
+            request))))
+    (should (string-match-p "^Summary$" logs))
+    (should (string-match-p
+             "Preparing request to http://localhost:8080/demo"
+             logs))
+    (should (string-match-p
+             "Started: 2026-04-22T08:50:39\\.000Z"
+             logs))
+    (should (string-match-p
+             "POST http://localhost:8080/demo"
+             logs))
+    (should (string-match-p "Trying localhost:8080\\.\\.\\." logs))
+    (should (string-match-p
+             "Connection failed after 0ms: Couldn't connect to server"
+             logs))
+    (should (string-match-p "Exit code: 7" logs))
+    (should (string-match-p "^Raw Command$" logs))
+    (should (string-match-p
+             (format "^\\$ %s$" (regexp-quote expected-command))
+             logs))
+    (should (string-match-p "^Raw stderr$" logs))
+    (should (string-match-p
+             "^curl: (7) Failed to connect to localhost port 8080 after 0 ms: Couldn't connect to server$"
+             logs))
+    (should-not (string-match-p
+                 "Process courier-curl stderr finished"
+                 logs))))
 
 (ert-deftest courier-response-status-face-treats-local-errors-as-error ()
   (should (eq (courier--response-status-face
@@ -2910,8 +2997,12 @@ skipping."
      courier-test--request)
     (courier-response-set-tab 'tests)
     (should (eq courier--response-tab 'tests))
-    (should (string-match-p "\\` View: Tests(1)  200 OK  •  10ms  •  12B"
-                            (substring-no-properties header-line-format)))
+    (should (equal (courier-test--current-response-summary-line)
+                   "200 OK  •  10ms  •  12B  •  text/plain"))
+    (should (courier-test--request-divider-matches-p
+             "Tests(1)"
+             (courier-test--current-response-divider-line)))
+    (should-not header-line-format)
     (should (string-match-p "status == 200" (buffer-string)))))
 
 (ert-deftest courier-response-tab-switch-resets-point-to-top ()
@@ -2959,27 +3050,33 @@ skipping."
     (search-forward "200 OK")
     (courier-response-activate)
     (should (= courier--history-index 1))
-    (should (string-match-p "2/2"
-                            (substring-no-properties header-line-format)))
+    (should (equal (courier-test--current-response-summary-line)
+                   "200 OK  •  42ms  •  5B  •  text/plain"))
+    (should (courier-test--request-divider-matches-p
+             "Timeline: 2/2"
+             (courier-test--current-response-divider-line)))
     (should (= (plist-get courier--response :status-code) 404))
     (should (eq courier--response-tab 'timeline))
     (should (string-match-p "GET https://example.com" (buffer-string)))))
 
-(ert-deftest courier-response-header-line-shows-summary-only ()
+(ert-deftest courier-response-scaffold-shows-summary-and-view ()
   (with-temp-buffer
     (courier--render-response
      (courier-test--make-response 200)
      courier-test--request)
-    (let ((line (substring-no-properties header-line-format)))
-      (should (string-match-p
-               "\\` View: Response  200 OK  •  42ms  •  5B"
-               line))
-      (courier-response-set-tab 'headers)
-      (should (string-match-p
-               "\\` View: Headers(1)  200 OK  •  42ms  •  5B"
-               (substring-no-properties header-line-format))))))
+    (should (equal (courier-test--current-response-summary-line)
+                   "200 OK  •  42ms  •  5B  •  text/plain"))
+    (should (courier-test--request-divider-matches-p
+             "Response: Raw"
+             (courier-test--current-response-divider-line)))
+    (courier-response-set-tab 'headers)
+    (should (equal (courier-test--current-response-summary-line)
+                   "200 OK  •  42ms  •  5B  •  text/plain"))
+    (should (courier-test--request-divider-matches-p
+             "Headers(1)"
+             (courier-test--current-response-divider-line)))))
 
-(ert-deftest courier-response-buffer-does-not-render-top-navigation-row ()
+(ert-deftest courier-response-buffer-renders-summary-and-divider-scaffold ()
   (with-temp-buffer
     (courier--render-response
      '(:status-code 200
@@ -2993,17 +3090,64 @@ skipping."
        :stderr ""
        :exit-code 0)
      courier-test--request)
-    (goto-char (point-min))
-    (should-not (search-forward "Headers(1)" (line-end-position) t))
-    (should (string-match-p "\\` View: Response  200 OK  •  10ms  •  12B"
-                            (substring-no-properties header-line-format)))))
+    (should (equal (courier-test--current-response-summary-line)
+                   "200 OK  •  10ms  •  12B  •  text/plain"))
+    (should (courier-test--request-divider-matches-p
+             "Response: Raw"
+             (courier-test--current-response-divider-line)))
+    (should-not header-line-format)))
+
+(ert-deftest courier-response-divider-line-adapts-to-target-width ()
+  (with-temp-buffer
+    (courier--render-response
+     (courier-test--make-response 200)
+     courier-test--request)
+    (cl-letf (((symbol-function 'courier--response-divider-target-width)
+               (lambda () 60)))
+      (let ((divider
+             (courier--response-divider-line
+              (courier--response-divider-label courier--response))))
+        (should (= (string-width divider)
+                   (- 60 courier--response-divider-safe-margin)))
+        (should (courier-test--request-divider-matches-p
+                 "Response: Raw"
+                 divider))))))
+
+(ert-deftest courier-response-divider-line-refreshes-after-window-change ()
+  (with-temp-buffer
+    (courier--render-response
+     (courier-test--make-response 200)
+     courier-test--request)
+    (let ((original (courier-test--current-response-divider-line)))
+      (cl-letf (((symbol-function 'get-buffer-window)
+                 (lambda (&rest _args)
+                   (selected-window)))
+                ((symbol-function 'courier--response-divider-target-width)
+                 (lambda () 60)))
+        (courier--refresh-response-after-window-change))
+      (let ((updated (courier-test--current-response-divider-line)))
+        (should (courier-test--request-divider-matches-p
+                 "Response: Raw"
+                 updated))
+        (should (= (string-width updated)
+                   (- 60 courier--response-divider-safe-margin)))
+        (should-not (equal updated original))))))
 
 (ert-deftest courier-response-timeline-network-logs-switches-section ()
   (with-temp-buffer
     (courier--render-response
-     (courier-test--make-response 403)
+     '(:status-code 0
+       :reason ""
+       :headers nil
+       :duration-ms 42
+       :size 0
+       :body-text nil
+       :content-type nil
+       :stderr "curl: (7) Failed to connect to localhost port 8080 after 0 ms: Couldn't connect to server"
+       :exit-code 7
+       :command ("curl" "http://localhost:8080/zj_oms_war/oilPlan/planSubmit.pl"))
      '(:method "POST"
-       :url "https://example.com/users"
+       :url "http://localhost:8080/zj_oms_war/oilPlan/planSubmit.pl"
        :headers (("content-type" . "application/json"))
        :body "{\"name\":\"Lucy\"}"
        :path "/tmp/test.http"))
@@ -3012,7 +3156,12 @@ skipping."
     (courier--toggle-timeline-section 'network-logs)
     (should (eq courier--response-tab 'timeline))
     (should (memq 'network-logs courier--timeline-expanded-sections))
-    (should (string-match-p "Exit code:" (buffer-string)))))
+    (should (string-match-p "Summary" (buffer-string)))
+    (should (string-match-p
+             "Preparing request to http://localhost:8080/zj_oms_war/oilPlan/planSubmit.pl"
+             (buffer-string)))
+    (should (string-match-p "Raw Command" (buffer-string)))
+    (should (string-match-p "Raw stderr" (buffer-string)))))
 
 (ert-deftest courier-response-timeline-defaults-to-collapsed-history ()
   (with-temp-buffer
@@ -3038,8 +3187,9 @@ skipping."
      courier-test--request)
     (courier-response-set-tab 'timeline)
     (courier--select-history-index 0)
-    (should (= 0 (courier-test--count-matches "404 OK" (buffer-string))))
-    (should (= 1 (courier-test--count-matches "200 OK" (buffer-string))))))
+    (let ((history (courier-test--response-history-string)))
+      (should (= 0 (courier-test--count-matches "404 OK" history)))
+      (should (= 1 (courier-test--count-matches "200 OK" history))))))
 
 (ert-deftest courier-response-timeline-selection-keeps-point-on-entry ()
   (with-temp-buffer
@@ -3067,7 +3217,7 @@ skipping."
       (should button)
       (should (eq 'network-logs (button-get button 'courier-timeline-tab))))))
 
-(ert-deftest courier-response-timeline-section-toggle-preserves-header-line ()
+(ert-deftest courier-response-timeline-section-toggle-preserves-scaffold ()
   (with-temp-buffer
     (courier--render-response
      (courier-test--make-response 200)
@@ -3075,8 +3225,11 @@ skipping."
     (courier-response-set-tab 'timeline)
     (courier--select-history-index 0)
     (courier--toggle-timeline-section 'network-logs)
-    (should (string-match-p "\\` View: Timeline  200 OK  •  42ms  •  5B"
-                            (substring-no-properties header-line-format)))))
+    (should (equal (courier-test--current-response-summary-line)
+                   "200 OK  •  42ms  •  5B  •  text/plain"))
+    (should (courier-test--request-divider-matches-p
+             "Timeline: 1/1"
+             (courier-test--current-response-divider-line)))))
 
 (ert-deftest courier-response-timeline-response-view-shows-header-count ()
   (with-temp-buffer
@@ -3094,8 +3247,7 @@ skipping."
      (courier-test--make-response 200)
      courier-test--request)
     (courier-response-set-tab 'timeline)
-    (goto-char (point-min))
-    (search-forward "200 OK")
+    (courier-test--goto-response-history-entry 0)
     (let ((button (button-at (point))))
       (should button)
       (should (= (button-get button 'courier-history-index) 0)))))
@@ -3106,10 +3258,9 @@ skipping."
      (courier-test--make-response 200)
      courier-test--request)
     (courier-response-set-tab 'timeline)
-    (goto-char (point-min))
-    (search-forward "200 OK")
+    (courier-test--goto-response-history-entry 0)
     (let* ((button (button-at (point)))
-           (face (get-text-property (1- (point)) 'face)))
+           (face (get-text-property (point) 'face)))
       (should button)
       (should-not (member 'button (if (listp face) face (list face)))))))
 
@@ -3119,9 +3270,8 @@ skipping."
      (courier-test--make-response 200)
      courier-test--request)
     (courier-response-set-tab 'timeline)
-    (goto-char (point-min))
-    (search-forward "200 OK")
-    (let ((face (get-text-property (1- (point)) 'face)))
+    (courier-test--goto-response-history-entry 0)
+    (let ((face (get-text-property (point) 'face)))
       (should (member 'courier-response-timeline-entry-face
                       (if (listp face) face (list face)))))))
 
@@ -3162,10 +3312,10 @@ skipping."
      courier-test--request)
     (courier-response-set-tab 'timeline)
     (courier--select-history-index 0)
-    (let ((buffer (buffer-string)))
-      (should (string-match-p "GET https://example.com" buffer))
-      (should-not (string-match-p "200 OK" buffer))
-      (should-not (string-match-p "42ms  •  5B" buffer)))))
+    (let ((history (courier-test--response-history-string)))
+      (should (string-match-p "GET https://example.com" history))
+      (should-not (string-match-p "200 OK" history))
+      (should-not (string-match-p "42ms  •  5B" history)))))
 
 (ert-deftest courier-response-context-tab-activates-timeline-button ()
   (with-temp-buffer
@@ -3173,8 +3323,7 @@ skipping."
      (courier-test--make-response 200)
      courier-test--request)
     (courier-response-set-tab 'timeline)
-    (goto-char (point-min))
-    (search-forward "200 OK")
+    (courier-test--goto-response-history-entry 0)
     (courier-response-context-tab)
     (should (= courier--history-index 0))))
 
@@ -3187,17 +3336,15 @@ skipping."
      (courier-test--make-response 404)
      courier-test--request)
     (courier-response-set-tab 'timeline)
-    (goto-char (point-min))
-    (search-forward "200 OK")
-    (end-of-line)
+    (courier-test--goto-response-history-entry 1)
     (courier-response-context-tab)
     (should (= courier--history-index 1))
     (should (= 1 (courier--timeline-index-at-point)))
-    (let ((buffer (buffer-string)))
-      (should (string-match-p "404 OK" buffer))
-      (should-not (string-match-p "200 OK" buffer))
-      (should (> (or (string-match "\\[[-+]\\] Request" buffer) -1)
-                  (or (string-match "GET https://example.com" buffer) -1))))))
+    (let ((history (courier-test--response-history-string)))
+      (should (string-match-p "404 OK" history))
+      (should-not (string-match-p "200 OK" history))
+      (should (> (or (string-match "\\[[-+]\\] Request" history) -1)
+                  (or (string-match "GET https://example.com" history) -1))))))
 
 (ert-deftest courier-response-context-tab-collapses-current-entry-inline ()
   (with-temp-buffer
@@ -3208,8 +3355,7 @@ skipping."
      (courier-test--make-response 404)
      courier-test--request)
     (courier-response-set-tab 'timeline)
-    (goto-char (point-min))
-    (search-forward "200 OK")
+    (courier-test--goto-response-history-entry 1)
     (courier-response-context-tab)
     (should (= courier--history-index 1))
     (courier-response-context-tab)
@@ -3541,6 +3687,45 @@ skipping."
                     (overlay-end courier--method-overlay))
                    "GET"))))
 
+(ert-deftest courier-request-mode-lighter-shows-current-section ()
+  (courier-test--with-request
+      (courier-test--http-content
+       :name "Demo"
+       :url "https://example.com/users/42")
+    (courier-request-mode)
+    (should (equal (courier--mode-line-lighter)
+                   "Courier Body: JSON"))))
+
+(ert-deftest courier-request-mode-lighter-includes-collection-env-and-section ()
+  (courier-test--with-temp-dir (root)
+    (let* ((collection-root (expand-file-name "collections/api-collection" root))
+           (request-root (expand-file-name "requests" collection-root))
+           (request-path (expand-file-name "demo.http" request-root))
+           (env-dir (expand-file-name "env" collection-root))
+           (config-path (expand-file-name "courier.json" collection-root)))
+      (make-directory request-root t)
+      (make-directory env-dir t)
+      (with-temp-file config-path
+        (insert "{\n"
+                "  \"name\": \"My API\",\n"
+                "  \"defaultEnv\": \"local\"\n"
+                "}\n"))
+      (with-temp-file (expand-file-name "local.env" env-dir)
+        (insert "base_url=https://api.example.com\n"))
+      (with-temp-buffer
+        (insert (courier-test--http-content
+                 :name "Demo"
+                 :url "{{base_url}}/users/42"
+                 :auth '(:type bearer :token "{{token}}")))
+        (setq-local buffer-file-name request-path)
+        (setq-local default-directory request-root)
+        (courier-request-mode)
+        (should (equal (courier--mode-line-lighter)
+                       "Courier[My API/local] Body: JSON"))
+        (courier-request-jump-section 'auth)
+        (should (equal (courier--mode-line-lighter)
+                       "Courier[My API/local] Authentication: Bearer"))))))
+
 (ert-deftest courier-request-divider-line-shows-primary-navigation ()
   (courier-test--with-request
       (courier-test--http-content
@@ -3594,7 +3779,8 @@ skipping."
     (cl-letf (((symbol-function 'courier--request-divider-target-width)
                (lambda () 60)))
       (let ((divider (courier--request-divider-line)))
-        (should (= (string-width divider) 60))
+        (should (= (string-width divider)
+                   (- 60 courier--request-divider-safe-margin)))
         (should (courier-test--request-divider-matches-p "Body: JSON" divider))))))
 
 (ert-deftest courier-request-divider-line-prefers-left-biased-label ()
@@ -3624,7 +3810,8 @@ skipping."
         (courier--refresh-request-divider-after-window-change))
       (let ((updated (courier-test--current-request-divider-line)))
         (should (courier-test--request-divider-matches-p "Body: JSON" updated))
-        (should (= (string-width updated) 60))
+        (should (= (string-width updated)
+                   (- 60 courier--request-divider-safe-margin)))
         (should-not (equal updated original))))))
 
 (ert-deftest courier-request-mode-clears-header-line ()
@@ -3813,6 +4000,74 @@ skipping."
         (when (buffer-live-p response-buffer)
           (kill-buffer response-buffer))))))
 
+(ert-deftest courier-request-send-surfaces-launch-errors-in-response-buffer ()
+  (courier-test--with-request
+      (courier-test--http-content
+       :method "GET"
+       :url "https://example.com")
+    (courier-request-mode)
+    (let (response-buffer)
+      (cl-letf (((symbol-function 'display-buffer)
+                 (lambda (buffer &rest _args)
+                   (setq response-buffer buffer)
+                   buffer))
+                ((symbol-function 'courier-send-request)
+                 (lambda (&rest _args)
+                   (error "fork failed"))))
+        (courier-request-send))
+      (unwind-protect
+          (with-current-buffer response-buffer
+            (should (equal (plist-get courier--response :reason)
+                           "Request Launch Error"))
+            (should (eq (courier--response-status-face courier--response)
+                        'courier-response-status-error-face))
+            (should (string-match-p
+                     "Request launch error: fork failed"
+                     (courier--format-body courier--response)))
+            (should-not (equal (courier-test--current-response-summary-line)
+                               "Sending...")))
+        (when (buffer-live-p response-buffer)
+          (kill-buffer response-buffer))))))
+
+(ert-deftest courier-send-resolved-request-cleans-temp-resources-on-launch-error ()
+  (courier-test--with-temp-files ((header ".headers")
+                                  (body ".body")
+                                  (request-body ".request-body")
+                                  (meta ".meta"))
+    (let ((stdout-buffer (generate-new-buffer " *courier-test-stdout*"))
+          (stderr-buffer (generate-new-buffer " *courier-test-stderr*")))
+      (unwind-protect
+          (progn
+            (dolist (path (list header body request-body meta))
+              (with-temp-file path
+                (insert "temp")))
+            (cl-letf (((symbol-function 'courier--temp-files-for-request)
+                       (lambda ()
+                         (list :header header
+                               :body body
+                               :request-body request-body
+                               :meta meta
+                               :stdout stdout-buffer
+                               :stderr stderr-buffer)))
+                      ((symbol-function 'courier-build-curl-command)
+                       (lambda (&rest _args)
+                         '("curl" "https://example.com")))
+                      ((symbol-function 'make-process)
+                       (lambda (&rest _args)
+                         (error "fork failed"))))
+              (should-error
+               (courier--send-resolved-request
+                '(:method "GET" :url "https://example.com" :path "/tmp/test.http")
+                #'ignore))
+              (dolist (path (list header body request-body meta))
+                (should-not (file-exists-p path)))
+              (should-not (buffer-live-p stdout-buffer))
+              (should-not (buffer-live-p stderr-buffer))))
+        (when (buffer-live-p stdout-buffer)
+          (kill-buffer stdout-buffer))
+        (when (buffer-live-p stderr-buffer)
+          (kill-buffer stderr-buffer))))))
+
 (ert-deftest courier-request-section-type-routes-vars-to-response-var ()
   (courier-test--with-request
       (courier-test--http-content
@@ -3856,6 +4111,12 @@ skipping."
   (should-not (courier-test--local-map-binding courier--response-mode-map "h"))
   (should-not (courier-test--local-map-binding courier--response-mode-map "l"))
   (should-not (courier-test--local-map-binding courier--response-mode-map "t")))
+
+(ert-deftest courier-response-mode-clears-header-line ()
+  (with-temp-buffer
+    (setq-local header-line-format "stale")
+    (courier--response-mode)
+    (should-not header-line-format)))
 
 (ert-deftest courier-response-jump-tab-switches-view ()
   (with-temp-buffer

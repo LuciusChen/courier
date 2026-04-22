@@ -41,7 +41,7 @@ Write a postmortem when:
 
 Write why, not what. The code already shows what changed.
 
-Long technical specifications do not belong in `CLAUDE.md`. Put detailed
+Long technical specifications do not belong in `AGENTS.md`. Put detailed
 formats, protocols, or migration rules in a separate document and link to them
 from the relevant postmortem.
 

@@ -446,8 +446,8 @@ Acceptance:
 
 Deliver:
 
-- cleaner header line
-- a header-line current-view indicator for Response, Headers, Timeline, and Tests,
+- cleaner response scaffold
+- an in-buffer current-view indicator for Response, Headers, Timeline, and Tests,
   switched through a jump command
 - a collapsed-by-default Timeline list
 - expandable Timeline detail sections for Request, Response, and Network Logs
