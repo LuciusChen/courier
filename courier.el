@@ -1993,12 +1993,17 @@ transport failures do not leave the outgoing payload in BODY-FILE."
   (let* ((settings (plist-get resolved-request :settings))
          (timeout (or (plist-get settings :timeout) courier-default-timeout))
          (follow-redirects (plist-get settings :follow-redirects))
+         (method (plist-get resolved-request :method))
          (command (list courier-curl-executable
                         "-sS"
                         "-D" header-file
                         "-o" body-file
-                        "-w" (format "@%s" meta-file)
-                        "-X" (plist-get resolved-request :method))))
+                        "-w" (format "@%s" meta-file))))
+    (setq command
+          (append command
+                  (if (string= method "HEAD")
+                      '("--head")
+                    (list "-X" method))))
     (when timeout
       (setq command (append command (list "--max-time" (number-to-string timeout)))))
     (when follow-redirects
@@ -2209,6 +2214,9 @@ COMMAND becomes the recorded curl command for the returned response."
             (with-temp-file meta-file
               (when (buffer-live-p stdout-buffer)
                 (insert (with-current-buffer stdout-buffer (buffer-string)))))
+            (when (and (equal (plist-get request :method) "HEAD")
+                       body-file)
+              (with-temp-file body-file))
             (setq response
                   (condition-case err
                       (courier-parse-response

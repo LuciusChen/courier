@@ -36,8 +36,6 @@ Clone this repository and add it to your =load-path=:
 (require 'courier)
 #+end_src
 
-License: MIT. See [[file:LICENSE][LICENSE]].
-
 * Quick Start
 
 Create a file =example.http=:
@@ -644,3 +642,8 @@ These integration tests start a local Python stdlib HTTP server from
 =test/server/courier_test_server.py=. When =python3= is unavailable, they skip
 instead of producing false positives. They also skip in restricted
 environments that forbid binding a localhost port.
+
+* License
+
+Courier is distributed under the MIT License. See [[file:LICENSE][LICENSE]] for
+the full license text.

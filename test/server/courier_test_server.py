@@ -211,6 +211,7 @@ class CourierTestHandler(BaseHTTPRequestHandler):
         *,
         content_type: str,
         extra_headers: dict[str, str] | None = None,
+        send_body: bool = True,
     ) -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
@@ -219,10 +220,24 @@ class CourierTestHandler(BaseHTTPRequestHandler):
             for key, value in extra_headers.items():
                 self.send_header(key, value)
         self.end_headers()
-        self.wfile.write(body)
+        if send_body:
+            self.wfile.write(body)
 
-    def _send_json(self, status: int, payload: object) -> None:
-        self._send_bytes(status, json_bytes(payload), content_type="application/json")
+    def _send_json(
+        self,
+        status: int,
+        payload: object,
+        *,
+        extra_headers: dict[str, str] | None = None,
+        send_body: bool = True,
+    ) -> None:
+        self._send_bytes(
+            status,
+            json_bytes(payload),
+            content_type="application/json",
+            extra_headers=extra_headers,
+            send_body=send_body,
+        )
 
     def _request_summary(self, body: bytes | None = None) -> dict[str, object]:
         split = urlsplit(self.path)
@@ -236,9 +251,37 @@ class CourierTestHandler(BaseHTTPRequestHandler):
             "body_sha256": hashlib.sha256(body or b"").hexdigest(),
         }
 
+    def _send_request_summary(
+        self,
+        body: bytes | None = None,
+        *,
+        send_body: bool = True,
+        extra_headers: dict[str, str] | None = None,
+    ) -> None:
+        self._send_json(
+            200,
+            self._request_summary(body),
+            extra_headers=extra_headers,
+            send_body=send_body,
+        )
+
+    def _send_status_response(self, *, send_body: bool = True) -> bool:
+        split = urlsplit(self.path)
+        parts = split.path.strip("/").split("/")
+        if len(parts) != 2 or parts[0] != "status":
+            return False
+        try:
+            status = int(parts[1])
+        except ValueError:
+            status = 400
+        self._send_json(status, {"status": status, "path": split.path}, send_body=send_body)
+        return True
+
     def do_GET(self) -> None:
+        if self._send_status_response():
+            return
         if self.path.startswith("/echo"):
-            self._send_json(200, self._request_summary())
+            self._send_request_summary()
             return
         if self.path.startswith("/redirect"):
             self.send_response(302)
@@ -279,8 +322,10 @@ class CourierTestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         body = self._read_body()
+        if self._send_status_response():
+            return
         if self.path.startswith("/echo"):
-            self._send_json(200, self._request_summary(body))
+            self._send_request_summary(body)
             return
         if self.path.startswith("/binary"):
             self._send_json(
@@ -319,6 +364,42 @@ class CourierTestHandler(BaseHTTPRequestHandler):
                 self._send_json(401, {"error": "invalid_client", "form": form})
             return
         self._send_json(404, {"error": "not_found", "path": self.path})
+
+    def _handle_summary_method(self) -> None:
+        body = self._read_body()
+        if self._send_status_response():
+            return
+        if self.path.startswith("/echo"):
+            self._send_request_summary(body)
+            return
+        self._send_json(404, {"error": "not_found", "path": self.path})
+
+    def do_PUT(self) -> None:
+        self._handle_summary_method()
+
+    def do_PATCH(self) -> None:
+        self._handle_summary_method()
+
+    def do_DELETE(self) -> None:
+        self._handle_summary_method()
+
+    def do_OPTIONS(self) -> None:
+        self._handle_summary_method()
+
+    def do_HEAD(self) -> None:
+        if self._send_status_response(send_body=False):
+            return
+        if self.path.startswith("/echo"):
+            self._send_request_summary(
+                send_body=False,
+                extra_headers={"X-Courier-Method": "HEAD"},
+            )
+            return
+        self._send_json(
+            404,
+            {"error": "not_found", "path": self.path},
+            send_body=False,
+        )
 
 
 def main() -> int:

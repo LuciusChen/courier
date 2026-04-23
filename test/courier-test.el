@@ -1237,6 +1237,19 @@ skipping."
       (should (string= (courier-test--argv-flag-value argv "-o") body))
       (should (equal (car (last argv)) "https://example.com")))))
 
+(ert-deftest courier-build-curl-command-head-uses-head-mode ()
+  (courier-test--with-temp-files ((header ".headers") (body ".body") (meta ".meta"))
+    (let ((argv (courier-build-curl-command
+                 '(:method "HEAD"
+                   :url "https://example.com"
+                   :headers nil
+                   :body ""
+                   :settings nil)
+                 header body meta)))
+      (should (member "--head" argv))
+      (should-not (courier-test--argv-flag-value argv "-X"))
+      (should (equal (car (last argv)) "https://example.com")))))
+
 (ert-deftest courier-build-curl-command-post-with-body ()
   (courier-test--with-temp-files ((header ".headers")
                                   (body ".body")
@@ -1477,8 +1490,55 @@ skipping."
                      "1"))
       (should (equal (courier-test--json-get (courier-test--json-get payload "headers")
                                              "content-type")
-                     "application/json"))
+                                             "application/json"))
       (should (string-match-p "courier" (courier-test--json-get payload "body_text"))))))
+
+(ert-deftest courier-integration-body-types-round-trip-via-local-server ()
+  (courier-test--with-integration-server (server)
+    (dolist (case (list (list :label "form-urlencoded"
+                              :body-type 'form-urlencoded
+                              :body "name={{name}}&mode={{mode}}"
+                              :vars '(("name" . "Lucy Chen")
+                                      ("mode" . "demo"))
+                              :expected-content-type
+                              "application/x-www-form-urlencoded"
+                              :expected-body "name=Lucy%20Chen&mode=demo")
+                        (list :label "text"
+                              :body-type 'text
+                              :body "Courier says {{word}}."
+                              :vars '(("word" . "hello"))
+                              :expected-content-type
+                              "text/plain; charset=utf-8"
+                              :expected-body "Courier says hello.")
+                        (list :label "xml"
+                              :body-type 'xml
+                              :body "<message>{{word}}</message>"
+                              :vars '(("word" . "hello"))
+                              :expected-content-type "application/xml"
+                              :expected-body "<message>hello</message>")))
+      (ert-info ((plist-get case :label))
+        (let* ((response
+                (courier-test--send-sync
+                 (list :path "/tmp/body-type.http"
+                       :name (plist-get case :label)
+                       :method "POST"
+                       :url (concat (plist-get server :base-url) "/echo")
+                       :headers nil
+                       :body (plist-get case :body)
+                       :body-type (plist-get case :body-type)
+                       :params nil
+                       :vars (plist-get case :vars)
+                       :tests nil
+                       :settings nil)))
+               (payload (courier-test--json-body response)))
+          (should (= (plist-get response :status-code) 200))
+          (should (equal (courier-test--json-get payload "method") "POST"))
+          (should (equal (courier-test--json-get
+                          (courier-test--json-get payload "headers")
+                          "content-type")
+                         (plist-get case :expected-content-type)))
+          (should (equal (courier-test--json-get payload "body_text")
+                         (plist-get case :expected-body))))))))
 
 (ert-deftest courier-integration-multipart-request-sends-real-parts ()
   (courier-test--with-integration-server (server)
@@ -1552,6 +1612,57 @@ skipping."
         (should (equal (courier-test--json-get payload "body_sha256")
                        (secure-hash 'sha256 "courier-binary-payload")))))))
 
+(ert-deftest courier-integration-supported-methods-round-trip-via-local-server ()
+  (courier-test--with-integration-server (server)
+    (dolist (method '("PUT" "PATCH" "DELETE" "OPTIONS"))
+      (ert-info (method)
+        (let* ((response
+                (courier-test--send-sync
+                 (list :path "/tmp/method.http"
+                       :name method
+                       :method method
+                       :url (concat (plist-get server :base-url) "/echo")
+                       :headers nil
+                       :body ""
+                       :body-type 'none
+                       :params '(("method" . "{{method}}"))
+                       :vars `(("method" . ,method))
+                       :tests nil
+                       :settings nil)))
+               (payload (courier-test--json-body response)))
+          (should (= (plist-get response :status-code) 200))
+          (should (equal (courier-test--json-get payload "method") method))
+          (should (equal (courier-test--json-get
+                          (courier-test--json-get payload "query")
+                          "method")
+                         method)))))))
+
+(ert-deftest courier-integration-head-request-keeps-headers-without-body ()
+  (courier-test--with-integration-server (server)
+    (let ((response
+           (courier-test--send-sync
+            (list :path "/tmp/head.http"
+                  :name "HEAD"
+                  :method "HEAD"
+                  :url (concat (plist-get server :base-url) "/echo")
+                  :headers nil
+                  :body ""
+                  :body-type 'none
+                  :params nil
+                  :vars nil
+                  :tests nil
+                  :settings nil))))
+      (should (= (plist-get response :status-code) 200))
+      (should (equal (plist-get response :content-type) "application/json"))
+      (should (equal (cdr (assoc-string "x-courier-method"
+                                        (plist-get response :headers)
+                                        nil))
+                     "HEAD"))
+      (should (= (file-attribute-size
+                  (file-attributes (plist-get response :body-file)))
+                 0))
+      (should (string-empty-p (or (plist-get response :body-text) ""))))))
+
 (ert-deftest courier-integration-transport-error-does-not-reuse-request-body ()
   (courier-test--with-integration-server (server)
     (let* ((cipher-body "{\"cipher\":\"courier-test\"}")
@@ -1575,6 +1686,71 @@ skipping."
       (should (file-exists-p body-file))
       (should (= (file-attribute-size (file-attributes body-file)) 0))
       (should-not (plist-get response :body-text)))))
+
+(ert-deftest courier-integration-follow-redirects-uses-last-response ()
+  (courier-test--with-integration-server (server)
+    (let* ((response
+            (courier-test--send-sync
+             (list :path "/tmp/redirect.http"
+                   :name "Redirect"
+                   :method "GET"
+                   :url (concat (plist-get server :base-url) "/redirect")
+                   :headers nil
+                   :body ""
+                   :body-type 'none
+                   :params nil
+                   :vars nil
+                   :tests nil
+                   :settings '(:follow-redirects t))))
+           (payload (courier-test--json-body response)))
+      (should (= (plist-get response :status-code) 200))
+      (should (equal (courier-test--json-get payload "path") "/echo"))
+      (should (equal (courier-test--json-get
+                      (courier-test--json-get payload "query")
+                      "redirected")
+                     "1")))))
+
+(ert-deftest courier-integration-redirect-without-follow-preserves-302 ()
+  (courier-test--with-integration-server (server)
+    (let ((response
+           (courier-test--send-sync
+            (list :path "/tmp/redirect-no-follow.http"
+                  :name "Redirect Without Follow"
+                  :method "GET"
+                  :url (concat (plist-get server :base-url) "/redirect")
+                  :headers nil
+                  :body ""
+                  :body-type 'none
+                  :params nil
+                  :vars nil
+                  :tests nil
+                  :settings nil))))
+      (should (= (plist-get response :status-code) 302))
+      (should (equal (cdr (assoc-string "location"
+                                        (plist-get response :headers)
+                                        nil))
+                     "/echo?redirected=1")))))
+
+(ert-deftest courier-integration-status-404-preserves-error-response ()
+  (courier-test--with-integration-server (server)
+    (let* ((response
+            (courier-test--send-sync
+             (list :path "/tmp/status-404.http"
+                   :name "Status 404"
+                   :method "GET"
+                   :url (concat (plist-get server :base-url) "/status/404")
+                   :headers nil
+                   :body ""
+                   :body-type 'none
+                   :params nil
+                   :vars nil
+                   :tests nil
+                   :settings nil)))
+           (payload (courier-test--json-body response)))
+      (should (= (plist-get response :status-code) 404))
+      (should (equal (plist-get response :content-type) "application/json"))
+      (should (= (courier-test--json-get payload "status") 404))
+      (should (equal (courier-test--json-get payload "path") "/status/404")))))
 
 (ert-deftest courier-integration-response-processing-errors-surface ()
   (courier-test--with-integration-server (server)
