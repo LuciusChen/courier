@@ -543,6 +543,16 @@ When NORMALIZE-KEYS is non-nil, apply it to each key before storing the alist."
               line
               (apply #'format format-string args)))
 
+(defun courier--valid-request-method-p (method)
+  "Return non-nil when METHOD is a supported HTTP method."
+  (and (stringp method) (member method courier--allowed-methods)))
+
+(defun courier--ensure-request-method (method)
+  "Return METHOD if it is supported, otherwise signal `user-error'."
+  (unless (courier--valid-request-method-p method)
+    (user-error "Invalid HTTP method: %s" method))
+  method)
+
 (defun courier--env-name-for-file (file-name)
   "Return the environment name for FILE-NAME."
   (if (string= file-name ".env")
@@ -1027,7 +1037,7 @@ When RELAXED is non-nil, allow incomplete draft request lines."
                    (parts (courier--split-request-url url))
                    (base (nth 0 parts))
                    (fragment (nth 2 parts)))
-              (unless (member method courier--allowed-methods)
+              (unless (courier--valid-request-method-p method)
                 (courier--parse-error line-number "Invalid HTTP method: %s" method))
               (setq request-line-seen t)
               (plist-put request :method method)
@@ -1301,8 +1311,7 @@ When RELAXED is non-nil, allow incomplete draft request lines."
         (body-file-path (plist-get request :body-file-path))
         (body-parts (plist-get request :body-parts))
         (auth (plist-get request :auth)))
-    (unless (and (stringp method) (member method courier--allowed-methods))
-      (user-error "Invalid HTTP method: %s" method))
+    (courier--ensure-request-method method)
     (unless (and (stringp url) (not (string-empty-p url)))
       (user-error "Request URL must be present"))
     (unless (memq body-type courier--allowed-body-types)
@@ -5609,8 +5618,31 @@ directory even when it does not exist yet."
   "Return a draft buffer name for request NAME."
   (format "*courier-request: %s*" name))
 
-(defun courier--request-skeleton (name)
-  "Return initial draft text for request NAME."
+(defun courier--read-new-request-url ()
+  "Read the URL for a new Courier request."
+  (courier--normalize-new-request-url (read-string "Request URL: ")))
+
+(defun courier--normalize-new-request-url (url)
+  "Return normalized new request URL, or signal when URL is invalid."
+  (unless (stringp url)
+    (user-error "Request URL must be a string"))
+  (let ((trimmed (string-trim url)))
+    (when (string-empty-p trimmed)
+      (user-error "Request URL cannot be empty"))
+    (when (string-match-p "[[:space:]]" trimmed)
+      (user-error "Request URL cannot contain whitespace"))
+    trimmed))
+
+(defun courier--read-request-method (&optional default)
+  "Read an HTTP method, using DEFAULT when supplied."
+  (let ((default-method (or default courier-default-request-method)))
+    (completing-read "Method: "
+                     courier--allowed-methods
+                     nil t nil nil
+                     default-method)))
+
+(defun courier--request-skeleton (name method url)
+  "Return initial draft text for request NAME, METHOD, and URL."
   (concat "+++\n"
           "name = " (courier--toml-quote-string name) "\n"
           "\n"
@@ -5618,7 +5650,7 @@ directory even when it does not exist yet."
           "type = " (courier--toml-quote-string
                      (symbol-name courier-default-body-type)) "\n"
           "+++\n\n"
-          courier-default-request-method " \n"
+          method " " url "\n"
           "Accept: application/json\n"))
 
 (defun courier--collection-template (root &optional name)
@@ -7120,11 +7152,8 @@ Signal `user-error' when the current request line has no URL."
 (defun courier-request-set-method (method)
   "Set the current request line HTTP METHOD."
   (interactive
-   (list
-    (completing-read "Method: "
-                     courier--allowed-methods
-                     nil t nil nil
-                     (courier--current-method))))
+   (list (courier--read-request-method (courier--current-method))))
+  (setq method (courier--ensure-request-method method))
   (courier--sync-request-model)
   (plist-put courier--request-model :method method)
   (courier--render-request-buffer)
@@ -7449,15 +7478,19 @@ Unsaved request buffers choose a collection on first save."
       (courier--handle-open-env-selection selection candidates))))
 
 ;;;###autoload
-(defun courier-new-request ()
-  "Create a new unsaved Courier request draft."
-  (interactive)
-  (let* ((name (courier--next-untitled-request-name))
+(defun courier-new-request (url method)
+  "Create a new unsaved Courier request draft for URL and METHOD."
+  (interactive
+   (let ((url (courier--read-new-request-url)))
+     (list url (courier--read-request-method courier-default-request-method))))
+  (let* ((request-url (courier--normalize-new-request-url url))
+         (request-method (courier--ensure-request-method method))
+         (name (courier--next-untitled-request-name))
          (origin-root (courier--collection-root))
          (buffer (generate-new-buffer (courier--draft-buffer-name name))))
     (with-current-buffer buffer
       (setq-local default-directory (or origin-root default-directory))
-      (insert (courier--request-skeleton name))
+      (insert (courier--request-skeleton name request-method request-url))
       (courier-request-mode)
       (setq-local courier--collection-root-hint origin-root)
       (goto-char (point-min))

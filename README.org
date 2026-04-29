@@ -453,9 +453,10 @@ snippets such as =status == 200= and =header content-type contains json=.
 | =C-x C-s= | =courier-request-save-buffer=  | Save draft or file     |
 
 Use =M-x courier-new-request= or =C-c C-n= to open an unsaved draft buffer. The
-draft buffer is temporary and the request editor itself starts at the request
-line using =courier-default-request-method=, which defaults to =GET=. On the first
-=C-x C-s=, Courier asks which collection should own the request. Courier keeps
+command first asks for a non-empty request-line URL, then asks for the HTTP
+method using =courier-default-request-method= as the default. The draft buffer
+is temporary and starts at the completed request line. On the first =C-x C-s=,
+Courier asks which collection should own the request. Courier keeps
 collections under =courier-home-directory= in =collections/<name>/=. If you
 type a collection name that does not exist yet, Courier creates it there
 before saving the request into that collection's =requests/= directory. Courier

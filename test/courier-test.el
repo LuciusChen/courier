@@ -4532,6 +4532,17 @@ skipping."
              "Body: JSON"
              (courier-test--current-request-divider-line)))))
 
+(ert-deftest courier-request-set-method-rejects-invalid-method ()
+  (courier-test--with-request
+      (concat "+++\nname = \"Demo\"\n+++\n\n"
+              "GET https://example.com\n")
+    (courier-request-mode)
+    (should-error (courier-request-set-method "TRACE")
+                  :type 'user-error)
+    (should (equal (plist-get courier--request-model :method) "GET"))
+    (goto-char (point-min))
+    (should (looking-at "GET https://example.com"))))
+
 (ert-deftest courier-request-section-type-updates-request-body-model ()
   (courier-test--with-request
       (courier-test--http-content
@@ -5324,45 +5335,113 @@ skipping."
 
 (ert-deftest courier-new-request-creates-untitled-draft ()
   (let ((courier--untitled-request-counter 0)
+        (calls nil)
         created-buffer)
-    (save-window-excursion
-      (let ((default-directory temporary-file-directory))
-        (courier-new-request)
-        (setq created-buffer (current-buffer))
-        (should (derived-mode-p 'courier-request-mode))
-        (should-not buffer-file-name)
-        (should (string-prefix-p "GET \n" (buffer-string)))
-        (should (courier-test--request-divider-matches-p
-                 "Body: JSON"
-                 (courier-test--current-request-divider-line)))
-        (should-not header-line-format)
-        (should (= (line-number-at-pos) 1))
-        (should (= (point) (line-end-position)))
-        (should (equal (plist-get courier--request-model :name) "Untitled 1"))
-        (should (equal (plist-get courier--request-model :method) "GET"))))
-    (when (buffer-live-p created-buffer)
-      (kill-buffer created-buffer))))
+    (unwind-protect
+        (save-window-excursion
+          (let ((default-directory temporary-file-directory))
+            (cl-letf (((symbol-function 'read-string)
+                       (lambda (prompt &rest _args)
+                         (push prompt calls)
+                         "https://example.com/users"))
+                      ((symbol-function 'completing-read)
+                       (lambda (prompt collection &optional _predicate _require-match
+                                       _initial-input _hist def _inherit-input-method)
+                         (push prompt calls)
+                         (should (equal collection courier--allowed-methods))
+                         def)))
+              (call-interactively #'courier-new-request))
+            (setq created-buffer (current-buffer))
+            (should (derived-mode-p 'courier-request-mode))
+            (should-not buffer-file-name)
+            (should (equal (nreverse calls) '("Request URL: " "Method: ")))
+            (should (string-prefix-p "GET https://example.com/users\n" (buffer-string)))
+            (should (courier-test--request-divider-matches-p
+                     "Body: JSON"
+                     (courier-test--current-request-divider-line)))
+            (should-not header-line-format)
+            (should (= (line-number-at-pos) 1))
+            (should (= (point) (line-end-position)))
+            (should (equal (plist-get courier--request-model :name) "Untitled 1"))
+            (should (equal (plist-get courier--request-model :method) "GET"))
+            (should (equal (plist-get courier--request-model :url)
+                           "https://example.com/users"))))
+      (when (buffer-live-p created-buffer)
+        (kill-buffer created-buffer)))))
 
 (ert-deftest courier-new-request-uses-configured-default-method ()
   (let ((courier--untitled-request-counter 0)
         (courier-default-request-method "POST")
         created-buffer)
+    (unwind-protect
+        (save-window-excursion
+          (let ((default-directory temporary-file-directory))
+            (cl-letf (((symbol-function 'read-string)
+                       (lambda (_prompt &rest _args)
+                         "https://example.com/users"))
+                      ((symbol-function 'completing-read)
+                       (lambda (_prompt _collection &optional _predicate _require-match
+                                        _initial-input _hist def _inherit-input-method)
+                         def)))
+              (call-interactively #'courier-new-request))
+            (setq created-buffer (current-buffer))
+            (should (derived-mode-p 'courier-request-mode))
+            (should-not buffer-file-name)
+            (should (string-prefix-p "POST https://example.com/users\n" (buffer-string)))
+            (should (courier-test--request-divider-matches-p
+                     "Body: JSON"
+                     (courier-test--current-request-divider-line)))
+            (should-not header-line-format)
+            (should (= (line-number-at-pos) 1))
+            (should (= (point) (line-end-position)))
+            (should (equal (plist-get courier--request-model :method) "POST"))))
+      (when (buffer-live-p created-buffer)
+        (kill-buffer created-buffer)))))
+
+(ert-deftest courier-new-request-uses-selected-method ()
+  (let ((courier--untitled-request-counter 0)
+        created-buffer)
+    (unwind-protect
+        (save-window-excursion
+          (let ((default-directory temporary-file-directory))
+            (cl-letf (((symbol-function 'read-string)
+                       (lambda (_prompt &rest _args)
+                         "https://example.com/users"))
+                      ((symbol-function 'completing-read)
+                       (lambda (_prompt _collection &rest _args)
+                         "POST")))
+              (call-interactively #'courier-new-request))
+            (setq created-buffer (current-buffer))
+            (should (string-prefix-p "POST https://example.com/users\n"
+                                     (buffer-string)))
+            (should (equal (plist-get courier--request-model :method) "POST"))))
+      (when (buffer-live-p created-buffer)
+        (kill-buffer created-buffer)))))
+
+(ert-deftest courier-new-request-rejects-empty-url ()
+  (let ((courier--untitled-request-counter 0))
     (save-window-excursion
-      (let ((default-directory temporary-file-directory))
-        (courier-new-request)
-        (setq created-buffer (current-buffer))
-        (should (derived-mode-p 'courier-request-mode))
-        (should-not buffer-file-name)
-        (should (string-prefix-p "POST \n" (buffer-string)))
-        (should (courier-test--request-divider-matches-p
-                 "Body: JSON"
-                 (courier-test--current-request-divider-line)))
-        (should-not header-line-format)
-        (should (= (line-number-at-pos) 1))
-        (should (= (point) (line-end-position)))
-        (should (equal (plist-get courier--request-model :method) "POST"))))
-    (when (buffer-live-p created-buffer)
-      (kill-buffer created-buffer))))
+      (cl-letf (((symbol-function 'read-string)
+                 (lambda (_prompt &rest _args)
+                   "  ")))
+        (should-error (call-interactively #'courier-new-request)
+                      :type 'user-error)
+        (should (= courier--untitled-request-counter 0))))))
+
+(ert-deftest courier-new-request-rejects-whitespace-url ()
+  (let ((courier--untitled-request-counter 0))
+    (save-window-excursion
+      (should-error
+       (courier-new-request "https://example.com/users with-space" "GET")
+       :type 'user-error)
+      (should (= courier--untitled-request-counter 0)))))
+
+(ert-deftest courier-new-request-rejects-invalid-method ()
+  (let ((courier--untitled-request-counter 0))
+    (save-window-excursion
+      (should-error (courier-new-request "https://example.com/users" "TRACE")
+                    :type 'user-error)
+      (should (= courier--untitled-request-counter 0)))))
 
 (ert-deftest courier-draft-and-response-buffers-use-distinct-names ()
   (should (equal (courier--draft-buffer-name "Untitled 1")
