@@ -14,7 +14,7 @@ buffers.
 - Built-in test assertions for status, headers, body, timing, and size
 - Preview resolved requests before sending
 - Select per-buffer environments from collection =env/*.env= files with =C-c C-e=
-- Pretty-print JSON responses, with =v= to toggle raw view
+- Pretty-print JSON responses, with =v= to choose a body view and =V= to toggle raw/auto
 - Start unsaved request drafts and place them into a collection on first save
 - Open requests with =C-c C-o= from one annotated minibuffer picker, even
   outside an active Courier buffer
@@ -66,8 +66,6 @@ Open it in Emacs. Press =C-c C-c= to send.
 If Courier fails before =curl= starts, such as while syncing section edits,
 validating the request, or running a pre-request script, =C-c C-c= still opens
 the response buffer and shows a =Request Preparation Error= state.
-
-[[file:docs/images/request-response-json-ui.png]]
 
 * Collections
 
@@ -543,9 +541,10 @@ major mode, image views display the image when Emacs can render it, and PDF
 documents open as file-backed viewers with =doc-view-mode= when available. The
 main response buffer also applies syntax highlighting to =json=, =html=,
 =xml=, and =javascript= body views. The response header line stays visible
-while scrolling and shows the current response view plus status, duration,
-size, and content type. The buffer body starts directly with the active
-response view. Use =C-c C-j= to jump directly to a response view.
+while scrolling. In Response, Headers, and Tests views it shows the current
+view plus status, duration, size, and content type; in Timeline it shows the
+history position, such as =Timeline: 2/5=. The buffer body starts directly with
+the active response view. Use =C-c C-j= to jump directly to a response view.
 Use =C-c ?= in request and response buffers to open a transient menu for the
 actions that make sense in the current Courier context.
 The response summary can therefore describe both remote and local failure
@@ -561,13 +560,13 @@ The response buffer has four top-level views:
 - *Headers* shows response headers in a two-column layout.
 - *Timeline* shows previous responses for the same request. It also has its own
   collapsed history list by default. Press =RET= on a history entry to expand
-  it. The expanded entry is removed from the collapsed list below it. When
-  expanded, Timeline behaves like a small section view:
+  it. The selected entry stays visible in the history list, with its details
+  grouped below it. When expanded, Timeline behaves like a small section view:
   - *Request* shows the request URL, headers, and body snapshot that produced
     the selected history entry.
   - *Response* shows the selected historical response headers and body.
-- *Network Logs* shows a structured transport summary first, then keeps the
-  raw curl command and raw stderr below it for copy-paste debugging.
+  - *Network Logs* shows a structured transport summary first, then keeps the
+    raw curl command and raw stderr below it for copy-paste debugging.
   Those section headings are buttons: use =RET= or mouse-1 on them to toggle
   sections open and closed. Use =M-x courier-response-clear-timeline= or the
   response transient menu to clear the current response buffer's timeline

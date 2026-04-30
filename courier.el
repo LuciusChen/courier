@@ -281,6 +281,24 @@ root."
     (t :inherit warning :weight bold))
   "Face used for Courier timeline section headings.")
 
+(defface courier-response-timeline-detail-face
+  '((((background dark)) :background "#141922" :extend t)
+    (((background light)) :background "#f8fafc" :extend t)
+    (t :inherit default))
+  "Face used for expanded Courier timeline detail panels.")
+
+(defface courier-response-timeline-detail-border-face
+  '((((background dark)) :foreground "#6b7a90" :background "#141922" :extend t)
+    (((background light)) :foreground "#94a3b8" :background "#f8fafc" :extend t)
+    (t :inherit shadow))
+  "Face used for expanded Courier timeline detail panel borders.")
+
+(defface courier-response-timeline-detail-title-face
+  '((((background dark)) :foreground "#dbeafe" :background "#141922" :weight semibold :extend t)
+    (((background light)) :foreground "#1d4ed8" :background "#f8fafc" :weight semibold :extend t)
+    (t :inherit bold))
+  "Face used for expanded Courier timeline detail panel titles.")
+
 (defface courier-response-timeline-entry-face
   '((((background dark)) :background "#171c22" :extend t)
     (((background light)) :background "#f3f5f9" :extend t)
@@ -1899,6 +1917,27 @@ TESTS supplies the assertions to evaluate."
            (string-suffix-p "+json" content-type)
            (string-suffix-p "+xml" content-type))))
 
+(defun courier--byte-string-text-like-p (bytes)
+  "Return non-nil when BYTES are safe to decode as text."
+  (let ((index 0)
+        (control-count 0)
+        (length (length bytes)))
+    (catch 'binary
+      (while (< index length)
+        (let ((byte (aref bytes index)))
+          (cond
+           ((= byte 0)
+            (throw 'binary nil))
+           ((or (= byte ?\t)
+                (= byte ?\n)
+                (= byte ?\f)
+                (= byte ?\r)
+                (>= byte 32)))
+           (t
+            (setq control-count (1+ control-count)))))
+        (setq index (1+ index)))
+      (<= control-count (max 0 (/ length 20))))))
+
 (defun courier--decode-body-file (body-file charset)
   "Decode BODY-FILE using CHARSET.
 
@@ -1916,6 +1955,18 @@ surface to the request boundary."
                     (user-error "Unsupported response charset: %s" charset)))
               'utf-8)))
       (decode-coding-string bytes coding-system))))
+
+(defun courier--decode-body-file-if-text (body-file)
+  "Decode BODY-FILE as UTF-8 when its bytes are textual."
+  (with-temp-buffer
+    (set-buffer-multibyte nil)
+    (insert-file-contents-literally body-file)
+    (let ((bytes (buffer-string)))
+      (when (and (> (length bytes) 0)
+                 (courier--byte-string-text-like-p bytes))
+        (let ((decoded (decode-coding-string bytes 'utf-8 t)))
+          (when (string= bytes (encode-coding-string decoded 'utf-8 t))
+            decoded))))))
 
 (defun courier--parse-content-type (value)
   "Parse CONTENT-TYPE header VALUE."
@@ -2087,9 +2138,13 @@ transport failures do not leave the outgoing payload in BODY-FILE."
       (setq status-code (string-to-number (match-string 1 status-line)))
       (setq reason (or (match-string 2 status-line) "")))
     (when (and (file-exists-p body-file)
-               (courier--text-content-type-p content-type)
                (<= size courier-body-text-max-size))
-      (setq body-text (courier--decode-body-file body-file charset)))
+      (setq body-text
+            (cond
+             ((courier--text-content-type-p content-type)
+              (courier--decode-body-file body-file charset))
+             ((not content-type)
+              (courier--decode-body-file-if-text body-file)))))
     (let ((response (list :request-path (plist-get request :path)
                           :status-code status-code
                           :reason reason
@@ -2504,9 +2559,23 @@ Each entry is a cons cell of the form `(TIMESTAMP . RESPONSE)'.")
      ((courier--html-content-type-p content-type) 'html)
      ((courier--xml-content-type-p content-type) 'xml)
      ((courier--javascript-content-type-p content-type) 'javascript)
+     ((and (not content-type)
+           (courier--json-body-text-p (plist-get response :body-text)))
+      'json)
      ((plist-get response :body-text) 'raw)
      ((plist-get response :body-file) 'hex)
      (t 'raw))))
+
+(defun courier--json-body-text-p (body-text)
+  "Return non-nil when BODY-TEXT is a JSON object or array."
+  (when (stringp body-text)
+    (let ((trimmed (string-trim body-text)))
+      (and (string-match-p "\\`[{\[]" trimmed)
+           (condition-case nil
+               (progn
+                 (ignore (json-parse-string trimmed))
+                 t)
+             (error nil))))))
 
 (defun courier--effective-body-view (response)
   "Return the effective body view for RESPONSE."
@@ -3010,8 +3079,10 @@ Move them to the top of the current response buffer."
          (view-label (courier--response-view-label summary-response)))
     (concat " "
             (propertize view-label 'face 'courier-response-tab-active-face)
-            courier--header-separator
-            (courier--response-summary-detail-string summary-response))))
+            (unless (eq courier--response-tab 'timeline)
+              (concat courier--header-separator
+                      (courier--response-summary-detail-string
+                       summary-response))))))
 
 (defun courier--refresh-response-header-line ()
   "Refresh the current Courier response header line."
@@ -3121,21 +3192,72 @@ Move them to the top of the current response buffer."
       (push current lines))
     (nreverse lines)))
 
+(defconst courier--header-name-min-width 8
+  "Minimum width for response header name cells.")
+
+(defconst courier--header-name-preferred-max-width 36
+  "Preferred maximum width for response header name cells.")
+
+(defconst courier--header-value-min-width 24
+  "Minimum width for response header value cells.")
+
+(defun courier--wrap-header-name-cell (name width)
+  "Return NAME wrapped into header table cells no wider than WIDTH."
+  (let ((parts (split-string (or name "") "-" t))
+        lines
+        current)
+    (while parts
+      (let* ((part (pop parts))
+             (segment (if parts
+                         (concat part "-")
+                       part)))
+        (cond
+         ((and current
+               (<= (+ (string-width current) (string-width segment)) width))
+          (setq current (concat current segment)))
+         ((> (string-width segment) width)
+          (when current
+            (push current lines)
+            (setq current nil))
+          (while (> (string-width segment) width)
+            (push (substring segment 0 width) lines)
+            (setq segment (substring segment width)))
+          (setq current segment))
+         (t
+          (when current
+            (push current lines))
+          (setq current segment)))))
+    (when current
+      (push current lines))
+    (or (nreverse lines) '(""))))
+
+(defun courier--format-header-name-cell (name width)
+  "Return NAME padded into a fixed WIDTH header table cell."
+  (propertize
+   (truncate-string-to-width name width nil ?\s)
+   'face 'font-lock-variable-name-face))
+
 (defun courier--format-headers (response)
   "Return formatted headers for RESPONSE."
   (if-let* ((headers (plist-get response :headers)))
-      (let* ((name-width
-              (min 24
-                   (max 8
-                        (apply #'max
-                               (string-width "Name")
-                               (mapcar (lambda (header)
-                                         (string-width (car header)))
-                                       headers)))))
-             (value-width (max 24 (- (courier--response-text-width)
-                                     name-width
-                                     3)))
-             (indent (make-string (+ name-width 2) ?\s))
+      (let* ((response-width (courier--response-text-width))
+             (longest-name-width
+              (apply #'max
+                     (string-width "Name")
+                     (mapcar (lambda (header)
+                               (string-width (car header)))
+                             headers)))
+             (available-name-width
+              (max courier--header-name-min-width
+                   (- response-width
+                      courier--header-value-min-width
+                      3)))
+             (name-width
+              (min longest-name-width
+                   courier--header-name-preferred-max-width
+                   available-name-width))
+             (value-width (max courier--header-value-min-width
+                               (- response-width name-width 3)))
              (header-name (propertize
                            (format (format "%%-%ds" name-width) "Name")
                            'face 'bold))
@@ -3147,20 +3269,25 @@ Move them to the top of the current response buffer."
               (mapcar
                (lambda (header)
                  (let* ((name (car header))
+                        (name-lines
+                         (courier--wrap-header-name-cell name name-width))
                         (value-lines (courier--wrap-response-cell
                                       (cdr header) value-width))
-                        (first-line
-                         (concat
-                          (propertize
-                           (format (format "%%-%ds" name-width) name)
-                           'face 'font-lock-variable-name-face)
-                          "  "
-                          (car value-lines)))
-                        (rest-lines
-                         (mapcar (lambda (line)
-                                   (concat indent line))
-                                 (cdr value-lines))))
-                   (mapconcat #'identity (cons first-line rest-lines) "\n")))
+                        (line-count (max (length name-lines)
+                                         (length value-lines))))
+                   (mapconcat
+                    (lambda (index)
+                      (let ((name-line (nth index name-lines))
+                            (value-line (nth index value-lines)))
+                        (concat
+                         (if name-line
+                             (courier--format-header-name-cell
+                              name-line name-width)
+                           (make-string name-width ?\s))
+                         "  "
+                         (or value-line ""))))
+                    (number-sequence 0 (1- line-count))
+                    "\n")))
                headers)))
         (concat
          header-name "  " header-value "\n"
@@ -3288,28 +3415,20 @@ Move them to the top of the current response buffer."
          (summary-face (if selectedp
                            'courier-response-timeline-selected-face
                          'courier-response-timeline-entry-face)))
-    (if selectedp
-        (concat
-         (propertize method
-                     'face `(courier-response-method-face ,summary-face))
-         (propertize " " 'face summary-face)
-         (propertize url
-                     'face `(courier-response-url-face ,summary-face))
-         "\n")
-      (concat
-       (propertize status 'face `(,status-face ,summary-face))
-      (propertize (format "  %s" timestamp)
-                  'face `(shadow ,summary-face))
-       "\n"
-       (propertize method
-                   'face `(courier-response-method-face ,summary-face))
-       (propertize " " 'face summary-face)
-       (propertize url
-                   'face `(courier-response-url-face ,summary-face))
-       "\n"
-       (propertize (concat duration courier--header-separator size)
-                   'face `(shadow ,summary-face))
-       "\n"))))
+    (concat
+     (propertize status 'face `(,status-face ,summary-face))
+     (propertize (format "  %s" timestamp)
+                 'face `(shadow ,summary-face))
+     "\n"
+     (propertize method
+                 'face `(courier-response-method-face ,summary-face))
+     (propertize " " 'face summary-face)
+     (propertize url
+                 'face `(courier-response-url-face ,summary-face))
+     "\n"
+     (propertize (concat duration courier--header-separator size)
+                 'face `(shadow ,summary-face))
+     "\n")))
 
 (defun courier--response-request-method (response)
   "Return the request method associated with RESPONSE."
@@ -3405,20 +3524,55 @@ Move them to the top of the current response buffer."
         (insert "No network logs found\n")
       (insert logs "\n"))))
 
+(defconst courier--timeline-detail-line-prefix "  │ "
+  "Display prefix used for expanded Courier timeline detail panels.")
+
+(defun courier--timeline-detail-prefix-string ()
+  "Return the propertized prefix for Courier timeline detail lines."
+  (propertize courier--timeline-detail-line-prefix
+              'face 'courier-response-timeline-detail-border-face))
+
+(defun courier--apply-timeline-detail-panel-properties (start end)
+  "Apply expanded timeline detail panel display properties from START to END."
+  (let ((prefix (courier--timeline-detail-prefix-string)))
+    (add-face-text-property start end 'courier-response-timeline-detail-face t)
+    (put-text-property start end 'line-prefix prefix)
+    (put-text-property start end 'wrap-prefix
+                       (concat prefix "  "))))
+
+(defun courier--insert-timeline-detail-title (response request timestamp)
+  "Insert a title for expanded timeline RESPONSE and REQUEST at TIMESTAMP."
+  (insert (propertize "Details"
+                      'face 'courier-response-timeline-detail-title-face)
+          "  "
+          (courier--response-summary-string response)
+          (propertize (format "  %s" timestamp) 'face 'shadow)
+          "\n")
+  (insert (propertize (courier--response-request-method response)
+                      'face 'courier-response-method-face)
+          " "
+          (propertize (or (plist-get request :url)
+                          (courier--response-request-url response)
+                          "(no URL)")
+                      'face 'courier-response-url-face)
+          "\n\n"))
+
 (defun courier--insert-expanded-timeline-details (response request timestamp)
   "Insert expanded timeline details for RESPONSE, REQUEST, and TIMESTAMP."
-  (ignore timestamp)
-  (dolist (tab courier--timeline-tabs)
-    (courier--insert-timeline-section-heading tab)
-    (when (courier--timeline-section-expanded-p tab)
-      (pcase tab
-        ('request
-         (courier--insert-timeline-request-view request))
-        ('response
-         (courier--insert-timeline-response-view response))
-        ('network-logs
-         (courier--insert-timeline-network-logs-view response request)))
-      (insert "\n"))))
+  (let ((start (point)))
+    (courier--insert-timeline-detail-title response request timestamp)
+    (dolist (tab courier--timeline-tabs)
+      (courier--insert-timeline-section-heading tab)
+      (when (courier--timeline-section-expanded-p tab)
+        (pcase tab
+          ('request
+           (courier--insert-timeline-request-view request))
+          ('response
+           (courier--insert-timeline-response-view response))
+          ('network-logs
+           (courier--insert-timeline-network-logs-view response request)))
+        (insert "\n")))
+    (courier--apply-timeline-detail-panel-properties start (point))))
 
 (defun courier--replace-selected-timeline-details ()
   "Replace only the expanded details block for the selected timeline entry."
@@ -5391,14 +5545,9 @@ directory even when it does not exist yet."
         (file-name-directory path))
       (courier--management-root)))
 
-(defun courier--slugify-name (name)
-  "Return a filesystem-friendly slug for NAME."
-  (replace-regexp-in-string "[^a-zA-Z0-9]+" "-"
-                            (downcase (string-trim name))))
-
 (defun courier--request-file-name (name)
   "Return a Courier request filename for NAME."
-  (concat (courier--slugify-name name) ".http"))
+  (concat (courier--slugify name) ".http"))
 
 (defun courier--buffer-request-name ()
   "Return the current buffer request name, or a default untitled name."

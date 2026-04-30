@@ -288,8 +288,9 @@ manager. It is a source of variable values for request resolution.
 
 - user sends request
 - response buffer centers on one response at a time, with the header line
-  showing `Response`, `Headers`, `Timeline`, or `Tests`, followed by the
-  status summary
+  showing `Response`, `Headers`, `Timeline`, or `Tests`; Response, Headers,
+  and Tests include the status summary, while Timeline shows the selected
+  history position
 - user changes response view as needed through a jump command
 - response history remains available for the same request
 - `C-c ?` opens a context-aware action menu in request and response buffers
@@ -355,11 +356,11 @@ The current baseline already includes:
 - split request and env pickers with collection-grouped display
 - unsaved request drafts with first-save collection placement
 - response view system with dedicated body viewer
-- basic response rendering, including image-aware views
+- polished response rendering, including image-aware views, timeline history,
+  sticky headers, and body viewers
 
 The current baseline does not yet include:
 
-- polished response presentation
 - broader collection management flows beyond requests and folders
 - stronger cleanup against compatibility shims and hidden parse fallbacks
 

@@ -2253,6 +2253,42 @@ skipping."
       (should (= (plist-get response :status-code) 200))
       (should (equal (plist-get response :headers) nil)))))
 
+(ert-deftest courier-parse-response-sniffs-json-without-content-type ()
+  (courier-test--with-temp-files ((header ".headers") (body ".body") (meta ".meta"))
+    (with-temp-file header
+      (insert "HTTP/1.1 200 OK\r\n\r\n"))
+    (with-temp-file body
+      (insert "{\"code\":\"8888\",\"msg\":\"must Login again\"}"))
+    (with-temp-file meta
+      (insert "200\n40\n0.340\n"))
+    (let ((response (courier-parse-response header body meta "" 0 '(:path "/tmp/test.http" :tests nil))))
+      (should (= (plist-get response :status-code) 200))
+      (should-not (plist-get response :content-type))
+      (should (equal (plist-get response :body-text)
+                     "{\"code\":\"8888\",\"msg\":\"must Login again\"}"))
+      (should (eq (courier--auto-body-view response) 'json))
+      (with-temp-buffer
+        (courier--render-response
+         response
+         '(:method "POST" :url "http://localhost:8080/login" :path "/tmp/test.http"))
+        (should (string-match-p "\\` Response: JSON"
+                                (courier-test--current-header-line)))
+        (should (string-match-p "\"code\": \"8888\"" (buffer-string)))
+        (should-not (string-match-p "^00000000" (buffer-string)))))))
+
+(ert-deftest courier-parse-response-keeps-binary-without-content-type-as-file ()
+  (courier-test--with-temp-files ((header ".headers") (body ".body") (meta ".meta"))
+    (with-temp-file header
+      (insert "HTTP/1.1 200 OK\r\n\r\n"))
+    (with-temp-file body
+      (set-buffer-multibyte nil)
+      (insert "\0\1\2\3"))
+    (with-temp-file meta
+      (insert "200\n4\n0.050\n"))
+    (let ((response (courier-parse-response header body meta "" 0 '(:path "/tmp/test.http" :tests nil))))
+      (should-not (plist-get response :body-text))
+      (should (eq (courier--auto-body-view response) 'hex)))))
+
 (ert-deftest courier-parse-response-errors-on-unsupported-charset ()
   (courier-test--with-temp-files ((header ".headers") (body ".body") (meta ".meta"))
     (with-temp-file header
@@ -3020,6 +3056,36 @@ skipping."
                  "Process courier-curl stderr finished"
                  logs))))
 
+(ert-deftest courier-format-headers-keeps-value-column-after-long-name ()
+  (let* ((rendered
+          (substring-no-properties
+           (courier--format-headers
+            '(:headers
+              (("access-control-allow-credentials" . "true")
+               ("x-super-long-custom-header-name-with-extra-tail" . "custom")
+               ("date" . "Thu, 30 Apr 2026 07:42:08 GMT"))))))
+         (lines (split-string rendered "\n" t))
+         (heading (car lines))
+         (cors-row (seq-find (lambda (line)
+                               (string-match-p "true\\'" line))
+                             lines))
+         (custom-row (seq-find (lambda (line)
+                                 (string-match-p "custom\\'" line))
+                               lines))
+         (custom-continuation
+          (seq-find (lambda (line)
+                      (string-prefix-p "with-extra-tail" line))
+                    lines)))
+    (should cors-row)
+    (should custom-row)
+    (should custom-continuation)
+    (should (string-prefix-p "access-control-allow-credentials" cors-row))
+    (should (string-prefix-p "x-super-long-custom-header-name-" custom-row))
+    (should (= (string-match "Value" heading)
+               (string-match "true" cors-row)))
+    (should (= (string-match "Value" heading)
+               (string-match "custom\\'" custom-row)))))
+
 (ert-deftest courier-response-status-face-treats-local-errors-as-error ()
   (should (eq (courier--response-status-face
                '(:status-code 0 :reason "Parse Error" :exit-code 0))
@@ -3237,10 +3303,8 @@ skipping."
     (search-forward "200 OK")
     (courier-response-activate)
     (should (= courier--history-index 1))
-    (should (equal (courier-test--current-response-summary-line)
-                   "200 OK  •  42ms  •  5B  •  text/plain"))
-    (should (string-match-p "\\` Timeline: 2/2  •  200 OK"
-                            (courier-test--current-header-line)))
+    (should (equal (courier-test--current-header-line)
+                   " Timeline: 2/2"))
     (should (= (plist-get courier--response :status-code) 404))
     (should (eq courier--response-tab 'timeline))
     (should (string-match-p "GET https://example.com" (buffer-string)))))
@@ -3324,7 +3388,7 @@ skipping."
     (should (string-match-p "404 OK" (buffer-string)))
     (should (string-match-p "200 OK" (buffer-string)))))
 
-(ert-deftest courier-response-timeline-expanded-entry-is-removed-from-list ()
+(ert-deftest courier-response-timeline-expanded-entry-keeps-selected-summary ()
   (with-temp-buffer
     (courier--render-response
      (courier-test--make-response 200)
@@ -3335,7 +3399,7 @@ skipping."
     (courier-response-set-tab 'timeline)
     (courier--select-history-index 0)
     (let ((history (courier-test--response-history-string)))
-      (should (= 0 (courier-test--count-matches "404 OK" history)))
+      (should (string-match-p "404 OK" history))
       (should (= 1 (courier-test--count-matches "200 OK" history))))))
 
 (ert-deftest courier-response-timeline-selection-keeps-point-on-entry ()
@@ -3372,10 +3436,8 @@ skipping."
     (courier-response-set-tab 'timeline)
     (courier--select-history-index 0)
     (courier--toggle-timeline-section 'network-logs)
-    (should (equal (courier-test--current-response-summary-line)
-                   "200 OK  •  42ms  •  5B  •  text/plain"))
-    (should (string-match-p "\\` Timeline: 1/1  •  200 OK"
-                            (courier-test--current-header-line)))))
+    (should (equal (courier-test--current-header-line)
+                   " Timeline: 1/1"))))
 
 (ert-deftest courier-response-timeline-response-view-shows-header-count ()
   (with-temp-buffer
@@ -3386,6 +3448,23 @@ skipping."
     (courier--select-history-index 0)
     (courier--toggle-timeline-section 'response)
     (should (string-match-p "Headers(1)" (buffer-string)))))
+
+(ert-deftest courier-response-timeline-expanded-details-use-panel-prefix ()
+  (with-temp-buffer
+    (courier--render-response
+     (courier-test--make-response 200)
+     courier-test--request)
+    (courier-response-set-tab 'timeline)
+    (courier--select-history-index 0)
+    (goto-char (point-min))
+    (search-forward "Details")
+    (let* ((pos (match-beginning 0))
+           (prefix (get-text-property pos 'line-prefix))
+           (face (get-text-property pos 'face)))
+      (should (string-match-p "│" (substring-no-properties prefix)))
+      (should (courier-test--face-includes-p
+               face
+               'courier-response-timeline-detail-face)))))
 
 (ert-deftest courier-response-timeline-request-body-fontifies-json ()
   (with-temp-buffer
@@ -3473,7 +3552,7 @@ skipping."
       (should (member 'courier-response-timeline-entry-face
                       (if (listp face) face (list face)))))))
 
-(ert-deftest courier-response-timeline-selected-entry-omits-summary-metadata ()
+(ert-deftest courier-response-timeline-selected-entry-keeps-summary-metadata ()
   (with-temp-buffer
     (courier--render-response
      (courier-test--make-response 200)
@@ -3482,8 +3561,8 @@ skipping."
     (courier--select-history-index 0)
     (let ((history (courier-test--response-history-string)))
       (should (string-match-p "GET https://example.com" history))
-      (should-not (string-match-p "200 OK" history))
-      (should-not (string-match-p "42ms  •  5B" history)))))
+      (should (string-match-p "200 OK" history))
+      (should (string-match-p "42ms  •  5B" history)))))
 
 (ert-deftest courier-response-context-tab-activates-timeline-button ()
   (with-temp-buffer
@@ -3510,7 +3589,7 @@ skipping."
     (should (= 1 (courier--timeline-index-at-point)))
     (let ((history (courier-test--response-history-string)))
       (should (string-match-p "404 OK" history))
-      (should-not (string-match-p "200 OK" history))
+      (should (string-match-p "200 OK" history))
       (should (> (or (string-match "\\[[-+]\\] Request" history) -1)
                   (or (string-match "GET https://example.com" history) -1))))))
 
@@ -4386,16 +4465,6 @@ skipping."
     (courier-request-mode)
     (courier-request-set-method "POST")
     (should (equal (plist-get courier--request-model :method) "POST"))
-    (should (string-match-p "\\` POST "
-                            (courier-test--current-header-line)))))
-
-(ert-deftest courier-request-set-method-refreshes-header-line ()
-  (courier-test--with-request
-      (concat "+++\nname = \"Demo\"\n+++\n\n"
-              "GET \n"
-              "Accept: application/json\n")
-    (courier-request-mode)
-    (courier-request-set-method "POST")
     (should (string-match-p "\\` POST "
                             (courier-test--current-header-line)))))
 
@@ -5315,6 +5384,14 @@ skipping."
       (should-error (courier-new-request "https://example.com/users" "TRACE")
                     :type 'user-error)
       (should (= courier--untitled-request-counter 0)))))
+
+(ert-deftest courier-request-file-name-normalizes-empty-and-punctuation ()
+  (should (equal (courier--request-file-name "Create User")
+                 "create-user.http"))
+  (should (equal (courier--request-file-name "  !!!  ")
+                 "request.http"))
+  (should (equal (courier--request-file-name "Admin / Tools ")
+                 "admin-tools.http")))
 
 (ert-deftest courier-draft-and-response-buffers-use-distinct-names ()
   (should (equal (courier--draft-buffer-name "Untitled 1")
