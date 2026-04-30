@@ -9,7 +9,7 @@ buffers.
 
 - Edit HTTP requests as plain text in =.http= files
 - Send requests with =C-c C-c= without blocking Emacs
-- View responses in a single buffer with an in-buffer summary/view scaffold and an Emacs-native timeline inspector
+- View responses in a single buffer with a sticky summary/view header line and an Emacs-native timeline inspector
 - Variable interpolation with ={{name}}= syntax
 - Built-in test assertions for status, headers, body, timing, and size
 - Preview resolved requests before sending
@@ -317,9 +317,8 @@ Send-time behavior:
 - =none= requires an empty body and sends no request body
 
 Use =C-c C-t= in the Body section to set the body type. In the request section view, the active body type is shown in
-the divider line as =---------------- Body: JSON ----------------=,
-=---------------- Body: XML ----------------=, and so on; the divider expands or
-contracts to match the request window width. For =binary= and
+the sticky header line as =Body: JSON=,
+=Body: XML=, and so on. For =binary= and
 =multipart= bodies, the body section itself is edited as a TOML fragment that
 matches the saved front matter, including =[body]= and =[[body.parts]]=
 headers. Use =C-c C-f= to attach a file into the current request body; Courier
@@ -343,13 +342,9 @@ the request, that explicit header wins.
 
 Use =C-c C-t= in the Auth section to set the auth type. The editor currently recognizes =none=, =bearer=, =basic=,
 =header=, =api_key=, and =oauth2=. In the request section view, the active
-auth type is shown in the divider line as
-=---------------- Authentication: None ----------------=,
-=---------------- Authentication: Bearer ----------------=,
-=---------------- Authentication: Basic ----------------=,
-=---------------- Authentication: Header ----------------=,
-=---------------- Authentication: API Key ----------------=, or
-=---------------- Authentication: OAuth2 ----------------=.
+auth type is shown in the sticky header line as =Authentication: None=,
+=Authentication: Bearer=, =Authentication: Basic=, =Authentication: Header=,
+=Authentication: API Key=, or =Authentication: OAuth2=.
 
 =api_key= already works at send time in both =header= and =query= modes.
 =oauth2= now works at send time for =grant_type = "client_credentials"=. Courier
@@ -443,6 +438,7 @@ snippets such as =status == 200= and =header content-type contains json=.
 | =C-c C-j= | =courier-request-jump-section= | Jump to request section |
 | =C-c C-m= | =courier-request-set-method=   | Change HTTP method     |
 | =C-c C-t= | =courier-request-section-type= | Section action         |
+| =C-c C-u= | =courier-request-set-url=      | Change request URL     |
 | =C-c C-n= | =courier-new-request=          | Create request draft   |
 | =C-c C-p= | =courier-request-preview=      | Preview resolved form  |
 | =C-c ?=   | =courier-dispatch=             | Show request actions   |
@@ -455,41 +451,31 @@ snippets such as =status == 200= and =header content-type contains json=.
 Use =M-x courier-new-request= or =C-c C-n= to open an unsaved draft buffer. The
 command first asks for a non-empty request-line URL, then asks for the HTTP
 method using =courier-default-request-method= as the default. The draft buffer
-is temporary and starts at the completed request line. On the first =C-x C-s=,
-Courier asks which collection should own the request. Courier keeps
-collections under =courier-home-directory= in =collections/<name>/=. If you
-type a collection name that does not exist yet, Courier creates it there
-before saving the request into that collection's =requests/= directory. Courier
-then asks for the request filename explicitly instead of inventing one from the
-current request name; =.http= is added automatically unless you typed it
-yourself.
-The request-line method token is highlighted with a lightweight overlay so
-=GET=/=POST=/etc. remain visually obvious while editing. The method token
-itself is managed by Courier and changed with =C-c C-m= rather than direct
-typing.
+is temporary and starts in the active section body; the request method and URL
+stay in the header line. On the first =C-x C-s=, Courier asks which collection
+should own the request. Courier keeps collections under =courier-home-directory=
+in =collections/<name>/=. If you type a collection name that does not exist
+yet, Courier creates it there before saving the request into that collection's
+=requests/= directory. Courier then asks for the request filename explicitly
+instead of inventing one from the current request name; =.http= is added
+automatically unless you typed it yourself.
+The method and URL are managed by Courier and changed with =C-c C-m= and =C-c
+C-u= instead of direct editing in the section buffer.
 Sending from request mode uses one response workflow for both send-time and
 pre-send failures: transport errors, response-processing errors, and request
 preparation errors all surface in the response buffer instead of splitting
 between a response window and transient echo-area errors. If Courier cannot
 even launch the curl process, that startup failure is rendered there too
 instead of leaving the buffer stuck on =Sending...=.
-The request buffer uses a section view model with a status divider:
-
-#+begin_example
----------------- Body: JSON ----------------
-#+end_example
-
 Use =C-c C-j= to jump to any section, including =Parameters=, =Body=, =Headers=,
-=Authentication=, =Variables=, =Scripts=, and =Tests=. The request line stays fixed as
-the request identity block; the area below it is the active section view, not a
-jump target into raw source text, and the current section is repeated in the
-second-line divider immediately below the request line. That divider adapts to
-the active request window width, keeps its label left-biased rather than
-centered, and is managed by Courier instead of edited directly. The request
-mode line mirrors the active collection, selected environment, and current
-section in a compact form such as =Courier[My API/local] Body: JSON=. The
-request line always shows the effective URL, including query params edited
-through the structured params view.
+=Authentication=, =Variables=, =Scripts=, and =Tests=. The buffer body is only
+the active section view, not a jump target into raw source text. The request
+header line keeps the current method, effective URL, and active section visible
+while scrolling. The request mode line mirrors the active collection, selected
+environment, and current section in a compact form such as =Courier[My
+API/local] Body: JSON=. The header line always shows the effective URL,
+including query params edited through the structured params view. Use =C-c C-u=
+to change the whole URL from the minibuffer.
 When =Body= is the active section, Courier also treats structured text bodies
 as editor content instead of inert raw text: JSON and XML bodies get syntax
 highlighting in place, and =C-c C-b= formats the current body section. For
@@ -512,8 +498,8 @@ available.
 =Params= can still be edited directly as part of the URL, but the request-side
 params views normalize those values into Courier params when you edit them.
 Saving then writes them back into the request URL instead of keeping two
-separate truths, and the request line continues to reflect that effective URL
-while you edit other sections.
+separate truths, and the request header line continues to reflect that
+effective URL while you edit other sections.
 
 Use =M-x courier-create-collection= to create a collection explicitly. Use
 =C-c C-o= to open another =.http= request from one annotated picker. Courier
@@ -556,10 +542,10 @@ current body in a dedicated viewer buffer; text-like views use an appropriate
 major mode, image views display the image when Emacs can render it, and PDF
 documents open as file-backed viewers with =doc-view-mode= when available. The
 main response buffer also applies syntax highlighting to =json=, =html=,
-=xml=, and =javascript= body views. The top of the response buffer starts with
-a primary summary line for status, duration, size, and content type, followed
-by a request-style divider that shows the current response view. Use =C-c C-j=
-to jump directly to a response view.
+=xml=, and =javascript= body views. The response header line stays visible
+while scrolling and shows the current response view plus status, duration,
+size, and content type. The buffer body starts directly with the active
+response view. Use =C-c C-j= to jump directly to a response view.
 Use =C-c ?= in request and response buffers to open a transient menu for the
 actions that make sense in the current Courier context.
 The response summary can therefore describe both remote and local failure
@@ -590,10 +576,9 @@ The response buffer has four top-level views:
 - *Tests* shows pass/fail badges for all request =tests=, and keeps failure
   messages visually subordinate to the test expression itself.
 
-The response scaffold keeps a clear information hierarchy: the first line says
-what response you are looking at, and the divider line says which response view
-is active. When visiting an older timeline entry, the divider also includes the
-history position (for example =Timeline: 2/5=).
+The sticky response header line says what response you are looking at. When
+visiting an older timeline entry, the header line also includes the history
+position (for example =Timeline: 2/5=).
 
 * Customization
 

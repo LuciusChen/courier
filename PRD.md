@@ -282,14 +282,14 @@ manager. It is a source of variable values for request resolution.
 
 - user invokes a method command
 - minibuffer offers allowed methods
-- Courier edits the request line directly
+- Courier updates the request model and refreshes the request header line
 
 ### 6. Send and inspect response
 
 - user sends request
 - response buffer centers on one response at a time, with the header line
-  showing `View: Response`, `View: Headers`, `View: Timeline`, or
-  `View: Tests`, followed by the status summary
+  showing `Response`, `Headers`, `Timeline`, or `Tests`, followed by the
+  status summary
 - user changes response view as needed through a jump command
 - response history remains available for the same request
 - `C-c ?` opens a context-aware action menu in request and response buffers
@@ -298,9 +298,9 @@ manager. It is a source of variable values for request resolution.
 
 - user creates a new request draft without choosing a path first
 - Courier gives it an `Untitled N` name and opens it as an unsaved buffer
-- the draft request line uses a configurable default method, with `GET` as the default
+- the draft request uses a configurable default method, with `GET` as the default
 - the draft name remains metadata and buffer identity; the editor body starts
-  at the request line instead of showing the name as editable first-line content
+  in the active request section, with method and URL kept in the header line
 - on first save, Courier asks which collection should own the request
 - Courier stores and discovers collections under `courier-home-directory/collections/`
 - if the chosen collection name does not exist yet, Courier creates it under
@@ -308,9 +308,11 @@ manager. It is a source of variable values for request resolution.
 - Courier then asks for the request filename explicitly and appends `.http`
   automatically unless the user already typed it
 - the request is then saved into that collection's `requestsDir`
-- request editing stays text-first; the header line shows the current section,
-  such as `Section: Body: JSON`, while `C-c C-j` switches to any request
-  section
+- request editing stays text-first; the header line keeps the method, effective
+  URL, and current section visible while scrolling, such as
+  `GET https://example.com • Body: JSON`; the buffer body contains
+  only the active section, `C-c C-j` switches to any request section, and
+  `C-c C-u` changes the URL
 - transient remains for actions such as send, preview, save, and env
   switching, not for primary content editing
 - request editing stays text-first:
@@ -446,7 +448,7 @@ Acceptance:
 
 Deliver:
 
-- cleaner response scaffold
+- cleaner response header line
 - an in-buffer current-view indicator for Response, Headers, Timeline, and Tests,
   switched through a jump command
 - a collapsed-by-default Timeline list

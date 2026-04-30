@@ -250,42 +250,30 @@ skipping."
       (courier-request-send))
     response-buffer))
 
-(defun courier-test--current-request-divider-line ()
-  "Return the divider line from the current request buffer."
-  (save-excursion
-    (goto-char (point-min))
-    (forward-line 1)
-    (buffer-substring-no-properties (line-beginning-position)
-                                    (line-end-position))))
+(defun courier-test--current-header-line-with-properties ()
+  "Return the current buffer header line, preserving text properties."
+  (cond
+   ((stringp header-line-format)
+    header-line-format)
+   ((and (consp header-line-format)
+         (eq (car header-line-format) :eval))
+    (eval (cadr header-line-format) t))
+   (header-line-format
+    (format-mode-line header-line-format))
+   (t
+    "")))
+
+(defun courier-test--current-header-line ()
+  "Return the current buffer header line as plain text."
+  (substring-no-properties
+   (courier-test--current-header-line-with-properties)))
 
 (defun courier-test--current-response-summary-line ()
-  "Return the summary line from the current response buffer."
-  (save-excursion
-    (goto-char (point-min))
-    (buffer-substring-no-properties (line-beginning-position)
-                                    (line-end-position))))
-
-(defun courier-test--current-response-divider-line ()
-  "Return the divider line from the current response buffer."
-  (save-excursion
-    (goto-char (point-min))
-    (forward-line 1)
-    (buffer-substring-no-properties (line-beginning-position)
-                                    (line-end-position))))
-
-(defun courier-test--request-divider-matches-p (label line)
-  "Return non-nil when LINE is a divider containing LABEL."
-  (string-match-p
-   (format "\\`-+ %s -+\\'" (regexp-quote label))
-   line))
-
-(defun courier-test--request-divider-padding-widths (label line)
-  "Return left/right padding widths for LABEL in divider LINE."
-  (when (string-match
-         (format "\\`\\(-+\\) %s \\(-+\\)\\'" (regexp-quote label))
-         line)
-    (cons (length (match-string 1 line))
-          (length (match-string 2 line)))))
+  "Return the summary portion from the current response header line."
+  (let ((line (courier-test--current-header-line)))
+    (if (string-match "  •  \\(.*\\)\\'" line)
+        (match-string 1 line)
+      line)))
 
 (defun courier-test--face-includes-p (value face)
   "Return non-nil when VALUE includes FACE."
@@ -2460,10 +2448,12 @@ skipping."
                 "  }\n"
                 "}\n"))
       (with-temp-file request-file
-        (insert "GET {{base_url}}/users\n"))
+        (insert "GET https://example.com/users\n"
+                "X-Root: {{base_url}}\n"))
       (with-current-buffer (find-file-noselect request-file)
         (unwind-protect
             (progn
+              (courier-request-jump-section 'headers)
               (goto-char (point-min))
               (search-forward "{{base_url}}")
               (let* ((definitions (courier-test--xref-definitions-at-point))
@@ -2945,10 +2935,8 @@ skipping."
     (should (eq courier--response-tab 'response))
     (should (equal (courier-test--current-response-summary-line)
                    "200 OK  •  42ms  •  5B  •  text/plain"))
-    (should (courier-test--request-divider-matches-p
-             "Response: Raw"
-             (courier-test--current-response-divider-line)))
-    (should-not header-line-format)))
+    (should (string-match-p "\\` Response: Raw  •  200 OK"
+                            (courier-test--current-header-line)))))
 
 (ert-deftest courier-response-summary-uses-clutch-style-separator ()
   (let ((line (substring-no-properties
@@ -3200,10 +3188,8 @@ skipping."
     (should (eq courier--response-tab 'tests))
     (should (equal (courier-test--current-response-summary-line)
                    "200 OK  •  10ms  •  12B  •  text/plain"))
-    (should (courier-test--request-divider-matches-p
-             "Tests(1)"
-             (courier-test--current-response-divider-line)))
-    (should-not header-line-format)
+    (should (string-match-p "\\` Tests(1)  •  200 OK"
+                            (courier-test--current-header-line)))
     (should (string-match-p "status == 200" (buffer-string)))))
 
 (ert-deftest courier-response-tab-switch-resets-point-to-top ()
@@ -3253,31 +3239,28 @@ skipping."
     (should (= courier--history-index 1))
     (should (equal (courier-test--current-response-summary-line)
                    "200 OK  •  42ms  •  5B  •  text/plain"))
-    (should (courier-test--request-divider-matches-p
-             "Timeline: 2/2"
-             (courier-test--current-response-divider-line)))
+    (should (string-match-p "\\` Timeline: 2/2  •  200 OK"
+                            (courier-test--current-header-line)))
     (should (= (plist-get courier--response :status-code) 404))
     (should (eq courier--response-tab 'timeline))
     (should (string-match-p "GET https://example.com" (buffer-string)))))
 
-(ert-deftest courier-response-scaffold-shows-summary-and-view ()
+(ert-deftest courier-response-header-shows-summary-and-view ()
   (with-temp-buffer
     (courier--render-response
      (courier-test--make-response 200)
      courier-test--request)
     (should (equal (courier-test--current-response-summary-line)
                    "200 OK  •  42ms  •  5B  •  text/plain"))
-    (should (courier-test--request-divider-matches-p
-             "Response: Raw"
-             (courier-test--current-response-divider-line)))
+    (should (string-match-p "\\` Response: Raw  •  200 OK"
+                            (courier-test--current-header-line)))
     (courier-response-set-tab 'headers)
     (should (equal (courier-test--current-response-summary-line)
                    "200 OK  •  42ms  •  5B  •  text/plain"))
-    (should (courier-test--request-divider-matches-p
-             "Headers(1)"
-             (courier-test--current-response-divider-line)))))
+    (should (string-match-p "\\` Headers(1)  •  200 OK"
+                            (courier-test--current-header-line)))))
 
-(ert-deftest courier-response-buffer-renders-summary-and-divider-scaffold ()
+(ert-deftest courier-response-buffer-renders-header-with-body-content ()
   (with-temp-buffer
     (courier--render-response
      '(:status-code 200
@@ -3293,46 +3276,9 @@ skipping."
      courier-test--request)
     (should (equal (courier-test--current-response-summary-line)
                    "200 OK  •  10ms  •  12B  •  text/plain"))
-    (should (courier-test--request-divider-matches-p
-             "Response: Raw"
-             (courier-test--current-response-divider-line)))
-    (should-not header-line-format)))
-
-(ert-deftest courier-response-divider-line-adapts-to-target-width ()
-  (with-temp-buffer
-    (courier--render-response
-     (courier-test--make-response 200)
-     courier-test--request)
-    (cl-letf (((symbol-function 'courier--response-divider-target-width)
-               (lambda () 60)))
-      (let ((divider
-             (courier--response-divider-line
-              (courier--response-divider-label courier--response))))
-        (should (= (string-width divider)
-                   (- 60 courier--response-divider-safe-margin)))
-        (should (courier-test--request-divider-matches-p
-                 "Response: Raw"
-                 divider))))))
-
-(ert-deftest courier-response-divider-line-refreshes-after-window-change ()
-  (with-temp-buffer
-    (courier--render-response
-     (courier-test--make-response 200)
-     courier-test--request)
-    (let ((original (courier-test--current-response-divider-line)))
-      (cl-letf (((symbol-function 'get-buffer-window)
-                 (lambda (&rest _args)
-                   (selected-window)))
-                ((symbol-function 'courier--response-divider-target-width)
-                 (lambda () 60)))
-        (courier--refresh-response-after-window-change))
-      (let ((updated (courier-test--current-response-divider-line)))
-        (should (courier-test--request-divider-matches-p
-                 "Response: Raw"
-                 updated))
-        (should (= (string-width updated)
-                   (- 60 courier--response-divider-safe-margin)))
-        (should-not (equal updated original))))))
+    (should (string-match-p "\\` Response: Raw  •  200 OK"
+                            (courier-test--current-header-line)))
+    (should (string-prefix-p "hello" (buffer-string)))))
 
 (ert-deftest courier-response-timeline-network-logs-switches-section ()
   (with-temp-buffer
@@ -3418,7 +3364,7 @@ skipping."
       (should button)
       (should (eq 'network-logs (button-get button 'courier-timeline-tab))))))
 
-(ert-deftest courier-response-timeline-section-toggle-preserves-scaffold ()
+(ert-deftest courier-response-timeline-section-toggle-preserves-header ()
   (with-temp-buffer
     (courier--render-response
      (courier-test--make-response 200)
@@ -3428,9 +3374,8 @@ skipping."
     (courier--toggle-timeline-section 'network-logs)
     (should (equal (courier-test--current-response-summary-line)
                    "200 OK  •  42ms  •  5B  •  text/plain"))
-    (should (courier-test--request-divider-matches-p
-             "Timeline: 1/1"
-             (courier-test--current-response-divider-line)))))
+    (should (string-match-p "\\` Timeline: 1/1  •  200 OK"
+                            (courier-test--current-header-line)))))
 
 (ert-deftest courier-response-timeline-response-view-shows-header-count ()
   (with-temp-buffer
@@ -3441,6 +3386,28 @@ skipping."
     (courier--select-history-index 0)
     (courier--toggle-timeline-section 'response)
     (should (string-match-p "Headers(1)" (buffer-string)))))
+
+(ert-deftest courier-response-timeline-request-body-fontifies-json ()
+  (with-temp-buffer
+    (courier--render-response
+     (courier-test--make-response 200)
+     '(:method "POST"
+       :url "https://example.com/users"
+       :headers (("content-type" . "application/json"))
+       :body-type json
+       :body "{\"name\":\"Lucy\"}"
+       :path "/tmp/test.http"))
+    (courier-response-set-tab 'timeline)
+    (courier--select-history-index 0)
+    (goto-char (point-min))
+    (search-forward "\"name\"")
+    (let ((start (match-beginning 0))
+          (end (match-end 0))
+          found-face)
+      (while (and (< start end) (not found-face))
+        (setq found-face (get-text-property start 'face))
+        (setq start (1+ start)))
+      (should found-face))))
 
 (ert-deftest courier-response-timeline-entry-is-a-button ()
   (with-temp-buffer
@@ -3864,7 +3831,7 @@ skipping."
                            (file-name-nondirectory request-file))))
         (kill-buffer buffer)))))
 
-(ert-deftest courier-request-set-method-rewrites-request-line ()
+(ert-deftest courier-request-set-method-updates-header-line ()
   (courier-test--with-request
       (courier-test--http-content
        :name "Demo"
@@ -3872,21 +3839,14 @@ skipping."
        :headers '(("accept" . "application/json")))
     (courier-request-mode)
     (courier-request-set-method "POST")
-    (goto-char (point-min))
-    (should (search-forward "POST https://example.com/users/42" nil t))))
-
-(ert-deftest courier-request-mode-adds-method-overlay ()
-  (courier-test--with-request
-      (courier-test--http-content
-       :name "Demo"
-       :url "https://example.com/users/42"
-       :headers '(("accept" . "application/json")))
-    (courier-request-mode)
-    (should (overlayp courier--method-overlay))
-    (should (equal (buffer-substring-no-properties
-                    (overlay-start courier--method-overlay)
-                    (overlay-end courier--method-overlay))
-                   "GET"))))
+    (should (equal (plist-get courier--request-model :method) "POST"))
+    (should (string-match-p "\\` POST https://example.com/users/42"
+                            (courier-test--current-header-line)))
+    (should (courier-test--face-includes-p
+             (get-text-property
+              1 'face
+              (courier-test--current-header-line-with-properties))
+             'courier-request-method-post-face))))
 
 (ert-deftest courier-request-mode-lighter-shows-current-section ()
   (courier-test--with-request
@@ -3927,7 +3887,7 @@ skipping."
         (should (equal (courier--mode-line-lighter)
                        "Courier[My API/local] Authentication: Bearer"))))))
 
-(ert-deftest courier-request-divider-line-shows-primary-navigation ()
+(ert-deftest courier-request-header-line-shows-primary-section ()
   (courier-test--with-request
       (courier-test--http-content
        :name "Demo"
@@ -3935,32 +3895,32 @@ skipping."
        :headers '(("accept" . "application/json"))
        :body "{\"name\":\"Lucy\"}\n")
     (courier-request-mode)
-    (should (courier-test--request-divider-matches-p
-             "Body: JSON"
-             (courier-test--current-request-divider-line)))))
+    (should (string-match-p
+             "\\` GET https://example.com/users/42  •  Body: JSON"
+             (courier-test--current-header-line)))))
 
-(ert-deftest courier-request-divider-line-shows-current-secondary-section ()
+(ert-deftest courier-request-header-line-shows-current-secondary-section ()
   (courier-test--with-request
       (courier-test--http-content
        :url "https://example.com/users/42"
        :auth '(:type bearer :token "{{token}}"))
     (courier-request-mode)
     (courier-request-jump-section 'auth)
-    (should (courier-test--request-divider-matches-p
-             "Authentication: Bearer"
-             (courier-test--current-request-divider-line)))))
+    (should (string-match-p
+             "Authentication: Bearer\\'"
+             (courier-test--current-header-line)))))
 
-(ert-deftest courier-request-divider-line-shows-none-auth-label ()
+(ert-deftest courier-request-header-line-shows-none-auth-label ()
   (courier-test--with-request
       (courier-test--http-content
        :url "https://example.com/users/42")
     (courier-request-mode)
     (courier-request-jump-section 'auth)
-    (should (courier-test--request-divider-matches-p
-             "Authentication: None"
-             (courier-test--current-request-divider-line)))))
+    (should (string-match-p
+             "Authentication: None\\'"
+             (courier-test--current-header-line)))))
 
-(ert-deftest courier-request-divider-line-shows-body-type-label ()
+(ert-deftest courier-request-header-line-shows-body-type-label ()
   (courier-test--with-request
       (courier-test--http-content
        :url "https://example.com/users/42"
@@ -3968,111 +3928,33 @@ skipping."
        :body "<ok/>\n")
     (courier-request-mode)
     (courier-request-jump-section 'body)
-    (should (courier-test--request-divider-matches-p
-             "Body: XML"
-             (courier-test--current-request-divider-line)))))
+    (should (string-match-p
+             "Body: XML\\'"
+             (courier-test--current-header-line)))))
 
-(ert-deftest courier-request-divider-line-adapts-to-target-width ()
-  (courier-test--with-request
-      (courier-test--http-content
-       :url "https://example.com/users/42")
-    (courier-request-mode)
-    (cl-letf (((symbol-function 'courier--request-divider-target-width)
-               (lambda () 60)))
-      (let ((divider (courier--request-divider-line)))
-        (should (= (string-width divider)
-                   (- 60 courier--request-divider-safe-margin)))
-        (should (courier-test--request-divider-matches-p "Body: JSON" divider))))))
-
-(ert-deftest courier-request-divider-line-prefers-left-biased-label ()
-  (courier-test--with-request
-      (courier-test--http-content
-       :url "https://example.com/users/42")
-    (courier-request-mode)
-    (cl-letf (((symbol-function 'courier--request-divider-target-width)
-               (lambda () 60)))
-      (pcase-let ((`(,left . ,right)
-                   (courier-test--request-divider-padding-widths
-                    "Body: JSON"
-                    (courier--request-divider-line))))
-        (should (< left right))))))
-
-(ert-deftest courier-request-divider-line-refreshes-after-window-change ()
-  (courier-test--with-request
-      (courier-test--http-content
-       :url "https://example.com/users/42")
-    (courier-request-mode)
-    (let ((original (courier-test--current-request-divider-line)))
-      (cl-letf (((symbol-function 'get-buffer-window)
-                 (lambda (&rest _args)
-                   (selected-window)))
-                ((symbol-function 'courier--request-divider-target-width)
-                 (lambda () 60)))
-        (courier--refresh-request-divider-after-window-change))
-      (let ((updated (courier-test--current-request-divider-line)))
-        (should (courier-test--request-divider-matches-p "Body: JSON" updated))
-        (should (= (string-width updated)
-                   (- 60 courier--request-divider-safe-margin)))
-        (should-not (equal updated original))))))
-
-(ert-deftest courier-request-mode-clears-header-line ()
+(ert-deftest courier-request-mode-sets-header-line ()
   (courier-test--with-request
       (courier-test--http-content
        :url "https://example.com/users/42")
     (setq-local header-line-format "stale")
     (courier-request-mode)
-    (should-not header-line-format)))
+    (should (string-match-p
+             "\\` GET https://example.com/users/42  •  Body: JSON"
+             (courier-test--current-header-line)))))
 
-(ert-deftest courier-request-method-prefix-is-read-only ()
+(ert-deftest courier-request-set-url-updates-header-line-and-query-params ()
   (courier-test--with-request
       (courier-test--http-content
        :url "https://example.com/users/42")
     (courier-request-mode)
-    (goto-char (point-min))
-    (should-error (insert "X") :type 'text-read-only)))
-
-(ert-deftest courier-request-divider-region-is-read-only ()
-  (courier-test--with-request
-      (courier-test--http-content
-       :url "https://example.com/users/42")
-    (courier-request-mode)
-    (goto-char (point-min))
-    (forward-line 1)
-    (should-error (insert "X") :type 'text-read-only)))
-
-(ert-deftest courier-request-url-remains-editable ()
-  (courier-test--with-request
-      (courier-test--http-content
-       :url "https://example.com/users/42")
-    (courier-request-mode)
-    (goto-char (point-min))
-    (search-forward " ")
-    (insert "http+")
-    (should (string-prefix-p "GET http+https://example.com/users/42"
-                             (buffer-string)))))
-
-(ert-deftest courier-request-divider-line-keeps-face-after-url-edit ()
-  (courier-test--with-request
-      (courier-test--http-content
-       :url "https://example.com/users/42")
-    (courier-request-mode)
-    (goto-char (point-min))
-    (search-forward " ")
-    (insert "http+")
-    (font-lock-ensure)
-    (goto-char (point-min))
-    (forward-line 1)
-    (search-forward "Body")
-    (let ((label-pos (match-beginning 0))
-          (divider-pos (line-beginning-position)))
-      (should (courier-test--face-includes-p
-               (get-char-property label-pos 'face)
-               'courier-request-nav-active-face))
-      (should (courier-test--face-includes-p
-               (get-char-property divider-pos 'face)
-               'courier-request-divider-face))
-      (should-not (get-text-property label-pos 'font-lock-face))
-      (should-not (get-text-property divider-pos 'font-lock-face)))))
+    (courier-request-set-url "https://example.com/users?page=2&filter=active")
+    (should (equal (plist-get courier--request-model :url)
+                   "https://example.com/users"))
+    (should (equal (plist-get courier--request-model :params)
+                   '(("page" . "2") ("filter" . "active"))))
+    (should (string-prefix-p
+             " GET https://example.com/users?page=2&filter=active"
+             (courier-test--current-header-line)))))
 
 (ert-deftest courier-request-mode-resets-state-when-buffer-visits-new-file ()
   (with-temp-buffer
@@ -4136,6 +4018,8 @@ skipping."
               #'courier-request-attach-file))
   (should (eq (lookup-key courier-request-mode-map (kbd "C-c C-t"))
               #'courier-request-section-type))
+  (should (eq (lookup-key courier-request-mode-map (kbd "C-c C-u"))
+              #'courier-request-set-url))
   (should-not (lookup-key courier-request-mode-map (kbd "C-c [")))
   (should-not (lookup-key courier-request-mode-map (kbd "C-c ]"))))
 
@@ -4395,11 +4279,7 @@ skipping."
        :body "{\"name\":\"Lucy\"}\n")
     (courier-request-mode)
     (should (markerp courier--request-content-start))
-    (should (= (marker-position courier--request-content-start)
-               (save-excursion
-                 (goto-char (point-min))
-                 (forward-line 3)
-                 (point))))
+    (should (= (marker-position courier--request-content-start) (point-min)))
     (should (string-prefix-p "{\"name\":\"Lucy\"}"
                              (buffer-substring-no-properties
                               (marker-position courier--request-content-start)
@@ -4491,10 +4371,9 @@ skipping."
                        "https://example.com/users"))
         (should (equal (plist-get courier--request-model :params)
                        '(("page" . "2") ("filter" . "active"))))
-        (should (string-prefix-p "GET https://example.com/users?page=2&filter=active"
-                                 (buffer-substring-no-properties
-                                  (point-min)
-                                  (line-end-position))))
+        (should (string-prefix-p
+                 " GET https://example.com/users?page=2&filter=active"
+                 (courier-test--current-header-line)))
         (should (string-match-p
                  (regexp-quote "GET https://example.com/users?page=2&filter=active\n\n")
                  (courier--serialize-request courier--request-model)))))))
@@ -4506,31 +4385,27 @@ skipping."
               "Accept: application/json\n")
     (courier-request-mode)
     (courier-request-set-method "POST")
-    (goto-char (point-min))
-    (should (search-forward "POST " nil t))))
+    (should (equal (plist-get courier--request-model :method) "POST"))
+    (should (string-match-p "\\` POST "
+                            (courier-test--current-header-line)))))
 
-(ert-deftest courier-request-set-method-refreshes-overlay ()
+(ert-deftest courier-request-set-method-refreshes-header-line ()
   (courier-test--with-request
       (concat "+++\nname = \"Demo\"\n+++\n\n"
               "GET \n"
               "Accept: application/json\n")
     (courier-request-mode)
     (courier-request-set-method "POST")
-    (should (overlayp courier--method-overlay))
-    (should (equal (buffer-substring-no-properties
-                    (overlay-start courier--method-overlay)
-                    (overlay-end courier--method-overlay))
-                   "POST"))))
+    (should (string-match-p "\\` POST "
+                            (courier-test--current-header-line)))))
 
 (ert-deftest courier-request-set-method-backfills-missing-request-line ()
   (courier-test--with-request "+++\nname = \"Demo\"\n+++\n\n"
     (courier-request-mode)
     (courier-request-set-method "POST")
     (should (equal (plist-get courier--request-model :method) "POST"))
-    (should (string-match-p "^POST $" (buffer-string)))
-    (should (courier-test--request-divider-matches-p
-             "Body: JSON"
-             (courier-test--current-request-divider-line)))))
+    (should (string-match-p "\\` POST "
+                            (courier-test--current-header-line)))))
 
 (ert-deftest courier-request-set-method-rejects-invalid-method ()
   (courier-test--with-request
@@ -4540,8 +4415,8 @@ skipping."
     (should-error (courier-request-set-method "TRACE")
                   :type 'user-error)
     (should (equal (plist-get courier--request-model :method) "GET"))
-    (goto-char (point-min))
-    (should (looking-at "GET https://example.com"))))
+    (should (string-match-p "\\` GET https://example.com"
+                            (courier-test--current-header-line)))))
 
 (ert-deftest courier-request-section-type-updates-request-body-model ()
   (courier-test--with-request
@@ -4558,7 +4433,7 @@ skipping."
     (should (eq (plist-get courier--request-model :body-type) 'none))
     (should (equal (plist-get courier--request-model :body) ""))))
 
-(ert-deftest courier-request-section-type-refreshes-body-divider-line ()
+(ert-deftest courier-request-section-type-refreshes-body-header-line ()
   (courier-test--with-request
       (courier-test--http-content
        :method "POST"
@@ -4570,9 +4445,8 @@ skipping."
     (cl-letf (((symbol-function 'courier--read-request-body-type)
                (lambda () 'form-urlencoded)))
       (courier-request-section-type))
-    (should (courier-test--request-divider-matches-p
-             "Body: Form"
-             (courier-test--current-request-divider-line)))))
+    (should (string-match-p "Body: Form\\'"
+                            (courier-test--current-header-line)))))
 
 (ert-deftest courier-request-body-section-round-trips-binary-metadata ()
   (courier-test--with-request
@@ -4821,7 +4695,7 @@ skipping."
                      :username "{{user}}"
                      :password "{{password}}")))))
 
-(ert-deftest courier-request-section-type-refreshes-auth-divider-line ()
+(ert-deftest courier-request-section-type-refreshes-auth-header-line ()
   (courier-test--with-request
       (courier-test--http-content
        :method "GET"
@@ -4831,9 +4705,8 @@ skipping."
     (cl-letf (((symbol-function 'courier--read-request-auth-type)
                (lambda () 'header)))
       (courier-request-section-type))
-    (should (courier-test--request-divider-matches-p
-             "Authentication: Header"
-             (courier-test--current-request-divider-line)))))
+    (should (string-match-p "Authentication: Header\\'"
+                            (courier-test--current-header-line)))))
 
 (ert-deftest courier-request-section-helpers-are-not-standalone-commands ()
   (should-not (commandp 'courier--request-set-body-type))
@@ -5355,13 +5228,12 @@ skipping."
             (should (derived-mode-p 'courier-request-mode))
             (should-not buffer-file-name)
             (should (equal (nreverse calls) '("Request URL: " "Method: ")))
-            (should (string-prefix-p "GET https://example.com/users\n" (buffer-string)))
-            (should (courier-test--request-divider-matches-p
-                     "Body: JSON"
-                     (courier-test--current-request-divider-line)))
-            (should-not header-line-format)
+            (should (string-empty-p (buffer-string)))
+            (should (string-match-p
+                     "\\` GET https://example.com/users  •  Body: JSON"
+                     (courier-test--current-header-line)))
             (should (= (line-number-at-pos) 1))
-            (should (= (point) (line-end-position)))
+            (should (= (point) (point-min)))
             (should (equal (plist-get courier--request-model :name) "Untitled 1"))
             (should (equal (plist-get courier--request-model :method) "GET"))
             (should (equal (plist-get courier--request-model :url)
@@ -5387,13 +5259,12 @@ skipping."
             (setq created-buffer (current-buffer))
             (should (derived-mode-p 'courier-request-mode))
             (should-not buffer-file-name)
-            (should (string-prefix-p "POST https://example.com/users\n" (buffer-string)))
-            (should (courier-test--request-divider-matches-p
-                     "Body: JSON"
-                     (courier-test--current-request-divider-line)))
-            (should-not header-line-format)
+            (should (string-empty-p (buffer-string)))
+            (should (string-match-p
+                     "\\` POST https://example.com/users  •  Body: JSON"
+                     (courier-test--current-header-line)))
             (should (= (line-number-at-pos) 1))
-            (should (= (point) (line-end-position)))
+            (should (= (point) (point-min)))
             (should (equal (plist-get courier--request-model :method) "POST"))))
       (when (buffer-live-p created-buffer)
         (kill-buffer created-buffer)))))
@@ -5412,8 +5283,10 @@ skipping."
                          "POST")))
               (call-interactively #'courier-new-request))
             (setq created-buffer (current-buffer))
-            (should (string-prefix-p "POST https://example.com/users\n"
-                                     (buffer-string)))
+            (should (string-empty-p (buffer-string)))
+            (should (string-match-p
+                     "\\` POST https://example.com/users  •  Body: JSON"
+                     (courier-test--current-header-line)))
             (should (equal (plist-get courier--request-model :method) "POST"))))
       (when (buffer-live-p created-buffer)
         (kill-buffer created-buffer)))))
@@ -5448,6 +5321,205 @@ skipping."
                  "*courier-request: Untitled 1*"))
   (should (equal (courier--response-buffer-name '(:name "Untitled 1"))
                  "*courier-response: Untitled 1*")))
+
+(ert-deftest courier-display-response-buffer-reuses-buffer-for-request-path ()
+  (let* ((path "/tmp/courier-reuse-response.http")
+         (first-request `(:method "GET"
+                          :url "https://example.com/first"
+                          :path ,path))
+         (second-request `(:method "GET"
+                           :url "https://example.com/second"
+                           :path ,path))
+         first-buffer
+         second-buffer)
+    (unwind-protect
+        (save-window-excursion
+          (setq first-buffer (courier--display-response-buffer first-request))
+          (with-current-buffer first-buffer
+            (courier--response-mode)
+            (setq-local courier--request first-request))
+          (setq second-buffer (courier--display-response-buffer second-request))
+          (should (eq first-buffer second-buffer))
+          (should (equal (buffer-name second-buffer)
+                         "*courier-response: GET https://example.com/second*")))
+      (dolist (buffer (list first-buffer second-buffer))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
+
+(ert-deftest courier-display-response-buffer-prefers-canonical-buffer-for-path ()
+  (let* ((path "/tmp/courier-canonical-response.http")
+         (request `(:method "GET"
+                    :url "https://example.com/current"
+                    :path ,path))
+         (canonical (get-buffer-create
+                     "*courier-response: GET https://example.com/current*"))
+         (stale (get-buffer-create
+                 "*courier-response: GET https://example.com/stale*"))
+         result)
+    (unwind-protect
+        (save-window-excursion
+          (with-current-buffer canonical
+            (courier--response-mode)
+            (setq courier--request request))
+          (with-current-buffer stale
+            (courier--response-mode)
+            (setq courier--request
+                  `(:method "GET"
+                    :url "https://example.com/stale"
+                    :path ,path)))
+          (switch-to-buffer stale)
+          (setq result (courier--display-response-buffer request))
+          (should (eq result canonical))
+          (should-not
+           (get-buffer "*courier-response: GET https://example.com/current*<2>")))
+      (dolist (buffer (list result canonical stale))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
+
+(ert-deftest courier-display-response-buffer-prefers-visible-window-reuse ()
+  (let ((request '(:method "GET"
+                   :url "https://example.com/window-reuse"
+                   :name "Window Reuse"))
+        displayed-buffer
+        display-action)
+    (unwind-protect
+        (cl-letf (((symbol-function 'display-buffer)
+                   (lambda (buffer action)
+                     (setq displayed-buffer buffer
+                           display-action action)
+                     buffer)))
+          (courier--display-response-buffer request)
+          (should (buffer-live-p displayed-buffer))
+          (should (memq 'display-buffer-reuse-window display-action)))
+      (when (buffer-live-p displayed-buffer)
+        (kill-buffer displayed-buffer)))))
+
+(ert-deftest courier-render-response-reuses-buffer-and-switches-to-response-view ()
+  (let* ((path "/tmp/courier-refresh-response.http")
+         (request `(:method "GET"
+                    :url "https://example.com"
+                    :path ,path))
+         (buffer (courier--display-response-buffer request)))
+    (unwind-protect
+        (with-current-buffer buffer
+          (courier--render-response (courier-test--make-response 200) request)
+          (courier-response-set-tab 'timeline)
+          (should (eq courier--response-tab 'timeline))
+          (courier--response-show-sending request)
+          (should (eq courier--response-tab 'response))
+          (courier--render-response (courier-test--make-response 201) request)
+          (should (eq courier--response-tab 'response))
+          (should (equal (current-buffer)
+                         (courier--display-response-buffer request))))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
+
+(ert-deftest courier-request-send-reuses-unsaved-draft-response-buffer ()
+  (let ((courier--untitled-request-counter 0)
+        (courier--request-draft-id-counter 0)
+        request-buffer
+        first-response
+        second-response)
+    (unwind-protect
+        (save-window-excursion
+          (cl-letf (((symbol-function 'display-buffer)
+                     (lambda (buffer &rest _args)
+                       buffer))
+                    ((symbol-function 'courier-send-request)
+                     (lambda (&rest _args)
+                       (error "fork failed"))))
+            (courier-new-request "https://example.com/users" "GET")
+            (setq request-buffer (current-buffer))
+            (with-current-buffer request-buffer
+              (courier-request-send))
+            (setq first-response (get-buffer "*courier-response: Untitled 1*"))
+            (with-current-buffer request-buffer
+              (courier-request-send))
+            (setq second-response (get-buffer "*courier-response: Untitled 1*"))
+            (should (eq first-response second-response))
+            (should (= 1
+                       (length
+                        (seq-filter
+                         (lambda (buffer)
+                           (string-prefix-p "*courier-response:"
+                                            (buffer-name buffer)))
+                         (buffer-list)))))))
+      (dolist (buffer (list request-buffer first-response second-response))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
+
+(ert-deftest courier-request-send-reuses-unsaved-draft-response-after-name-change ()
+  (let ((courier--untitled-request-counter 0)
+        (courier--request-draft-id-counter 0)
+        request-buffer
+        first-response
+        second-response)
+    (unwind-protect
+        (save-window-excursion
+          (cl-letf (((symbol-function 'display-buffer)
+                     (lambda (buffer &rest _args)
+                       buffer))
+                    ((symbol-function 'courier-send-request)
+                     (lambda (&rest _args)
+                       (error "fork failed"))))
+            (courier-new-request "https://example.com/users" "GET")
+            (setq request-buffer (current-buffer))
+            (with-current-buffer request-buffer
+              (courier-request-send))
+            (setq first-response (get-buffer "*courier-response: Untitled 1*"))
+            (with-current-buffer request-buffer
+              (plist-put courier--request-model :name "Renamed Draft")
+              (courier-request-send))
+            (setq second-response
+                  (get-buffer "*courier-response: Renamed Draft*"))
+            (should (eq first-response second-response))
+            (should-not (get-buffer "*courier-response: Untitled 1*"))))
+      (dolist (buffer (list request-buffer first-response second-response))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
+
+(ert-deftest courier-response-retry-reuses-current-response-buffer ()
+  (let* ((request-file (make-temp-file "courier-retry" nil ".http"
+                                       "GET https://example.com/current\n"))
+         (current-response (get-buffer-create
+                            "*courier-response: GET https://example.com/stale*"))
+         (canonical (get-buffer-create
+                     "*courier-response: GET https://example.com/current*"))
+         shown)
+    (unwind-protect
+        (progn
+          (with-current-buffer current-response
+            (courier--render-response
+             (courier-test--make-response 200)
+             `(:method "GET"
+               :url "https://example.com/stale"
+               :path ,request-file))
+            (setq courier--response-tab 'timeline))
+          (with-current-buffer canonical
+            (courier--render-response
+             (courier-test--make-response 200)
+             `(:method "GET"
+               :url "https://example.com/current"
+               :path ,request-file)))
+          (with-current-buffer current-response
+            (cl-letf (((symbol-function 'display-buffer)
+                       (lambda (buffer &rest _args)
+                         (push buffer shown)
+                         buffer))
+                      ((symbol-function 'courier-send-request)
+                       (lambda (&rest _args)
+                         (error "fork failed"))))
+              (courier-response-retry)))
+          (should (eq (car shown) current-response))
+          (with-current-buffer current-response
+            (should (eq courier--response-tab 'response))
+            (should (equal (plist-get courier--request :url)
+                           "https://example.com/current"))))
+      (when (file-exists-p request-file)
+        (delete-file request-file))
+      (dolist (buffer (list current-response canonical))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
 
 (ert-deftest courier-request-save-buffer-uses-configured-requests-dir ()
   (courier-test--with-temp-dir (root)
@@ -5615,7 +5687,7 @@ skipping."
             (should (file-exists-p new-file))
             (should-not (file-exists-p request-file))
             (should (equal (plist-get courier--request-model :name) "Create User"))
-            (should (string-match-p "^GET https://example.com/users/42$" (buffer-string)))
+            (should (string-empty-p (buffer-string)))
             (should (string-match-p
                      (regexp-quote "+++\nname = \"Create User\"\n\n[body]\ntype = \"json\"\n+++\n\nGET https://example.com/users/42\n\n")
                      (with-temp-buffer
