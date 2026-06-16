@@ -367,6 +367,7 @@ skipping."
          (courier-test--parsed
           (courier-test--http-content
            :name "Example"
+           :description "示例请求"
            :method "POST"
            :url "https://example.com"
            :headers '(("accept" . "application/json"))
@@ -377,6 +378,7 @@ skipping."
            :tests '("status == 200")
            :settings '(:timeout 12 :follow-redirects t)))))
     (should (equal (plist-get request :name) "Example"))
+    (should (equal (plist-get request :description) "示例请求"))
     (should (equal (plist-get (plist-get request :settings) :timeout) 12))
     (should (equal (plist-get (plist-get request :settings) :follow-redirects) t))
     (should (equal (plist-get request :auth)
@@ -3821,12 +3823,54 @@ skipping."
         (should (eq (plist-get (cdr candidate) :kind) 'request))
         (should (equal (car candidate) "users/get-user"))))))
 
+(ert-deftest courier-request-candidates-annotate-description ()
+  (courier-test--with-temp-dir (root)
+    (let* ((request-file (expand-file-name "users/get-user.http" root)))
+      (make-directory (file-name-directory request-file) t)
+      (with-temp-file request-file
+        (insert (courier-test--http-content
+                 :name "get-user"
+                 :description "获取用户详情"
+                 :url "https://example.com/users/42")))
+      (let ((candidate (car (courier--request-candidates root))))
+        (should (equal (get-text-property 0 'courier-annotation
+                                          (car candidate))
+                       "获取用户详情"))))))
+
+(ert-deftest courier-open-ignores-invalid-description-metadata ()
+  (courier-test--with-temp-dir (root)
+    (let* ((courier-home-directory root)
+           (collection-root (expand-file-name "collections/api-collection" root))
+           (request-root (expand-file-name "requests/users" collection-root))
+           (request-file (expand-file-name "broken.http" request-root))
+           selected
+           opened-path)
+      (make-directory (file-name-directory request-file) t)
+      (with-temp-file (expand-file-name "courier.json" collection-root)
+        (insert "{}\n"))
+      (with-temp-file request-file
+        (insert "+++\ntimeout = \"bad\"\n+++\n\nGET https://example.com/users\n"))
+      (with-temp-buffer
+        (setq default-directory root)
+        (cl-letf (((symbol-function 'completing-read)
+                   (lambda (_prompt collection &rest _args)
+                     (setq selected (car (all-completions "" collection)))
+                     selected))
+                  ((symbol-function 'courier--open-request-file)
+                   (lambda (path)
+                     (setq opened-path path))))
+          (courier-open))
+        (should (equal selected "users/broken"))
+        (should-not (get-text-property 0 'courier-annotation selected))
+        (should (equal opened-path request-file))))))
+
 (ert-deftest courier-open-does-not-parse-request-files ()
   (courier-test--with-temp-dir (root)
     (let* ((courier-home-directory root)
            (collection-root (expand-file-name "collections/api-collection" root))
            (request-root (expand-file-name "requests/users" collection-root))
-           (request-file (expand-file-name "broken.http" request-root)))
+           (request-file (expand-file-name "broken.http" request-root))
+           opened-path)
       (make-directory (file-name-directory request-file) t)
       (with-temp-file (expand-file-name "courier.json" collection-root)
         (insert "{}\n"))
@@ -3840,9 +3884,11 @@ skipping."
                   ((symbol-function 'completing-read)
                    (lambda (_prompt collection &rest _args)
                      (car (all-completions "" collection))))
-                  ((symbol-function 'find-file)
-                   #'ignore))
-          (courier-open))))))
+                  ((symbol-function 'courier--open-request-file)
+                   (lambda (path)
+                     (setq opened-path path))))
+          (courier-open))
+        (should (equal opened-path request-file))))))
 
 (ert-deftest courier-open-opens-selected-request-file ()
   (courier-test--with-temp-dir (root)
@@ -4318,6 +4364,36 @@ skipping."
     (should (equal (plist-get courier--request-model :auth)
                    '(:type bearer :token "{{token}}")))))
 
+(ert-deftest courier-request-meta-section-round-trips-name-and-description ()
+  (courier-test--with-request
+      (courier-test--http-content
+       :name "plan-submit"
+       :description "油品计划提交"
+       :url "https://example.com/oilPlan/planSubmit.pl")
+    (courier-request-mode)
+    (courier-request-jump-section 'meta)
+    (should (string-match-p "^name = \"plan-submit\"$" (buffer-string)))
+    (should (string-match-p "^description = \"油品计划提交\"$" (buffer-string)))
+    (erase-buffer)
+    (insert "name = \"submit-oil-plan\"\n"
+            "description = \"提交油品计划\"\n")
+    (courier--sync-request-model)
+    (should (equal (plist-get courier--request-model :name)
+                   "submit-oil-plan"))
+    (should (equal (plist-get courier--request-model :description)
+                   "提交油品计划"))))
+
+(ert-deftest courier-request-meta-section-rejects-non-meta-keys ()
+  (courier-test--with-request
+      (courier-test--http-content
+       :name "plan-submit"
+       :url "https://example.com/oilPlan/planSubmit.pl")
+    (courier-request-mode)
+    (courier-request-jump-section 'meta)
+    (erase-buffer)
+    (insert "timeout = 10\n")
+    (should-error (courier--sync-request-model) :type 'user-error)))
+
 (ert-deftest courier-request-jump-section-shows-request-section ()
   (courier-test--with-request
       "GET https://example.com/users?page=1\n"
@@ -4333,6 +4409,9 @@ skipping."
     (courier-request-jump-section 'params)
     (should (string-match-p "^# Query params$" (buffer-string)))
     (should (string-match-p "^# include = profile,roles$" (buffer-string)))
+    (courier-request-jump-section 'meta)
+    (should (string-match-p "^# name = \"request\"$" (buffer-string)))
+    (should (string-match-p "^# description = \"\"$" (buffer-string)))
     (courier-request-jump-section 'vars)
     (should (string-match-p "^# Request Vars$" (buffer-string)))
     (should (string-match-p "^# Pre-request Vars$" (buffer-string)))
@@ -5275,7 +5354,7 @@ skipping."
         (when (buffer-live-p buffer)
           (kill-buffer buffer))))))
 
-(ert-deftest courier-new-request-creates-untitled-draft ()
+(ert-deftest courier-new-request-creates-untitled-draft-with-empty-name ()
   (let ((courier--untitled-request-counter 0)
         (calls nil)
         created-buffer)
@@ -5303,7 +5382,8 @@ skipping."
                      (courier-test--current-header-line)))
             (should (= (line-number-at-pos) 1))
             (should (= (point) (point-min)))
-            (should (equal (plist-get courier--request-model :name) "Untitled 1"))
+            (should (equal (buffer-name) "*courier-request: Untitled 1*"))
+            (should-not (plist-get courier--request-model :name))
             (should (equal (plist-get courier--request-model :method) "GET"))
             (should (equal (plist-get courier--request-model :url)
                            "https://example.com/users"))))
@@ -5733,6 +5813,31 @@ skipping."
               (courier-request-save-buffer))
             (should (equal captured-initial "create-user"))
             (should (string-suffix-p ".http" buffer-file-name)))
+        (when (buffer-live-p draft-buffer)
+          (kill-buffer draft-buffer))))))
+
+(ert-deftest courier-request-save-buffer-does-not-fallback-to-url-name ()
+  (courier-test--with-temp-dir (root)
+    (let* ((courier-home-directory root)
+           (draft-buffer (generate-new-buffer "*courier-save-empty-name*"))
+           captured-initial)
+      (unwind-protect
+          (with-current-buffer draft-buffer
+            (insert "+++\nname = \"\"\n+++\n\nGET https://example.com/users\n")
+            (setq default-directory root)
+            (courier-request-mode)
+            (cl-letf (((symbol-function 'completing-read)
+                       (lambda (_prompt _collection &rest _args)
+                         "api-collection"))
+                      ((symbol-function 'read-string)
+                       (lambda (prompt &optional initial _history _default-value _inherit-input-method)
+                         (when (string-prefix-p "Request file name:" prompt)
+                           (setq captured-initial initial)
+                           initial)
+                         initial)))
+              (courier-request-save-buffer))
+            (should (equal captured-initial "request"))
+            (should (string-suffix-p "request.http" buffer-file-name)))
         (when (buffer-live-p draft-buffer)
           (kill-buffer draft-buffer))))))
 

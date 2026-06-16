@@ -118,7 +118,7 @@ root."
   "Directory name under Courier state that stores runtime variables.")
 
 (defvar courier--untitled-request-counter 0
-  "Running counter used for untitled Courier request drafts.")
+  "Running counter used for untitled Courier request draft buffers.")
 
 (defvar courier--request-draft-id-counter 0
   "Running counter used for unsaved Courier request draft identities.")
@@ -589,6 +589,7 @@ When NORMALIZE-KEYS is non-nil, apply it to each key before storing the alist."
 (defun courier--empty-request (&optional path)
   "Return a fresh Courier request plist for PATH."
   (list :path path
+        :description nil
         :headers nil
         :body ""
         :body-type courier-default-body-type
@@ -802,6 +803,10 @@ Return `(VALUE . NEXT-INDEX)'."
                   (unless (stringp value)
                     (courier--parse-error line-number "name must be a string"))
                   (setq request (plist-put request :name value)))
+                 ("description"
+                  (unless (stringp value)
+                    (courier--parse-error line-number "description must be a string"))
+                  (setq request (plist-put request :description value)))
                  ("timeout"
                   (unless (and (integerp value) (> value 0))
                     (courier--parse-error line-number "timeout must be a positive integer"))
@@ -3911,21 +3916,25 @@ Move them to the top of the current response buffer."
     (user-error "No Courier response is available"))
   (courier--set-response-tab tab))
 
+;;;###autoload
 (defun courier-response-view-response ()
   "Switch to the Response view."
   (interactive)
   (courier--set-response-tab 'response))
 
+;;;###autoload
 (defun courier-response-view-headers ()
   "Switch to the Headers view."
   (interactive)
   (courier--set-response-tab 'headers))
 
+;;;###autoload
 (defun courier-response-view-timeline ()
   "Switch to the Timeline view."
   (interactive)
   (courier--set-response-tab 'timeline))
 
+;;;###autoload
 (defun courier-response-view-tests ()
   "Switch to the test results view."
   (interactive)
@@ -4150,6 +4159,9 @@ The return value is one of:
 (defvar-local courier--request-draft-id nil
   "Stable identity for an unsaved Courier request buffer.")
 
+(defvar-local courier--request-draft-name nil
+  "Display name for the current unsaved Courier request buffer.")
+
 (defvar-local courier--request-tab 'body
   "Current Courier request section shown in the active request buffer.")
 
@@ -4164,6 +4176,7 @@ The return value is one of:
 (put 'courier--collection-root-hint 'permanent-local t)
 (put 'courier--request-model 'permanent-local t)
 (put 'courier--request-draft-id 'permanent-local t)
+(put 'courier--request-draft-name 'permanent-local t)
 (put 'courier--request-tab 'permanent-local t)
 (put 'courier--request-content-start 'permanent-local t)
 
@@ -4172,7 +4185,7 @@ The return value is one of:
   "Primary navigation sections shown in Courier request buffers.")
 
 (defconst courier--request-secondary-sections
-  '(auth vars script tests)
+  '(meta auth vars script tests)
   "Secondary request sections shown through the section jump command.")
 
 (defface courier-request-method-get-face
@@ -4335,6 +4348,7 @@ The return value is one of:
     ('auth (format "Authentication: %s"
                    (courier--auth-type-label
                     (courier--request-auth-type courier--request-model))))
+    ('meta "Meta")
     ('vars "Variables")
     ('script "Scripts")
     ('tests "Tests")
@@ -4346,6 +4360,7 @@ The return value is one of:
     ('params "edit URL query parameters")
     ('body "edit request body")
     ('headers "edit HTTP headers")
+    ('meta "edit request name and description")
     ('auth "edit authentication settings")
     ('vars "edit request and response vars")
     ('script "edit pre and post scripts")
@@ -4435,6 +4450,9 @@ The return value is one of:
                 "# path = \"./avatar.png\"\n"
                 "# content_type = \"image/png\"\n"))
        (_ "")))
+    ('meta
+     (concat "# name = \"request\"\n"
+             "# description = \"\"\n"))
     ('auth
      (concat "# [auth]\n"
              "# type = \"bearer\"\n"
@@ -4479,6 +4497,64 @@ The return value is one of:
                  pairs
                  "\n")
     ""))
+
+(defun courier--request-meta-lines (request)
+  "Return editable TOML fragment for REQUEST metadata."
+  (let ((name (and (plist-get request :name)
+                   (string-trim (plist-get request :name))))
+        (description (and (plist-get request :description)
+                          (string-trim (plist-get request :description)))))
+    (if (or (and name (not (string-empty-p name)))
+            (and description (not (string-empty-p description))))
+        (string-join
+         (delq nil
+               (list
+                (when (and name (not (string-empty-p name)))
+                  (format "name = %s" (courier--toml-quote-string name)))
+                (if (and description (not (string-empty-p description)))
+                    (format "description = %s"
+                            (courier--toml-quote-string description))
+                  "# description = \"\"")))
+         "\n")
+      "")))
+
+(defun courier--parse-request-meta-lines (text)
+  "Parse meta section TEXT into Courier request metadata."
+  (let ((lines (split-string (or text "") "\n"))
+        (index 0)
+        (name "")
+        description)
+    (while (< index (length lines))
+      (let* ((line (nth index lines))
+             (line-number (1+ index))
+             (trimmed (string-trim line)))
+        (cond
+         ((or (string-empty-p trimmed)
+              (string-prefix-p "#" trimmed))
+          (setq index (1+ index)))
+         ((or (string-match-p courier--toml-table-regexp trimmed)
+              (string-match-p courier--toml-array-table-regexp trimmed))
+          (courier--parse-error line-number
+                                "Meta section does not support TOML tables"))
+         ((string-match courier--toml-assignment-regexp line)
+          (let* ((key (match-string 1 line))
+                 (raw-value (match-string 2 line))
+                 (parsed (courier--parse-toml-value
+                          raw-value lines index line-number))
+                 (value (car parsed)))
+            (setq index (cdr parsed))
+            (unless (stringp value)
+              (courier--parse-error line-number "%s must be a string" key))
+            (pcase key
+              ("name" (setq name value))
+              ("description" (setq description value))
+              (_
+               (courier--parse-error line-number
+                                     "Unsupported meta key: %s" key)))))
+         (t
+          (courier--parse-error line-number
+                                "Malformed meta line: %s" trimmed)))))
+    (list :name name :description description)))
 
 (defun courier--request-effective-params (request)
   "Return the effective params for REQUEST.
@@ -4786,6 +4862,8 @@ REGEXP must place the editable string contents in capture group 1."
               ""))
            ('body
             (courier--request-body-section-text request))
+           ('meta
+            (courier--request-meta-lines request))
            ('auth
             (courier--request-auth-lines request))
            ('vars
@@ -4961,6 +5039,8 @@ REGEXP must place the editable string contents in capture group 1."
   (let* ((settings (plist-get request :settings))
          (name (and (plist-get request :name)
                     (string-trim (plist-get request :name))))
+         (description (and (plist-get request :description)
+                           (string-trim (plist-get request :description))))
          (timeout (plist-get settings :timeout))
          (follow-redirects-present (plist-member settings :follow-redirects))
          (follow-redirects (plist-get settings :follow-redirects))
@@ -4968,6 +5048,10 @@ REGEXP must place the editable string contents in capture group 1."
          sections)
     (when (and name (not (string-empty-p name)))
       (push (format "name = %s" (courier--toml-quote-string name)) sections))
+    (when (and description (not (string-empty-p description)))
+      (push (format "description = %s"
+                    (courier--toml-quote-string description))
+            sections))
     (when timeout
       (push (format "timeout = %d" timeout) sections))
     (when follow-redirects-present
@@ -5215,11 +5299,17 @@ REGEXP must place the editable string contents in capture group 1."
           ('headers
            (plist-put courier--request-model :headers
                       (courier--parse-request-header-lines section-text)))
-         ('body
+          ('body
            (courier--request-apply-body-state
             courier--request-model
             (courier--request-body-type courier--request-model)
             section-text))
+          ('meta
+           (let ((parsed-meta (courier--parse-request-meta-lines section-text)))
+             (plist-put courier--request-model :name
+                        (plist-get parsed-meta :name))
+             (plist-put courier--request-model :description
+                        (plist-get parsed-meta :description))))
           ('auth
            (plist-put courier--request-model :auth
                       (courier--parse-request-auth-lines section-text)))
@@ -5460,7 +5550,7 @@ LINE-KIND names the line type in malformed-line errors."
     (plist-put request :name (courier--buffer-request-name))
     (plist-put request :method method)
     (plist-put request :url url)
-    (courier--apply-request-buffer-identity request)
+    (courier--apply-request-buffer-identity request t)
     request))
 
 (defun courier--collection-config-path (&optional start)
@@ -5549,11 +5639,23 @@ directory even when it does not exist yet."
   "Return a Courier request filename for NAME."
   (concat (courier--slugify name) ".http"))
 
+(defun courier--request-save-file-name-source (request)
+  "Return the filename source for saving REQUEST."
+  (or (plist-get request :name) "request"))
+
 (defun courier--buffer-request-name ()
   "Return the current buffer request name, or a default untitled name."
   (if courier--request-model
-      (or (plist-get courier--request-model :name) "Untitled")
+      (or (plist-get courier--request-model :name)
+          courier--request-draft-name
+          "Untitled")
     "Untitled"))
+
+(defun courier--next-untitled-request-name ()
+  "Return the next untitled request buffer display name."
+  (setq courier--untitled-request-counter
+        (1+ courier--untitled-request-counter))
+  (format "Untitled %d" courier--untitled-request-counter))
 
 (defun courier--ensure-request-draft-id ()
   "Return the stable draft identity for the current unsaved request buffer."
@@ -5564,18 +5666,16 @@ directory even when it does not exist yet."
                 (format "draft-%d" courier--request-draft-id-counter)))
   courier--request-draft-id)
 
-(defun courier--apply-request-buffer-identity (request)
-  "Attach the current request buffer identity to REQUEST when needed."
+(defun courier--apply-request-buffer-identity (request &optional display-name)
+  "Attach the current request buffer identity to REQUEST when needed.
+When DISPLAY-NAME is non-nil, also attach the current display name."
   (when (and (derived-mode-p 'courier-request-mode)
              (not (plist-get request :path)))
+    (when (and display-name
+               (not (plist-get request :name)))
+      (plist-put request :name (courier--buffer-request-name)))
     (plist-put request :draft-id (courier--ensure-request-draft-id)))
   request)
-
-(defun courier--next-untitled-request-name ()
-  "Return the next untitled request display name."
-  (setq courier--untitled-request-counter
-        (1+ courier--untitled-request-counter))
-  (format "Untitled %d" courier--untitled-request-counter))
 
 (defun courier--draft-buffer-name (name)
   "Return a draft buffer name for request NAME."
@@ -5607,8 +5707,9 @@ directory even when it does not exist yet."
 (defun courier--request-skeleton (name method url)
   "Return initial draft text for request NAME, METHOD, and URL."
   (concat "+++\n"
-          "name = " (courier--toml-quote-string name) "\n"
-          "\n"
+          (if (and name (not (string-empty-p (string-trim name))))
+              (concat "name = " (courier--toml-quote-string name) "\n\n")
+            "")
           "[body]\n"
           "type = " (courier--toml-quote-string
                      (symbol-name courier-default-body-type)) "\n"
@@ -6113,12 +6214,40 @@ When NEW-NAME is non-nil, also update any live response buffer name metadata."
          (relative-path (file-relative-name path request-root)))
     (file-name-sans-extension relative-path)))
 
+(defun courier--request-file-description (path)
+  "Return the description stored in request file PATH, or nil.
+
+Malformed metadata or file read failures return nil so optional annotations do
+not block request discovery."
+  (condition-case nil
+      (with-temp-buffer
+        (insert-file-contents path)
+        (let* ((components (courier--buffer-components))
+               (front-matter (plist-get components :front-matter)))
+          (when front-matter
+            (let* ((request (courier--parse-front-matter
+                             front-matter
+                             (plist-get components :front-matter-line)
+                             (courier--empty-request path)))
+                   (description (and (plist-get request :description)
+                                     (string-trim
+                                      (plist-get request :description)))))
+              (and description
+                   (not (string-empty-p description))
+                   description)))))
+    ((user-error file-error) nil)))
+
 (defun courier--request-candidate (path collection-root)
   "Return a completion candidate for request PATH in COLLECTION-ROOT."
   (let* ((label (courier--open-request-display-path path collection-root))
-         (collection-name (courier--open-collection-label collection-root)))
-    (cons (propertize label
-                      'courier-group collection-name)
+         (collection-name (courier--open-collection-label collection-root))
+         (description (courier--request-file-description path))
+         (display-label (propertize label 'courier-group collection-name)))
+    (when description
+      (add-text-properties 0 (length display-label)
+                           (list 'courier-annotation description)
+                           display-label))
+    (cons display-label
           (list :kind 'request
                 :path path
                 :collection-root collection-root))))
@@ -6622,7 +6751,7 @@ Entries are read from the configured env directory only."
                       (plist-get defaulted-request :vars)
                       (plist-get defaulted-request :pre-request-vars))))
          (request (courier--run-pre-request-script request-with-vars base-vars)))
-    (courier--apply-request-buffer-identity request)
+    (courier--apply-request-buffer-identity request t)
     (plist-put request :env-name env-name)
     (plist-put request :env-vars base-vars)
     request))
@@ -7392,7 +7521,8 @@ Unsaved request buffers choose a collection on first save."
         (force-mode-line-update))
     (let* ((collection-root (courier--read-save-collection-root))
            (request-root (courier--preferred-requests-root collection-root))
-           (request-name (courier--buffer-request-name))
+           (request-name
+            (courier--request-save-file-name-source courier--request-model))
            (path (courier--read-save-request-path request-root request-name)))
       (make-directory request-root t)
       (when (and (file-exists-p path)
@@ -7506,13 +7636,14 @@ When RESPONSE-BUFFER is live, render the result there."
      (list url (courier--read-request-method courier-default-request-method))))
   (let* ((request-url (courier--normalize-new-request-url url))
          (request-method (courier--ensure-request-method method))
-         (name (courier--next-untitled-request-name))
+         (draft-name (courier--next-untitled-request-name))
          (origin-root (courier--collection-root))
-         (buffer (generate-new-buffer (courier--draft-buffer-name name))))
+         (buffer (generate-new-buffer (courier--draft-buffer-name draft-name))))
     (with-current-buffer buffer
       (setq-local default-directory (or origin-root default-directory))
-      (insert (courier--request-skeleton name request-method request-url))
+      (insert (courier--request-skeleton nil request-method request-url))
       (courier-request-mode)
+      (setq-local courier--request-draft-name draft-name)
       (setq-local courier--collection-root-hint origin-root)
       (goto-char (point-min))
       (end-of-line))

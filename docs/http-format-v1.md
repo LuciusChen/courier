@@ -27,6 +27,7 @@ The HTTP request block remains the source of truth for:
 The TOML front matter is the source of truth for:
 
 - name
+- description
 - timeout
 - follow redirects
 - body type
@@ -121,6 +122,7 @@ Content-Type: application/json
 Top-level keys:
 
 - `name`
+- `description`
 - `timeout`
 - `follow_redirects`
 - `tests`
@@ -143,6 +145,15 @@ name = "Create User"
 
 - Optional string
 - Used for display and file creation defaults
+
+### `description`
+
+```toml
+description = "创建用户"
+```
+
+- Optional string
+- Used as a human-readable request note in request pickers
 
 ### `timeout`
 
@@ -477,13 +488,14 @@ Courier must be able to parse and save the file without inventing hidden state.
 When Courier writes front matter, use this order:
 
 1. `name`
-2. `timeout`
-3. `follow_redirects`
-4. `tests`
-5. `[body]`
-6. `[auth]`
-7. `[vars]`
-8. `[scripts]`
+2. `description`
+3. `timeout`
+4. `follow_redirects`
+5. `tests`
+6. `[body]`
+7. `[auth]`
+8. `[vars]`
+9. `[scripts]`
 
 ### Missing Values
 

@@ -298,15 +298,19 @@ manager. It is a source of variable values for request resolution.
 ### 7. Create a new request
 
 - user creates a new request draft without choosing a path first
-- Courier gives it an `Untitled N` name and opens it as an unsaved buffer
+- Courier gives the buffer an `Untitled N` temporary identity and opens it as
+  an unsaved buffer without setting request `name`
 - the draft request uses a configurable default method, with `GET` as the default
-- the draft name remains metadata and buffer identity; the editor body starts
-  in the active request section, with method and URL kept in the header line
+- the editor body starts in the active request section, with method and URL kept
+  in the header line
+- the `Meta` section lets users edit `name` and an optional `description`
+  before saving
 - on first save, Courier asks which collection should own the request
 - Courier stores and discovers collections under `courier-home-directory/collections/`
 - if the chosen collection name does not exist yet, Courier creates it under
   that home-managed collections directory
-- Courier then asks for the request filename explicitly and appends `.http`
+- Courier then asks for the request filename explicitly using the current
+  `name` as the default, or `request` when no name is set, and appends `.http`
   automatically unless the user already typed it
 - the request is then saved into that collection's `requestsDir`
 - request editing stays text-first; the header line keeps the method, effective

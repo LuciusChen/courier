@@ -62,5 +62,6 @@ method prompt keeps the flow explicit.
 - Creating a request now requires a non-empty URL without whitespace. Users who
   want a scratch request can still edit any existing request buffer or create a
   draft with a placeholder URL.
-- The generated draft name remains `Untitled N`; Courier does not infer a name
-  from the URL.
+- Superseded by [005 Request Meta Name Description v1](005-request-meta-name-description-v1.md):
+  request `name` can now be set explicitly in the `Meta` section, while the
+  unsaved buffer keeps an `Untitled N` temporary identity.

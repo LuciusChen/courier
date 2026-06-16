@@ -199,6 +199,7 @@ Example:
 #+begin_src http
 +++
 name = "Create User"
+description = "创建用户"
 timeout = 10
 follow_redirects = true
 
@@ -236,6 +237,7 @@ Metadata belongs in TOML front matter:
 | Key / Table           | Example                                | Description             |
 |-----------------------+----------------------------------------+-------------------------|
 | =name=                | =name = "Get User"=                    | Human-readable name     |
+| =description=         | =description = "获取用户详情"=        | Request note            |
 | =timeout=             | =timeout = 10=                         | Timeout in seconds      |
 | =follow_redirects=    | =follow_redirects = true=              | Follow redirects        |
 | =[body]=              | =type = "json"=                        | Body serialization type |
@@ -450,13 +452,14 @@ Use =M-x courier-new-request= or =C-c C-n= to open an unsaved draft buffer. The
 command first asks for a non-empty request-line URL, then asks for the HTTP
 method using =courier-default-request-method= as the default. The draft buffer
 is temporary and starts in the active section body; the request method and URL
-stay in the header line. On the first =C-x C-s=, Courier asks which collection
-should own the request. Courier keeps collections under =courier-home-directory=
-in =collections/<name>/=. If you type a collection name that does not exist
+stay in the header line. Use the =Meta= section before saving to set the
+request =name= or add a =description= note. On the first =C-x C-s=, Courier
+asks which collection should own the request. Courier keeps collections under
+=courier-home-directory= in =collections/<name>/=. If you type a collection name that does not exist
 yet, Courier creates it there before saving the request into that collection's
 =requests/= directory. Courier then asks for the request filename explicitly
-instead of inventing one from the current request name; =.http= is added
-automatically unless you typed it yourself.
+using the current =name= as the default, or =request= when no name is set;
+=.http= is added automatically unless you typed it yourself.
 The method and URL are managed by Courier and changed with =C-c C-m= and =C-c
 C-u= instead of direct editing in the section buffer.
 Sending from request mode uses one response workflow for both send-time and
@@ -480,6 +483,7 @@ highlighting in place, and =C-c C-b= formats the current body section. For
 =text= bodies, Courier infers the formatter and syntax highlighter from the
 =Content-Type= header when it identifies JSON, HTML, XML, or JavaScript.
 
+=Meta= edits the request =name= and optional =description= as front matter.
 =Authentication= is edited as a TOML-backed fragment. =Variables=, =Scripts=,
 and =Tests= stay TOML-backed too, with the request editor adding comment
 headings where that improves scanability. =Tests= now edits the same
@@ -502,9 +506,9 @@ effective URL while you edit other sections.
 Use =M-x courier-create-collection= to create a collection explicitly. Use
 =C-c C-o= to open another =.http= request from one annotated picker. Courier
 scans known collections under =courier-home-directory=, lists request files
-directly from the filesystem, and groups the picker by collection instead of
-dropping into a directory prompt or parsing request contents just to build
-picker entries.
+directly from the filesystem, reads front matter descriptions for picker
+annotations, and groups the picker by collection instead of dropping into a
+directory prompt.
 Use =C-c C-e= to switch the active environment for the current request buffer.
 Use =M-x courier-open-env= to open an environment file for editing from
 anywhere; env candidates are grouped by collection, keep the env name as the
