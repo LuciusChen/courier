@@ -53,6 +53,11 @@
   (courier-test--with-request content
     (courier-parse-buffer)))
 
+(defun courier-test--parsed-for-editor (content)
+  "Parse request CONTENT using Courier's relaxed editor parser."
+  (courier-test--with-request content
+    (courier--parse-buffer-for-editor)))
+
 (defun courier-test--http-content (&rest pairs)
   "Return a Courier v1 `.http' fixture from plist PAIRS."
   (let ((request (courier--empty-request "/tmp/test.http"))
@@ -767,6 +772,16 @@ skipping."
                   "Still body\n"))))
     (should (equal (plist-get request :body)
                    "Looks-Like: Header\nStill body\n"))))
+
+(ert-deftest courier-parse-editor-treats-body-only-json-as-body ()
+  (let ((request
+         (courier-test--parsed-for-editor
+          "{\"cipher\":\"abc123\"}\n")))
+    (should (equal (plist-get request :method) "GET"))
+    (should (equal (plist-get request :url) ""))
+    (should-not (plist-get request :headers))
+    (should (equal (plist-get request :body)
+                   "{\"cipher\":\"abc123\"}\n"))))
 
 ;; Variable expansion tests.
 
@@ -4080,6 +4095,19 @@ skipping."
     (should (string-prefix-p
              " GET https://example.com/users?page=2&filter=active"
              (courier-test--current-header-line)))))
+
+(ert-deftest courier-request-mode-body-only-json-stays-body-after-method-url-edits ()
+  (courier-test--with-request
+      "{\"cipher\":\"abc123\"}\n"
+    (courier-request-mode)
+    (courier-request-set-method "POST")
+    (courier-request-set-url "https://example.com/oil")
+    (should-not (plist-get courier--request-model :headers))
+    (should (equal (plist-get courier--request-model :body)
+                   "{\"cipher\":\"abc123\"}"))
+    (should (string-match-p
+             (regexp-quote "POST https://example.com/oil\n\n{\"cipher\":\"abc123\"}")
+             (courier--serialize-request courier--request-model)))))
 
 (ert-deftest courier-request-mode-resets-state-when-buffer-visits-new-file ()
   (with-temp-buffer

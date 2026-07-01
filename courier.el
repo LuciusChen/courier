@@ -1089,6 +1089,8 @@ When RELAXED is non-nil, allow incomplete draft request lines."
                      (line-beginning-position)
                      (line-end-position))))
           (cond
+           ((and relaxed (not request-line-seen))
+            (setq body-start (point)))
            ((string-empty-p line)
             (forward-line 1)
             (setq body-start (point)))
