@@ -7748,7 +7748,7 @@ This renames the request file and updates its front matter name."
         (kill-buffer buffer))
       (message "Courier request moved to %s" new-path))))
 
-;;;###autoload
+;;;###autoload (autoload 'courier-request-menu "courier" nil t)
 (transient-define-prefix courier-request-menu ()
   "Show request actions for the current Courier buffer."
   [["Run"
@@ -7772,7 +7772,7 @@ This renames the request file and updates its front matter name."
     ("F" "New folder" courier-new-folder)
     ("C" "New collection" courier-create-collection)]])
 
-;;;###autoload
+;;;###autoload (autoload 'courier-response-menu "courier" nil t)
 (transient-define-prefix courier-response-menu ()
   "Show response actions for the current Courier buffer."
   [["View"
